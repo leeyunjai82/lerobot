@@ -24,7 +24,7 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 
 ## 환경
 
-- lerobot commit: `<git -C lerobot-src rev-parse HEAD 값>`
+- lerobot commit: `e40b58a8dfa9e7b86918c374791599d070518d11`
 - Python 3.12 (miniforge), torch 2.9 cu130
   - Jetson Thor(aarch64): `pip install torch --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130`
     + `nvidia-jetpack-dev`, NVPL, cuDSS
