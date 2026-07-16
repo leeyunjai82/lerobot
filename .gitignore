@@ -4,3 +4,4 @@ outputs/
 lrweb_jobs/
 *.log
 lrweb_marks.json
+*.pid
