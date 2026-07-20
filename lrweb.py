@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  lrweb.py v8.7 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
+#  lrweb.py v9.0 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
 #
 #  v7 추가
 #   - Collect: 웹에서 데이터 수집 시작/조작 — n(다음)/r(재녹화)/q(종료) 버튼
@@ -21,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 
 # ------------------------------- 설정 ---------------------------------------
 HOME = Path.home()
@@ -65,6 +65,47 @@ def save_json(p, obj):
 
 def load_marks():  return load_json(MARKS_FILE, {})
 def save_marks(m): save_json(MARKS_FILE, m)
+
+_ICON_CACHE = {}
+def _solid_png(size, rgb):
+    """의존성 없는 단색 PNG (PIL 없을 때 폴백)."""
+    import struct, zlib
+    w = h = size; r, g, b = rgb
+    raw = b"".join(b"\x00" + bytes((r, g, b)) * w for _ in range(h))
+    def chunk(t, d):
+        return (struct.pack(">I", len(d)) + t + d
+                + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+def icon_png(size):
+    """앱 아이콘 PNG 생성 (PIL 있으면 로봇팔 마크, 없으면 단색)."""
+    if size in _ICON_CACHE:
+        return _ICON_CACHE[size]
+    try:
+        import io
+        from PIL import Image, ImageDraw
+        S = size
+        img = Image.new("RGB", (S, S), (15, 18, 22))
+        d = ImageDraw.Draw(img)
+        pad = int(S * 0.11); rad = int(S * 0.22)
+        d.rounded_rectangle([pad, pad, S - pad, S - pad], radius=rad,
+                            fill=(44, 66, 87), outline=(93, 157, 214), width=max(2, S // 36))
+        lw = max(3, S // 12)
+        pts = [(S * 0.40, S * 0.72), (S * 0.40, S * 0.50), (S * 0.63, S * 0.40)]
+        d.line(pts, fill=(93, 157, 214), width=lw, joint="curve")
+        for x, y in pts:
+            r = lw * 0.6
+            d.ellipse([x - r, y - r, x + r, y + r], fill=(93, 157, 214))
+        gx, gy, gr = S * 0.63, S * 0.40, S * 0.085
+        d.ellipse([gx - gr, gy - gr, gx + gr, gy + gr],
+                  outline=(220, 234, 254), width=max(2, S // 40))
+        buf = io.BytesIO(); img.save(buf, "PNG"); data = buf.getvalue()
+    except Exception:
+        data = _solid_png(size, (44, 66, 87))
+    _ICON_CACHE[size] = data
+    return data
 
 def list_datasets():
     out = []
@@ -390,6 +431,14 @@ def log_tail(jid, nbytes=4000):
 
 # ----------------------------- 화면 공통 ------------------------------------
 CSS = """
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161b21">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LRWEB">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -478,7 +527,45 @@ pre{font-family:var(--mono);font-size:12.5px;line-height:1.5;background:#0a0d10;
 form.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0 22px}
 .chartbox{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px}
 .keys{display:flex;gap:12px;margin:14px 0 18px}
-</style>"""
+
+/* ---- 반응형 (태블릿/모바일) ---- */
+@media(max-width:820px){
+  .appbar{gap:12px;padding:0 14px;height:auto;min-height:52px;flex-wrap:wrap}
+  .brand{font-size:12px}
+  .brand small{display:none}
+  .statuscluster{font-size:11px;max-width:52vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .nav{order:3;width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;
+    height:46px;gap:0;border-top:1px solid var(--line)}
+  .nav a{padding:0 15px;white-space:nowrap;flex:0 0 auto}
+  .wrap{padding:18px 14px 48px}
+  h2{font-size:18px;margin-bottom:16px}
+  button{padding:10px 15px}
+  button.big{padding:13px 22px}
+  input,select{font-size:16px;padding:9px 11px}   /* 16px = iOS 자동확대 방지 */
+  label.f{min-width:0!important}
+  .card{padding:16px 15px}
+  pre{max-height:52vh}
+}
+@media(max-width:560px){
+  .formgrid{gap:10px}
+  .formgrid label.f{flex:1 1 100%}   /* 폼 필드 세로 스택 */
+  form.row > *{flex:1 1 100%}
+  .nav a{padding:0 13px;font-size:13px}
+  table{font-size:13px}
+  th,td{padding:8px 9px}
+}
+.fsbtn{padding:5px 9px;font-size:15px;line-height:1;background:transparent;
+  border-color:var(--line);color:var(--muted)}
+.fsbtn:hover{color:var(--text);border-color:var(--accent)}
+</style>
+<script>
+function toggleFS(){
+  var el=document.documentElement;
+  if(document.fullscreenElement){ (document.exitFullscreen||document.webkitExitFullscreen).call(document); }
+  else{ (el.requestFullscreen||el.webkitRequestFullscreen).call(el); }
+}
+if('serviceWorker' in navigator){ navigator.serviceWorker.register('/sw.js').catch(function(){}); }
+</script>"""
 
 def nav_html(active=""):
     running = [j for j in jobs_index() if j["alive"]]
@@ -497,7 +584,34 @@ def nav_html(active=""):
     return (f'<div class=appbar><div class=brand>LRWEB <small>/ SO-101 PIPELINE</small></div>'
             f'<div class=nav>{tab("/","Datasets","ds")}{tab("/collect","Collect","co")}'
             f'{tab("/train","Training","tr")}{tab("/rollout","Rollout","ro")}'
-            f'{tab("/control","Control","ct")}{tab("/jobs","Jobs","jb")}</div>{cluster}</div>')
+            f'{tab("/control","Control","ct")}{tab("/jobs","Jobs","jb")}</div>{cluster}'
+            f'<button class=fsbtn title="전체화면" aria-label="전체화면" onclick="toggleFS()">⛶</button></div>')
+
+# ----------------------------- PWA / 키오스크 -------------------------------
+@app.get("/manifest.webmanifest")
+def api_manifest():
+    return JSONResponse({
+        "name": "LRWEB — SO-101 Pipeline", "short_name": "LRWEB",
+        "start_url": "/", "scope": "/", "display": "fullscreen",
+        "orientation": "landscape",
+        "background_color": "#0f1216", "theme_color": "#161b21",
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+    }, media_type="application/manifest+json")
+
+@app.get("/icon-{size}.png")
+def api_icon(size: int):
+    size = max(16, min(1024, size))
+    return Response(content=icon_png(size), media_type="image/png")
+
+@app.get("/sw.js")
+def api_sw():
+    js = ("self.addEventListener('install',function(e){self.skipWaiting();});"
+          "self.addEventListener('activate',function(e){self.clients.claim();});"
+          "self.addEventListener('fetch',function(){});")
+    return Response(content=js, media_type="application/javascript")
 
 # ----------------------------- 페이지: 데이터셋 -------------------------------
 @app.get("/", response_class=HTMLResponse)
@@ -1010,6 +1124,12 @@ letter-spacing:.1em;text-transform:uppercase;color:#cfd8e3;text-shadow:0 0 4px #
 #nourdf{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
 color:var(--dim);font-family:var(--mono);font-size:12px;text-align:center;line-height:2}}
 button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-family:var(--mono);font-weight:600}}
+@media(max-width:820px){{
+  .cmain{{grid-template-columns:1fr;height:auto}}
+  .cpanel{{border-right:none;border-bottom:1px solid var(--line);overflow:visible}}
+  #right{{min-height:auto}}
+  #view{{min-height:56vh}}
+}}
 </style>
 <div class=cmain>
   <div class=cpanel>
