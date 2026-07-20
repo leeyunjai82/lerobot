@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  lrweb.py v9.0 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
+#  lrweb.py v9.1 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
 #
 #  v7 추가
 #   - Collect: 웹에서 데이터 수집 시작/조작 — n(다음)/r(재녹화)/q(종료) 버튼
@@ -555,7 +555,7 @@ form.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0 22
   th,td{padding:8px 9px}
 }
 .fsbtn{padding:5px 9px;font-size:15px;line-height:1;background:transparent;
-  border-color:var(--line);color:var(--muted)}
+  border-color:var(--line);color:var(--muted);display:inline-flex;align-items:center}
 .fsbtn:hover{color:var(--text);border-color:var(--accent)}
 </style>
 <script>
@@ -585,7 +585,11 @@ def nav_html(active=""):
             f'<div class=nav>{tab("/","Datasets","ds")}{tab("/collect","Collect","co")}'
             f'{tab("/train","Training","tr")}{tab("/rollout","Rollout","ro")}'
             f'{tab("/control","Control","ct")}{tab("/jobs","Jobs","jb")}</div>{cluster}'
-            f'<button class=fsbtn title="전체화면" aria-label="전체화면" onclick="toggleFS()">⛶</button></div>')
+            f'<button class=fsbtn title="전체화면" aria-label="전체화면" onclick="toggleFS()">'
+            f'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+            f'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+            f'<path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/>'
+            f'</svg></button></div>')
 
 # ----------------------------- PWA / 키오스크 -------------------------------
 @app.get("/manifest.webmanifest")
