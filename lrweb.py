@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  lrweb.py v9.1 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
+#  lrweb.py v9.2 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
 #
 #  v7 추가
 #   - Collect: 웹에서 데이터 수집 시작/조작 — n(다음)/r(재녹화)/q(종료) 버튼
@@ -39,11 +39,14 @@ TELEOP_ARGS = "--teleop.type=so101_leader --teleop.port=/dev/so101_leader --tele
 DEFAULT_TASK = "Pick up the block and place it in the box"
 
 FOLLOWER_PORT = "/dev/so101_follower"
+LEADER_PORT = "/dev/so101_leader"
 CALIB_FILE = HOME / "project/lerobot/data/hf/lerobot/calibration/robots/so_follower/follower.json"
+CALIB_ROOT = HOME / "project/lerobot/data/hf/lerobot/calibration"
 URDF_DIR = HOME / "project/lerobot/urdf"      # so101.urdf + meshes/ 를 두면 3D 표시
 CONTROL_HZ = 20
 FEEDBACK_HZ = 10
 MAX_STEP_DEG = 2.5
+FOLLOW_STEP_DEG = 6.0     # 리더 팔로우 시 스텝당 최대 이동 (반응성↑)
 CTL_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 CTL_CAMS = {"wrist": 0, "top": 2}     # Control 탭 스트리밍용 (record 설정과 동일)
 CTL_STREAM_FPS = 15
@@ -222,6 +225,7 @@ class Arm:
         self.actual = {}      # 엔코더 실측 (표시/3D 전용)
         self.limits = {}
         self.err = ""
+        self.follow = False   # 리더 팔로우 모드
 
     def connect(self):
         from lerobot.motors.feetech import FeetechMotorsBus
@@ -259,6 +263,7 @@ class Arm:
             except Exception: pass
         self.bus = None
         self.torque = False
+        self.follow = False
         self.err = ""
 
     def read(self):
@@ -279,6 +284,7 @@ class Arm:
         if not (self.bus and self.torque):
             return
         goal = {}
+        cap = FOLLOW_STEP_DEG if self.follow else MAX_STEP_DEG
         for n in CTL_JOINTS:
             cur = self.cmd.get(n, self.actual.get(n, 0.0))
             lo, hi = self.limits[n]
@@ -287,7 +293,7 @@ class Arm:
             if abs(diff) < 0.2:          # 데드밴드: 도달로 간주, 쓰기 중단
                 self.cmd[n] = tgt
                 continue
-            nxt = cur + max(-MAX_STEP_DEG, min(MAX_STEP_DEG, diff))
+            nxt = cur + max(-cap, min(cap, diff))
             self.cmd[n] = nxt
             goal[n] = nxt
         if goal:
@@ -295,6 +301,46 @@ class Arm:
 
 ARM = Arm()
 CTL_OWNER = None    # 현재 Control 탭을 점유한 WebSocket
+
+def _leader_calib_path():
+    """리더 캘리브레이션(leader.json)을 calibration 트리에서 탐색."""
+    if not CALIB_ROOT.exists():
+        return None
+    hits = sorted(CALIB_ROOT.glob("**/leader.json"))
+    return hits[0] if hits else None
+
+class Leader:
+    """리더 암 읽기 전용 버스 (토크 OFF, 캘리브레이션 적용).
+    teleoperate와 동일하게 정규화된 관절값(deg / gripper 0~100)을 반환 → 팔로워 목표로 그대로 사용."""
+    def __init__(self):
+        self.bus = None
+    def connect(self):
+        from lerobot.motors.feetech import FeetechMotorsBus
+        from lerobot.motors import Motor, MotorNormMode, MotorCalibration
+        motors = {n: Motor(i + 1, "sts3215",
+                           MotorNormMode.RANGE_0_100 if n == "gripper" else MotorNormMode.DEGREES)
+                  for i, n in enumerate(CTL_JOINTS)}
+        calib = {}
+        p = _leader_calib_path()
+        if p:
+            for n, c in json.loads(p.read_text()).items():
+                if n in motors:
+                    calib[n] = MotorCalibration(**c)
+        self.bus = FeetechMotorsBus(LEADER_PORT, motors, calibration=calib or None)
+        self.bus.connect()
+        try:                      # 리더는 사람이 손으로 움직이므로 토크 OFF
+            self.bus.disable_torque()
+        except Exception:
+            pass
+    def read(self):
+        return {k: float(v) for k, v in self.bus.sync_read("Present_Position").items()}
+    def disconnect(self):
+        if self.bus:
+            try: self.bus.disconnect()
+            except Exception: pass
+        self.bus = None
+
+LEADER = Leader()
 
 class Cams:
     """Control 탭 전용 카메라 스트리머 — 리더 스레드 1개가 JPEG 최신본 유지"""
@@ -1140,6 +1186,7 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
     <div class=toolbar>
       <span id=cst class=badge>connecting…</span>
       <button id=btrq onclick="toggleTorque()" disabled>토크 ON</button>
+      <button id=bflw onclick="toggleFollow()" disabled>리더 팔로우 ON</button>
       <button class=estop onclick="estop()">E-STOP</button>
       <input type=color id=armcolor value="#e07a3f" title="로봇 색상"
              style="width:34px;height:30px;padding:2px;border-radius:7px;border:1px solid var(--line);background:var(--bg);cursor:pointer">
@@ -1147,6 +1194,7 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
     <div id=sliders></div>
     <p class=muted>토크 OFF: 손으로 움직이면 값·3D가 따라옵니다.<br>
     토크 ON: 슬라이더가 목표 (스텝당 최대 {MAX_STEP_DEG}° 제한).<br>
+    리더 팔로우: 리더 암을 손으로 움직이면 팔로워가 실시간 미러링 (슬라이더 잠금).<br>
     이 탭을 떠나면 자동으로 토크 해제 + 연결 해제됩니다.</p>
   </div>
   <div id=right>
@@ -1166,9 +1214,10 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
 </script>
 <script type="module">
 const JOINTS = {joints_js};
-let ws=null, torque=false, robot=null;
+let ws=null, torque=false, follow=false, robot=null;
 const sliders={{}}, valEls={{}}, actEls={{}};
 const cst=document.getElementById('cst'), btrq=document.getElementById('btrq');
+const bflw=document.getElementById('bflw');
 
 function buildSliders(lims, actual){{
   const box=document.getElementById('sliders'); box.innerHTML='';
@@ -1190,6 +1239,7 @@ function buildSliders(lims, actual){{
   }});
 }}
 window.toggleTorque=()=>{{ if(ws&&ws.readyState===1) ws.send(JSON.stringify({{type:'torque',on:!torque}})); }};
+window.toggleFollow=()=>{{ if(ws&&ws.readyState===1) ws.send(JSON.stringify({{type:'follow',on:!follow}})); }};
 window.estop=()=>{{ if(ws&&ws.readyState===1) ws.send(JSON.stringify({{type:'estop'}})); }};
 
 function openWS(){{
@@ -1199,7 +1249,7 @@ function openWS(){{
     if(d.type==='init'){{
       if(d.error){{ cst.textContent=d.error; cst.classList.add('b-bad'); return; }}
       buildSliders(d.limits,d.actual);
-      cst.textContent='connected'; cst.classList.add('b-ok'); btrq.disabled=false;
+      cst.textContent='connected'; cst.classList.add('b-ok'); btrq.disabled=false; bflw.disabled=false;
       if(d.cams){{
         document.getElementById('cams').style.display='grid';
         document.getElementById('cam_wrist').src='/stream/wrist';
@@ -1207,19 +1257,27 @@ function openWS(){{
       }}
     }}
     if(d.type==='state'){{
-      torque=d.torque;
+      torque=d.torque; follow=!!d.follow;
       btrq.textContent=torque?'토크 OFF':'토크 ON';
+      btrq.disabled=follow;
+      bflw.textContent=follow?'리더 팔로우 OFF':'리더 팔로우 ON';
+      bflw.classList.toggle('primary',follow);
       JOINTS.forEach(j=>{{
         if(valEls[j])valEls[j].textContent=(d.target[j]??0).toFixed(1);
         if(actEls[j])actEls[j].textContent='('+(d.actual[j]??0).toFixed(1)+')';
-        if(!torque&&sliders[j]&&d.actual[j]!==undefined)sliders[j].value=d.actual[j];
-        if(torque&&d.synced&&sliders[j]&&d.actual[j]!==undefined)sliders[j].value=d.actual[j];
+        if(sliders[j])sliders[j].disabled=follow;
+        if(follow){{
+          if(sliders[j]&&d.target[j]!==undefined)sliders[j].value=d.target[j];
+        }}else{{
+          if(!torque&&sliders[j]&&d.actual[j]!==undefined)sliders[j].value=d.actual[j];
+          if(torque&&d.synced&&sliders[j]&&d.actual[j]!==undefined)sliders[j].value=d.actual[j];
+        }}
       }});
       if(d.err){{cst.textContent='bus error';cst.classList.add('b-bad');}}
       updateRobot(d.actual);
     }}
   }};
-  ws.onclose=()=>{{ cst.textContent='disconnected'; cst.classList.remove('b-ok'); btrq.disabled=true; }};
+  ws.onclose=()=>{{ cst.textContent='disconnected'; cst.classList.remove('b-ok'); btrq.disabled=true; bflw.disabled=true; }};
 }}
 addEventListener('pagehide',()=>{{ try{{ws&&ws.close();}}catch(e){{}} }});
 openWS();
@@ -1336,9 +1394,28 @@ async def ws_control(sock: WebSocket):
                         ARM.err = str(e)
                 elif d.get("type") == "estop":
                     try:
+                        ARM.follow = False
+                        await asyncio.to_thread(LEADER.disconnect)
                         await asyncio.to_thread(ARM.set_torque, False)
                     except Exception as e:
                         ARM.err = str(e)
+                elif d.get("type") == "follow":
+                    on = bool(d.get("on"))
+                    try:
+                        if on:
+                            if LEADER.bus is None:
+                                await asyncio.to_thread(LEADER.connect)
+                            if not ARM.torque:
+                                await asyncio.to_thread(ARM.set_torque, True)
+                            ARM.follow = True
+                        else:
+                            ARM.follow = False
+                            await asyncio.to_thread(LEADER.disconnect)
+                        synced = True
+                    except Exception as e:
+                        ARM.err = str(e); ARM.follow = False
+                        try: await asyncio.to_thread(LEADER.disconnect)
+                        except Exception: pass
 
         rx_task = asyncio.create_task(rx())
         last_fb = 0.0
@@ -1347,6 +1424,11 @@ async def ws_control(sock: WebSocket):
                 t0 = time.monotonic()
                 if ARM.bus:
                     try:
+                        if ARM.follow and LEADER.bus is not None:
+                            la = await asyncio.to_thread(LEADER.read)
+                            for n in CTL_JOINTS:
+                                if n in la:
+                                    ARM.target[n] = la[n]
                         await asyncio.to_thread(ARM.step)
                         if t0 - last_fb > 1.0 / FEEDBACK_HZ:
                             ARM.actual = await asyncio.to_thread(ARM.read)
@@ -1356,7 +1438,8 @@ async def ws_control(sock: WebSocket):
                         ARM.err = str(e)
                 await sock.send_text(json.dumps(
                     {"type": "state", "actual": ARM.actual, "target": ARM.target,
-                     "torque": ARM.torque, "synced": synced, "err": ARM.err}))
+                     "torque": ARM.torque, "follow": ARM.follow,
+                     "synced": synced, "err": ARM.err}))
                 synced = False
                 dt = time.monotonic() - t0
                 await asyncio.sleep(max(0.0, 1.0 / CONTROL_HZ - dt))
@@ -1367,6 +1450,8 @@ async def ws_control(sock: WebSocket):
     finally:
         CTL_OWNER = None
         CAMS.close()       # 탭 이탈 = 카메라 해제
+        try: LEADER.disconnect()   # 리더 버스 해제
+        except Exception: pass
         ARM.disconnect()   #          + 토크 해제 + 시리얼 해제
 
 # Control 카메라 MJPEG 스트림
