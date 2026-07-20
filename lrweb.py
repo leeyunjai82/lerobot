@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  lrweb.py v8.4 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
+#  lrweb.py v8.5 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
 #
 #  v7 추가
 #   - Collect: 웹에서 데이터 수집 시작/조작 — n(다음)/r(재녹화)/q(종료) 버튼
@@ -883,6 +883,11 @@ def rollout_page():
     </div>
     <p class=muted>시작 즉시 팔이 움직입니다 — 팔 주변을 비우고, 물체를 시연 위치에 놓으세요.
     카메라 배치는 학습 데이터 수집 때와 동일해야 합니다.</p>
+    <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class=danger onclick="delCkpt('step')" {'disabled' if not ckpts else ''}>선택 체크포인트 삭제</button>
+      <button class=danger onclick="delCkpt('run')" {'disabled' if not ckpts else ''}>출력 전체 삭제</button>
+      <span class=muted>선택 = 해당 step 폴더만 · 출력 전체 = outputs/&lt;run&gt; 통째 (복구 불가)</span>
+    </div>
     </div></div>
     <script>
     async function startRo(){{
@@ -891,6 +896,19 @@ def rollout_page():
                duration:document.getElementById('dur').value,
                task:document.getElementById('task').value}};
       const r=await fetch('/api/rollout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
+      const d=await r.json(); if(d.error)alert(d.error); else location.reload();
+    }}
+    async function delCkpt(scope){{
+      const rel=document.getElementById('ckpt').value;
+      if(!rel){{alert('선택된 체크포인트가 없습니다');return;}}
+      const run=rel.split('/checkpoints/')[0];
+      if(scope==='run'){{
+        const typed=prompt('출력 "'+run+'" 을 통째로 삭제합니다 (복구 불가).\\n확인을 위해 이름을 그대로 입력하세요:');
+        if(typed!==run)return;
+      }}else{{
+        if(!confirm('체크포인트 삭제:\\n'+rel.replace('/pretrained_model','')+'\\n삭제할까요?'))return;
+      }}
+      const r=await fetch('/api/delete_checkpoint',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{rel:rel,scope:scope}})}});
       const d=await r.json(); if(d.error)alert(d.error); else location.reload();
     }}
     </script>"""
@@ -911,6 +929,31 @@ async def api_rollout(req: Request):
            f"--strategy.type=base --duration={dur} --task=\"{task}\"")
     jid = start_job("rollout", cmd)
     return {"ok": True, "job": jid}
+
+@app.post("/api/delete_checkpoint")
+async def api_delete_checkpoint(req: Request):
+    b = await req.json()
+    rel = b.get("rel", "")
+    scope = b.get("scope", "step")
+    if "/checkpoints/" not in rel:
+        return JSONResponse({"error": "체크포인트 경로 아님"}, status_code=400)
+    run = rel.split("/checkpoints/")[0]
+    for j in jobs_index():
+        if j["alive"] and run in j.get("cmd", ""):
+            return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 출력을 사용 중"}, status_code=400)
+    if scope == "run":
+        target = (OUT_ROOT / run).resolve()
+    else:
+        step = rel.split("/checkpoints/")[1].split("/")[0]
+        if step == "last":
+            return JSONResponse({"error": "last는 심볼릭 링크 — 숫자 체크포인트를 선택하세요"}, status_code=400)
+        target = (OUT_ROOT / run / "checkpoints" / step).resolve()
+    if not str(target).startswith(str(OUT_ROOT.resolve())) or not target.exists():
+        return JSONResponse({"error": "대상 없음"}, status_code=400)
+    if target.is_symlink():
+        return JSONResponse({"error": "심볼릭 링크는 삭제하지 않음"}, status_code=400)
+    shutil.rmtree(target)
+    return {"ok": True}
 
 
 # ----------------------------- 페이지: Control (수동 제어) --------------------
