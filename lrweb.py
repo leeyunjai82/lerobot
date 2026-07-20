@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  lrweb.py v8.5 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
+#  lrweb.py v8.7 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
 #
 #  v7 추가
 #   - Collect: 웹에서 데이터 수집 시작/조작 — n(다음)/r(재녹화)/q(종료) 버튼
@@ -78,9 +78,17 @@ def list_datasets():
                             "fps": info.get("fps", "?")})
     return out
 
+def _clamp_int(v, default, lo, hi):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        n = default
+    return max(lo, min(hi, n))
+
 def list_checkpoints():
-    """outputs/*/checkpoints/*/pretrained_model 탐색 (last 우선 정렬)"""
-    found = []
+    """outputs/*/checkpoints/*/pretrained_model 탐색.
+    'last'가 숫자 체크포인트를 가리키는 심볼릭 링크면 중복 제거(숫자 쪽 유지)."""
+    entries = []   # (rel, is_last, real_target)
     for run in sorted(OUT_ROOT.iterdir()) if OUT_ROOT.exists() else []:
         ck = run / "checkpoints"
         if not ck.is_dir():
@@ -89,7 +97,15 @@ def list_checkpoints():
             pm = step / "pretrained_model"
             if pm.is_dir():
                 rel = f"{run.name}/checkpoints/{step.name}/pretrained_model"
-                found.append(rel)
+                entries.append((rel, step.name == "last", str(pm.resolve())))
+    # 같은 실제 경로는 하나만 — 숫자 체크포인트(is_last=False)를 우선 채택
+    entries.sort(key=lambda e: (e[2], e[1]))
+    seen, found = set(), []
+    for rel, _is_last, real in entries:
+        if real in seen:
+            continue
+        seen.add(real)
+        found.append(rel)
     found.sort(key=lambda r: ("/last/" not in f"/{r}/", r))
     return found
 
@@ -711,10 +727,13 @@ async def api_record(req: Request):
         return JSONResponse({"error": f"{busy['id']} 실행 중 — 종료 후 시작하세요"}, status_code=400)
     b = await req.json()
     task = (b.get("task") or DEFAULT_TASK).replace('"', "'")
-    neps = int(b.get("num_episodes", 50))
-    ept = int(b.get("episode_time_s", 30)); rst = int(b.get("reset_time_s", 15))
+    neps = _clamp_int(b.get("num_episodes"), 50, 1, 100000)
+    ept = _clamp_int(b.get("episode_time_s"), 30, 1, 3600)
+    rst = _clamp_int(b.get("reset_time_s"), 15, 0, 3600)
     if b.get("mode") == "resume":
-        ds = b.get("resume_ds", "")
+        ds = (b.get("resume_ds") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", ds):
+            return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
         root = DATA_ROOT / ds
         if not root.exists():
             return JSONResponse({"error": "데이터셋 없음"}, status_code=400)
@@ -726,7 +745,7 @@ async def api_record(req: Request):
             return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
         ds_args = f"--dataset.repo_id=local/{name}"
     cmd = (f"lerobot-record {ROBOT_ARGS} {TELEOP_ARGS} {ds_args} "
-           f"--dataset.num_episodes={neps} --dataset.single_task=\"{task}\" "
+           f"--dataset.num_episodes={neps} --dataset.single_task={shlex.quote(task)} "
            f"--dataset.episode_time_s={ept} --dataset.reset_time_s={rst} "
            f"--dataset.push_to_hub=false --dataset.fps=30")
     jid = start_job("record", cmd, use_pty=True)
@@ -804,8 +823,14 @@ async def api_train(req: Request):
     busy = gpu_or_loop_busy()   # lrctl 수동 제어(control)는 학습과 동시 가능
     if busy:
         return JSONResponse({"error": f"{busy['id']} 실행 중 — 종료 후 시작하세요"}, status_code=400)
-    ds = b.get("dataset"); name = (b.get("name") or f"act_{ds}").strip()
-    steps = int(b.get("steps", 80000)); batch = int(b.get("batch", 8))
+    ds = (b.get("dataset") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", ds):
+        return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
+    name = (b.get("name") or f"act_{ds}").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        return JSONResponse({"error": "출력 이름은 영문/숫자/._- 만"}, status_code=400)
+    steps = _clamp_int(b.get("steps"), 80000, 1, 100000000)
+    batch = _clamp_int(b.get("batch"), 8, 1, 4096)
     root = DATA_ROOT / ds
     if not root.exists():
         return JSONResponse({"error": "dataset not found"}, status_code=400)
@@ -822,7 +847,7 @@ def api_trainlog():
     trains = [j for j in jobs_index() if j["kind"] == "train"]
     if not trains:
         return JSONResponse({"points": [], "tail": "", "current": None})
-    j = trains[0]
+    j = next((t for t in trains if t["alive"]), trains[0])
     pts = []
     try:
         with open(j["log"], errors="ignore") as f:
@@ -923,10 +948,10 @@ async def api_rollout(req: Request):
     ck = (OUT_ROOT / rel).resolve()
     if not str(ck).startswith(str(OUT_ROOT.resolve())) or not ck.is_dir():
         return JSONResponse({"error": "체크포인트 없음"}, status_code=400)
-    dur = int(b.get("duration", 60))
+    dur = _clamp_int(b.get("duration"), 60, 0, 86400)
     task = (b.get("task") or DEFAULT_TASK).replace('"', "'")
     cmd = (f"lerobot-rollout --policy.path={shlex.quote(str(ck))} {ROBOT_ARGS} "
-           f"--strategy.type=base --duration={dur} --task=\"{task}\"")
+           f"--strategy.type=base --duration={dur} --task={shlex.quote(task)}")
     jid = start_job("rollout", cmd)
     return {"ok": True, "job": jid}
 
@@ -938,8 +963,9 @@ async def api_delete_checkpoint(req: Request):
     if "/checkpoints/" not in rel:
         return JSONResponse({"error": "체크포인트 경로 아님"}, status_code=400)
     run = rel.split("/checkpoints/")[0]
+    run_path = str((OUT_ROOT / run).resolve())
     for j in jobs_index():
-        if j["alive"] and run in j.get("cmd", ""):
+        if j["alive"] and run_path in j.get("cmd", ""):
             return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 출력을 사용 중"}, status_code=400)
     if scope == "run":
         target = (OUT_ROOT / run).resolve()
