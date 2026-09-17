@@ -18,7 +18,6 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 | 파일 | 설명 |
 |---|---|
 | `lrweb_config.json` | 포트·카메라·fps 설정 (아래 참고) |
-| `lrweb_token.txt` | 접속 토큰 (권한 600) |
 | `lrweb_jobs/` | 백그라운드 작업 기록·로그 |
 | `lrweb_marks.json` | 불량 에피소드 마킹 |
 
@@ -68,18 +67,17 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
   (Control 탭의 자체 속도 제한 적분기가 담당)
 - `arms` 를 2개로 늘리면 아직 `NotImplementedError` 입니다 (로드맵 6단계)
 
-## 접속 / 인증
+## 접속
 
-기본으로 토큰 인증이 켜져 있습니다. 시작 로그에 찍히는 URL로 최초 1회 접속하면
-쿠키가 저장되어 이후에는 그냥 `http://<host>:8080/` 으로 들어갑니다.
+기본은 인증 없음입니다. 그냥 `http://<host>:8080/` 으로 들어가면 됩니다.
 
+필요하면 토큰 인증을 켤 수 있습니다 (시작 로그에 찍히는 URL로 1회 접속하면
+쿠키가 저장되어 이후에는 주소만으로 들어갑니다):
+
+```bash
+LRWEB_TOKEN=원하는값 python lrweb.py   # 토큰 직접 지정
+LRWEB_AUTH=on        python lrweb.py   # lrweb_token.txt 에 자동 생성
 ```
-open : http://<host>:8080/?token=xxxxxxxx   (token: /home/<user>/project/lerobot/lrweb_token.txt)
-```
-
-- 토큰 고정: `LRWEB_TOKEN=...`
-- 인증 해제: `LRWEB_AUTH=off` — **신뢰된 네트워크에서만**. 이 웹툴은 데이터셋 삭제와
-  로봇 구동 권한을 그대로 노출합니다
 
 ## 환경
 
@@ -97,7 +95,6 @@ open : http://<host>:8080/?token=xxxxxxxx   (token: /home/<user>/project/lerobot
 source activate.sh
 pip install fastapi uvicorn
 nohup python lrweb.py > lrweb.log 2>&1 &
-head -5 lrweb.log        # 접속 URL(토큰 포함) 확인
 ```
 
 ## 로드맵
@@ -122,8 +119,8 @@ head -5 lrweb.log        # 접속 URL(토큰 포함) 확인
   전부 안 잡힙니다 (그리퍼가 풀 토크로 물고 버팀). `SOFollower` 를 쓰면 `connect()` 가 처리
 - **셸 인젝션.** `/api/delete/{ds}` 가 검증 없는 이름을 `shell=True` 명령 문자열에
   넣고 있었습니다. 모든 외부 프로세스를 argv 리스트 + `shell=False` 로 전환
-- **HTML 이스케이프 / 무인증.** 데이터셋 이름이 HTML·JS 에 그대로 들어가고 있었고,
-  `0.0.0.0:8080` 이 무인증이었습니다
+- **HTML 이스케이프.** 데이터셋 이름이 HTML·JS 에 그대로 들어가고 있었습니다
+  (옵션으로 토큰 인증도 추가 — 기본은 꺼짐)
 - **PTY 키가 조용히 무시되는 경우.** lerobot `init_keyboard_listener()` 는 X11 세션이면
   pynput 전역 리스너를 씁니다. 그러면 PTY 로 넣는 n/r/q 가 아무 데도 안 갑니다.
   자식 프로세스 환경에서 `DISPLAY`/`WAYLAND_DISPLAY` 를 제거해 터미널 리스너로 고정

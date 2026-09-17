@@ -150,13 +150,17 @@ JOB_DIR.mkdir(parents=True, exist_ok=True)
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="lrweb")
 
-# ----------------------------- 인증 -----------------------------------------
+# ----------------------------- 인증 (기본 꺼짐) -------------------------------
+# 기본은 인증 없음 — 예전처럼 http://<host>:8080 으로 바로 들어갑니다.
+# 켜려면 둘 중 하나:
+#   LRWEB_TOKEN=원하는값 python lrweb.py     (토큰 직접 지정)
+#   LRWEB_AUTH=on        python lrweb.py     (lrweb_token.txt 에 자동 생성)
 def _init_token():
-    if os.environ.get("LRWEB_AUTH", "").lower() in ("off", "0", "none", "false"):
-        return None
     tok = os.environ.get("LRWEB_TOKEN")
-    if tok:
+    if tok and tok.strip():
         return tok.strip()
+    if os.environ.get("LRWEB_AUTH", "").lower() not in ("on", "1", "true", "yes"):
+        return None
     if TOKEN_FILE.exists():
         tok = TOKEN_FILE.read_text().strip()
         if tok:
@@ -2069,5 +2073,5 @@ if __name__ == "__main__":
     if AUTH_TOKEN:
         print(f"open : http://<host>:{PORT}/?token={AUTH_TOKEN}   (token: {TOKEN_FILE})")
     else:
-        print(f"open : http://<host>:{PORT}/   ** 인증 꺼짐 (LRWEB_AUTH=off) **")
+        print(f"open : http://<host>:{PORT}/   (인증 없음 — 켜려면 LRWEB_AUTH=on)")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
