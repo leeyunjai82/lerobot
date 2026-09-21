@@ -3086,6 +3086,17 @@ function btn(label,fn,cls){
   const b=document.createElement('button'); b.textContent=label;
   if(cls)b.className=cls; b.style.marginLeft='6px'; b.onclick=fn; return b;
 }
+function noimg(text){
+  const d=document.createElement('div'); d.className='camthumb noimg'; d.textContent=text; return d;
+}
+/* 인라인 onerror 는 따옴표 escape 가 꼬이기 쉬워 DOM 으로 만듭니다 */
+function thumb(dev, ts, failText){
+  const img=document.createElement('img');
+  img.className='camthumb';
+  img.src='/api/setup/camsnap?dev='+encodeURIComponent(dev)+'&t='+ts;
+  img.onerror=function(){ img.replaceWith(noimg(failText)); };
+  return img;
+}
 
 async function loadPorts(){ PORTS=(await jget('/api/setup/ports')).ports; PROBE={}; renderPorts(); fillMsPorts(); }
 
@@ -3191,9 +3202,7 @@ function renderVCams(){
     const sn=c.usb&&c.usb.serial;
     const tr=document.createElement('tr');
     const c0=document.createElement('td');
-    c0.innerHTML = c.snap
-      ? '<img class=camthumb src="/api/setup/camsnap?dev='+encodeURIComponent(c.dev)+'&t='+ts+'">'
-      : '<div class="camthumb noimg">영상 없음</div>';
+    c0.appendChild(c.snap ? thumb(c.dev, ts, '영상 없음') : noimg('영상 없음'));
     const c1=document.createElement('td'); c1.className='mono';
     c1.innerHTML=E(c.dev)+(stable!==c.dev?'<br><span class=tiny>'+E(stable)+'</span>':'')
       +(c.usb&&c.usb.vid?'<br><span class=tiny>'+E(c.usb.vid)+':'+E(c.usb.pid)+(sn?' sn='+E(sn):' <b class=b-warn>sn 없음 → by-path</b>')+'</span>':'');
@@ -3245,10 +3254,7 @@ function renderCurCams(){
       const s=obj[name];
       const tr=document.createElement('tr');
       const c0=document.createElement('td');
-      c0.innerHTML='<img class=camthumb src="/api/setup/camsnap?dev='
-        +encodeURIComponent(s.index_or_path)+'&t='+ts+'" '
-        +'onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),'
-        +'{className:\'camthumb noimg\',textContent:\'스캔 필요\'}))">';
+      c0.appendChild(thumb(s.index_or_path, ts, '스캔 필요'));
       const c1=document.createElement('td'); c1.className='mono'; c1.textContent=prefix+name;
       const c2=document.createElement('td'); c2.className='mono';
       c2.style.fontSize='11px'; c2.textContent=s.index_or_path;

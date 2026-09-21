@@ -12,6 +12,8 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 | `lrweb.py` | 통합 웹툴 — Datasets / Collect / Training / Rollout / Control (port 8080) |
 | `activate.sh` | conda env 활성화 + `HF_HOME` 설정 |
 | `urdf/` | SO-101 URDF/STL (Control 탭 3D 뷰용) |
+| `lerobot_conda.sh` | 새 기기 셋업 (conda env, PyTorch, lerobot 핀 커밋, 의존성) |
+| `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
 
 실행하면 `~/project/lerobot/` 아래에 자동 생성되는 것:
 
