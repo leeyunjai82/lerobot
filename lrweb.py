@@ -844,13 +844,21 @@ class ArmCtl:
 
     def set_torque(self, on: bool):
         with self.lock:
-            (self.robot.bus.enable_torque if on else self.robot.bus.disable_torque)()
-            self.torque = on
             if on:
-                # 점프 방지: 현재 자세를 명령/목표의 시작점으로
+                # 서보의 Goal_Position 은 지난 세션 값이 그대로 남아 있습니다.
+                # 그 상태로 토크만 켜면 서보가 **예전 목표로 전속 돌진**합니다.
+                # 기계적 스톱에 부딪히면 과부하 보호가 걸려 토크가 빠지고,
+                # 그 뒤로는 어떤 명령도 안 먹습니다 (실기에서 right/wrist_flex 가 이 경우였습니다).
+                # 그래서 반드시 '현재 위치를 목표로 먼저 쓰고' 토크를 켭니다.
                 self.actual = self.read()
                 self.target = dict(self.actual)
                 self.cmd = dict(self.actual)
+                self.robot.send_action({f"{k}.pos": v for k, v in self.actual.items()})
+                self.robot.bus.enable_torque()
+                self._last_goal = {}
+            else:
+                self.robot.bus.disable_torque()
+            self.torque = on
 
     def step(self):
         """cmd 를 target 으로 제한 속도 이동. 엔코더 값은 절대 안 섞음(떨림 방지).
