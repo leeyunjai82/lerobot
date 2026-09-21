@@ -3674,7 +3674,7 @@ function renderPicker(s){
         +'<span class=mono style="font-size:12px">'+E(d.id)+'.json</span>'
         +'<div class=p>'+E(d.path)+'</div>'
         +'<button class=primary '+(busy||!s.ports_configured?'disabled':'')
-        +' onclick="start(\\''+E(side)+'\\',\\''+role+'\\')">'+(d.ok?'다시 캘리브레이션':'캘리브레이션 시작')+'</button>'
+        +' onclick="start(\\''+E(side)+'\\',\\''+role+'\\',this)">'+(d.ok?'다시 캘리브레이션':'캘리브레이션 시작')+'</button>'
         +'</div>';
     });
   });
@@ -3688,23 +3688,42 @@ function rows(s, withRange){
     +(withRange?'<th class=num>min</th><th class=num>max</th><th class=num>span</th><th style="width:160px"></th>':'')
     +'</tr>';
   s.rows.forEach(r=>{
-    h+='<tr><td class=mono>'+r.name+(r.full_turn?' <span class=muted style="font-size:11px">(전체 회전, 0~4095 고정)</span>':'')+'</td>'
-      +'<td class="num mono">'+(r.pos==null?'-':r.pos)+'</td>'
-      +(s.stage!=='homing'?'<td class="num mono">'+(r.deg==null?'-':r.deg.toFixed(1)+'°')+'</td>':'');
+    const n=r.name;
+    h+='<tr><td class=mono>'+n+(r.full_turn?' <span class=muted style="font-size:11px">(전체 회전, 0~4095 고정)</span>':'')+'</td>'
+      +'<td class="num mono" id="c_pos_'+n+'"></td>'
+      +(s.stage!=='homing'?'<td class="num mono" id="c_deg_'+n+'"></td>':'');
     if(withRange){
       if(r.full_turn){ h+='<td class=num>0</td><td class=num>4095</td><td class=num>360°</td><td></td>'; }
       else{
-        const sp=r.span_deg||0;
-        const cls = r.wrapped?'bad':(sp<=0?'bad':(sp<s.span_ok_deg?'warn':'ok'));
-        const pct=Math.min(100, sp/180*100);
-        h+='<td class="num mono">'+(r.min==null?'-':r.min)+'</td><td class="num mono">'+(r.max==null?'-':r.max)+'</td>'
-          +'<td class="num mono">'+(r.wrapped?'<span class=b-bad>'+sp.toFixed(1)+'° ⚠</span>':sp.toFixed(1)+'°')+'</td>'
-          +'<td><div class="bar '+cls+'"><i style="width:'+pct+'%"></i></div></td>';
+        h+='<td class="num mono" id="c_min_'+n+'"></td><td class="num mono" id="c_max_'+n+'"></td>'
+          +'<td class="num mono" id="c_span_'+n+'"></td>'
+          +'<td><div class="bar" id="c_bar_'+n+'"><i style="width:0%"></i></div></td>';
       }
     }
     h+='</tr>';
   });
   return h+'</table>';
+}
+
+/* 값만 갱신 — DOM 을 다시 만들지 않습니다.
+   250ms 마다 통째로 다시 그리면 버튼/셀이 교체되며 클릭이 씹힙니다. */
+function patchRows(s){
+  s.rows.forEach(r=>{
+    const n=r.name;
+    const pos=$('c_pos_'+n); if(pos) pos.textContent = r.pos==null?'-':r.pos;
+    const deg=$('c_deg_'+n); if(deg) deg.textContent = r.deg==null?'-':r.deg.toFixed(1)+'°';
+    if(r.full_turn) return;
+    const mn=$('c_min_'+n); if(mn) mn.textContent = r.min==null?'-':r.min;
+    const mx=$('c_max_'+n); if(mx) mx.textContent = r.max==null?'-':r.max;
+    const sp=r.span_deg||0;
+    const spc=$('c_span_'+n);
+    if(spc) spc.innerHTML = r.wrapped?'<span class=b-bad>'+sp.toFixed(1)+'° ⚠</span>':sp.toFixed(1)+'°';
+    const bar=$('c_bar_'+n);
+    if(bar){
+      bar.className='bar '+(r.wrapped||sp<=0?'bad':(sp<s.span_ok_deg?'warn':'ok'));
+      bar.firstElementChild.style.width=Math.min(100, sp/180*100)+'%';
+    }
+  });
 }
 
 function dots(n){
@@ -3713,10 +3732,29 @@ function dots(n){
     '<span class="'+(i===n?'on':'')+'">'+(i<n?'✓ ':'')+(i===n?'<b>'+x+'</b>':x)+'</span>'+(i<3?' › ':'')).join('')+'</div>';
 }
 
+function noteHtml(s){
+  const wrp=(s.wrap||[]).length, blk=s.block.length, wrn=s.warn.length;
+  if(wrp) return '<p class="badge b-bad">엔코더 경계(0/4095)를 넘었습니다: '+s.wrap.join(', ')
+    +'<br>중앙 자세가 가동범위의 중앙이 아닙니다. <b>취소</b>하고 해당 관절을 양 끝의 정확히 가운데에 놓은 뒤 다시 시작하세요.</p>';
+  if(blk) return '<p class="badge b-bad">아직 움직이지 않은 관절: '+s.block.join(', ')+'</p>';
+  if(wrn) return '<p class="badge b-warn">'+s.span_ok_deg+'° 미만으로만 움직인 관절: '+s.warn.join(', ')+' — 의도한 게 아니면 더 움직이세요</p>';
+  return '<p class="badge b-ok">모든 관절 기록됨 — 저장할 수 있습니다</p>';
+}
+
+/* 구조를 다시 만들지 않고 살아 있는 값만 덮어씁니다 */
+function patchStage(s){
+  patchRows(s);
+  const n=$('cnote'); if(n) n.innerHTML=noteHtml(s);
+  const e=$('cerr');
+  if(e){ e.innerHTML = s.err?'<p class="badge b-bad">'+E(s.err)+'</p>':''; }
+  const fb=$('cfinish');
+  if(fb) fb.disabled = s.block.length>0 || (s.wrap||[]).length>0;
+}
+
 function renderStage(s){
   const box=$('stage');
   const head='<h3>'+E(s.side)+' · '+E(s.role)+'</h3>';
-  const err=s.err?'<p class="badge b-bad">'+E(s.err)+'</p>':'';
+  const err='<div id=cerr></div>';
   if(s.stage==='homing'){
     const follower = s.role==='follower';
     box.innerHTML='<div class=stagebox>'+head+dots(1)
@@ -3728,24 +3766,17 @@ function renderStage(s){
       +'그리퍼 포함 6개 관절 전부입니다. 준비되면 아래 버튼을 누르세요.</p>'
       +err+rows(s,false)
       +'<div class=toolbar style="margin-top:14px">'
-      +'<button class="primary big" onclick="home()">중앙 자세 기록</button>'
+      +'<button class="primary big" onclick="home(this)">중앙 자세 기록</button>'
       +'<button class=danger onclick="cancel()">취소</button></div></div>';
   }else if(s.stage==='ranging'){
-    const wrp=(s.wrap||[]).length, blk=s.block.length, wrn=s.warn.length;
-    let note='';
-    if(wrp) note='<p class="badge b-bad">엔코더 경계(0/4095)를 넘었습니다: '+s.wrap.join(', ')
-      +'<br>중앙 자세가 가동범위의 중앙이 아닙니다. <b>취소</b>하고 해당 관절을 양 끝의 정확히 가운데에 놓은 뒤 다시 시작하세요.</p>';
-    else if(blk) note='<p class="badge b-bad">아직 움직이지 않은 관절: '+s.block.join(', ')+'</p>';
-    else if(wrn) note='<p class="badge b-warn">'+s.span_ok_deg+'° 미만으로만 움직인 관절: '+s.warn.join(', ')+' — 의도한 게 아니면 더 움직이세요</p>';
-    else note='<p class="badge b-ok">모든 관절 기록됨 — 저장할 수 있습니다</p>';
     box.innerHTML='<div class=stagebox>'+head+dots(2)
       +'<p class=inst><b>wrist_roll 을 뺀 모든 관절</b>을 한 개씩, 한쪽 끝에서 반대쪽 끝까지 <b>천천히</b> 움직이세요. '
       +'그리퍼도 완전히 열고 완전히 닫으세요.<br>'
       +'여기서 기록되는 min/max 가 그대로 관절 한계가 됩니다 — 기계적 스톱에 <b>살짝 닿기 직전</b>까지만.<br>'
       +'각 줄의 막대가 초록이 되면 충분합니다. 끝나면 <b>완료·저장</b>.</p>'
-      +err+note+rows(s,true)
+      +err+'<div id=cnote></div>'+rows(s,true)
       +'<div class=toolbar style="margin-top:14px">'
-      +'<button class="primary big" onclick="finish()" '+((blk||wrp)?'disabled':'')+'>완료·저장</button>'
+      +'<button class="primary big" id=cfinish onclick="finish(this)">완료·저장</button>'
       +'<button class=danger onclick="cancel()">취소 (이전 값 복원)</button></div></div>';
   }else if(s.stage==='done'){
     box.innerHTML='<div class=stagebox>'+head+dots(3)
@@ -3762,28 +3793,71 @@ function renderStage(s){
   }
 }
 
+let LAST_KEY=null, LAST_PICK=null, polling=false;
+
+/* 구조가 바뀌었을 때만 다시 그리고, 평소엔 값만 갱신 */
+function apply(s){
+  ST=s;
+  const busy=s.busy?'<p class="badge b-warn">'+E(s.busy)+' — 끝나야 캘리브레이션을 시작할 수 있습니다</p>':'';
+  if($('busywarn').innerHTML!==busy) $('busywarn').innerHTML=busy;
+  const pick=JSON.stringify([s.devices, s.stage, s.ports_configured]);
+  if(pick!==LAST_PICK){ LAST_PICK=pick; renderPicker(s); }
+  const key=[s.stage, s.side, s.role].join('|');
+  if(key!==LAST_KEY){ LAST_KEY=key; renderStage(s); }
+  patchStage(s);
+}
+
 async function refresh(){
-  const s=await jget('/api/calib/state'); ST=s;
-  $('busywarn').innerHTML=s.busy?'<p class="badge b-warn">'+E(s.busy)+' — 끝나야 캘리브레이션을 시작할 수 있습니다</p>':'';
-  renderPicker(s); renderStage(s);
+  if(polling) return;          /* 응답이 느려도 요청이 쌓이지 않게 */
+  polling=true;
+  try{ apply(await jget('/api/calib/state')); }
+  catch(e){ /* 일시적 네트워크 오류는 무시하고 다음 주기에 */ }
+  finally{ polling=false; }
 }
-async function start(side,role){
-  const r=await jpost('/api/calib/start',{side:side,role:role});
-  if(r.error) alert(r.error);
-  refresh();
+
+/* setInterval 은 느린 응답에서 요청이 겹칩니다 — 끝난 뒤 다음을 예약 */
+async function poll(){
+  await refresh();
+  timer=setTimeout(poll, 250);
 }
-async function home(){ const r=await jpost('/api/calib/home'); if(r.error) alert(r.error); refresh(); }
-async function finish(){
+
+/* 클릭 즉시 잠가서 중복 클릭·먹통 체감을 없앰 */
+async function withBusy(el, fn){
+  if(el){ el.disabled=true; el.dataset.t=el.textContent; el.textContent='처리 중…'; }
+  try{ return await fn(); }
+  finally{
+    if(el && el.isConnected){ el.disabled=false; if(el.dataset.t) el.textContent=el.dataset.t; }
+  }
+}
+async function start(side,role,el){
+  await withBusy(el, async()=>{
+    const r=await jpost('/api/calib/start',{side:side,role:role});
+    if(r.error) alert(r.error);
+    await refresh();
+  });
+}
+async function home(el){
+  await withBusy(el, async()=>{
+    const r=await jpost('/api/calib/home');
+    if(r.error) alert(r.error);
+    await refresh();
+  });
+}
+async function finish(el){
   if(ST&&ST.warn&&ST.warn.length&&!confirm('일부 관절이 좁게만 움직였습니다:\\n'+ST.warn.join(', ')+'\\n이대로 저장할까요?')) return;
-  const r=await jpost('/api/calib/finish'); if(r.error) alert(r.error); refresh();
+  await withBusy(el, async()=>{
+    const r=await jpost('/api/calib/finish');
+    if(r.error) alert(r.error);
+    await refresh();
+  });
 }
 async function cancel(){
   if(!confirm('취소하면 지금까지 기록이 버려집니다.')) return;
-  await jpost('/api/calib/cancel'); refresh();
+  await jpost('/api/calib/cancel'); await refresh();
 }
-async function closeDone(){ await jpost('/api/calib/cancel'); refresh(); }
+async function closeDone(){ await jpost('/api/calib/cancel'); await refresh(); }
 addEventListener('pagehide',()=>{ if(ST&&(ST.stage==='homing'||ST.stage==='ranging')) navigator.sendBeacon('/api/calib/cancel'); });
-refresh(); timer=setInterval(refresh,250);
+poll();
 </script>"""
 
 
