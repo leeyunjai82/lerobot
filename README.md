@@ -120,27 +120,38 @@ Setup 탭은 시리얼 번호가 있으면 `by-id`, 없으면 `by-path` 를 자�
 
 ## 캘리브레이션 — Calib 탭
 
-`lerobot-calibrate` 가 하는 일을 그대로, 터미널 `input()` 대기만 웹 버튼으로 바꾼 것입니다.
+`lerobot-calibrate` 와 같은 결과를 만들지만 **중앙 자세를 맞추는 단계가 없습니다.**
 
-| 단계 | 화면 | 내부 (lerobot 과 동일) |
+| 단계 | 화면 | 내부 |
 |---|---|---|
-| 연결 | 팔 선택 → 시작 | `connect(calibrate=False)` → `disable_torque()` → `Operating_Mode=POSITION` |
-| 중앙 자세 | 모든 관절을 가동 범위 중앙에 → **중앙 자세 기록** | `bus.set_half_turn_homings()` |
-| 범위 기록 | wrist_roll 빼고 관절마다 양 끝까지 → 막대가 초록이면 충분 | `Present_Position` (raw) 폴링, min/max 누적 |
-| 저장 | **완료·저장** | `bus.write_calibration()` + `_save_calibration()` → `<id>.json` |
+| 연결 | 팔 선택 → 시작 | `connect(calibrate=False)` → `disable_torque()` → `Operating_Mode=POSITION` → `bus.reset_calibration()` |
+| 범위 기록 | 관절마다 양 끝까지 쓸기 → 막대가 초록이면 충분 | `Present_Position`(raw) 폴링, **언랩**해서 min/max 누적 |
+| 저장 | **완료·저장** | 기록된 범위의 중심으로 `homing_offset` 역산 → `write_calibration()` + `_save_calibration()` |
 
-- 안 움직인 관절(min == max)이 있으면 저장이 막힙니다 (lerobot 도 여기서 `ValueError`)
+### 왜 중앙 자세 단계를 없앴나
+
+lerobot CLI 는 먼저 "관절을 가동범위 중앙에 놓고 Enter" 를 요구하고, 그 자세를 2047(반 바퀴)로
+잡습니다(`set_half_turn_homings`). 그런데 STS3215 는 **단일 회전 절대 엔코더**라, 고른 자세가
+실제 중앙에서 벗어나 있으면 반대쪽 끝에서 값이 `4095 → 0` 으로 넘어갑니다. 그러면 min/max 가
+`3 / 4064` 처럼 잡혀 span 이 357° 같은 불가능한 값이 되고, 그대로 저장하면 서보의
+`Min/Max_Position_Limit` 보호가 무력화되어 슬라이더가 기계 스톱 너머를 명령하게 됩니다.
+
+게다가 **중앙을 찾으려면 어차피 한 번 쓸어봐야** 합니다. 그래서 순서를 뒤집었습니다:
+
+1. `reset_calibration()` 으로 `Homing_Offset=0` — 읽는 값이 곧 원시 엔코더값
+2. 쓸면서 연속 표본의 차이로 **언랩** (±2048 넘는 점프를 ∓4096 보정) → 진짜 min/max
+3. 저장할 때 `homing_offset = 중심 − 2047`, `range = 2047 ± span/2`
+
+결과 파일의 의미는 lerobot 과 동일합니다 (`Present = Actual − Homing_Offset`). 중심이 항상
+2047 로 오므로 범위가 `0~4095` 를 벗어날 수 없습니다. 화면의 **저장될 범위** 열에서 미리 확인됩니다.
+
+- 안 움직인 관절(span 0)이 있으면 저장이 막힙니다
 - 30° 미만으로만 움직인 관절은 경고만 하고 저장은 허용합니다
-- **엔코더 경계(0/4095)를 넘으면 저장이 막힙니다.** STS3215 는 단일 회전 절대 엔코더라
-  중앙 자세가 가동범위의 중앙에서 벗어나면 반대쪽 끝에서 값이 `4095 → 0` 으로 튑니다.
-  그대로 저장하면 `range_min≈0, range_max≈4095` 가 되어 서보의 Min/Max_Position_Limit
-  보호가 무력화되고, 슬라이더가 기계 스톱 너머를 명령하게 됩니다.
-  lrweb 는 연속 표본의 차이로 값을 **언랩**해 진짜 이동량을 재고, 경계를 넘었으면
-  해당 관절을 빨갛게 표시하고 저장을 막습니다 (lerobot CLI 에는 없는 검사입니다)
-- `wrist_roll` 은 0~4095 고정 (전체 회전)
-- **취소**하면 중앙 자세 기록으로 이미 바뀐 모터 EEPROM 을 이전 캘리브레이션 값으로 되돌립니다
+- 한 바퀴(360°)를 넘게 움직이면 단일 회전 엔코더로 표현할 수 없어 막힙니다
+- `wrist_roll` 은 전체 회전이라 범위를 재지 않고 `0~4095` 고정 — **시작 시점의 자세가 0° 기준**입니다
+- **취소**하면 `reset_calibration()` 으로 바뀐 모터 EEPROM 을 이전 값으로 되돌립니다
 - ⚠️ 시작하면 토크가 꺼집니다. 팔로워는 손으로 받치세요
-- 기록되는 min/max 가 그대로 관절 한계가 됩니다 — 기계적 스톱에 **닿기 직전**까지만 움직이세요
+- 기록되는 min/max 가 그대로 관절 한계가 됩니다 — 기계적 스톱에 **닿기 직전**까지만
 
 ## 수집 worker — 왜 CLI 를 안 쓰나
 
