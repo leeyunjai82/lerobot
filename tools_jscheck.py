@@ -32,8 +32,17 @@ def main():
         print(f"의존성 없음: {e}", file=sys.stderr)
         return 2
 
+    # 포트가 비어 있으면 Control 탭이 '포트 미설정' 안내만 그려서 정작 검사해야 할
+    # 모듈 스크립트가 빠집니다. 메모리상으로만 더미 포트를 넣어 전체 페이지를 렌더합니다.
+    if not lrweb.ports_configured():
+        for i, arm in enumerate(lrweb.ARM_CFGS.values()):
+            arm["follower_port"] = f"/dev/null_f{i}"
+            arm["leader_port"] = f"/dev/null_l{i}"
+        print("  (포트 미설정 → 더미 포트 주입, 전체 페이지 렌더)")
+
     client = TestClient(lrweb.app)
     bad = 0
+    seen = {}
     with tempfile.TemporaryDirectory() as tmp:
         chk = Path(tmp) / "chk.mjs"
         for path in PAGES:
@@ -52,6 +61,12 @@ def main():
                     print(f"  {path} script#{i}: SYNTAX ERROR\n{r.stderr}")
                 else:
                     print(f"  {path:9s} script#{i}  {len(js):6d} chars  OK")
+                seen[path] = seen.get(path, 0) + 1
+    # 페이지마다 최소 2개(공통 + 페이지 스크립트) 는 나와야 합니다.
+    # 하나뿐이면 조기 반환 페이지를 검사한 것이라 정작 볼 코드를 못 봤다는 뜻입니다.
+    thin = [pg for pg, n in seen.items() if n < 2]
+    if thin:
+        print(f"\n주의: 스크립트가 1개뿐인 페이지 {thin} — 조기 반환 페이지를 검사했을 수 있습니다")
     print(f"\n문법 오류 {bad}건")
     return 1 if bad else 0
 

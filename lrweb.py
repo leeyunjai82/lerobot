@@ -694,6 +694,8 @@ class ArmCtl:
         self.follow = False
         self.track = {}    # 명령(cmd) 대비 실측 오차 — 서보가 실제로 따라오는지
         self.temp = {}     # 서보 온도(°C)
+        self.ten = {}      # Torque_Enable 실제 값 (서보가 스스로 토크를 뺐는지)
+        self.load = {}     # Present_Load — 버티는 중이면 큽니다
         self._last_goal = {}
         self._last_temp = 0.0
         self.lock = threading.Lock()   # 시리얼은 스레드 안전하지 않음 — 루프/명령 직렬화
@@ -740,6 +742,8 @@ class ArmCtl:
         self.cmd = dict(self.actual)
         self.track = dict.fromkeys(CTL_JOINTS, 0.0)
         self.temp = {}
+        self.ten = {}
+        self.load = {}
         self._last_goal = {}
         self._last_temp = 0.0
 
@@ -816,11 +820,18 @@ class ArmCtl:
                                       for n in CTL_JOINTS}
                     if t0 - self._last_temp > TEMP_READ_S:
                         self._last_temp = t0
-                        try:
-                            self.temp = {k: int(v) for k, v in self.robot.bus.sync_read(
-                                "Present_Temperature", normalize=False).items()}
-                        except Exception:
-                            pass
+                        # 안 따라가는 원인을 가릅니다:
+                        #   Torque_Enable=0 → 서보가 과부하 보호로 스스로 토크를 뺌
+                        #   Torque_Enable=1 + 부하 큼 → 기계적으로 막힘 (곧 과열)
+                        #   Torque_Enable=1 + 부하 ~0 → 명령 미도달 / 서보 이상
+                        for name, dst in (("Present_Temperature", "temp"),
+                                          ("Torque_Enable", "ten"),
+                                          ("Present_Load", "load")):
+                            try:
+                                setattr(self, dst, {k: int(v) for k, v in self.robot.bus.sync_read(
+                                    name, normalize=False).items()})
+                            except Exception:
+                                pass
                 self.err = ""
             except Exception as e:
                 self.err = str(e)
@@ -2293,9 +2304,16 @@ function openWS(){{
         const a=d.arms[side]; if(!a||!sliders[side])return;
         const stuck=a.stuck||[], hot=a.hot||[];
         const tag=SIDES.length>1?(side+' '):'';
-        if(stuck.length) warn+='<p class="badge b-bad">'+tag+'명령을 못 따라가는 관절: '+stuck.join(', ')
-          +' — 막혔거나 서보 과부하 보호로 토크가 빠졌을 수 있습니다. '
-          +'<b>E-STOP 후 원인을 확인하세요</b> (계속 두면 스톨 상태로 과열).</p>';
+        if(stuck.length){{
+          const dg=a.diag||{{}};
+          const lines=stuck.map(j=>{{
+            const d=dg[j]||{{}};
+            return '<br>· <b>'+j+'</b>: '+(d.why||'')
+              +' <span class=mono style="font-size:11px">(Torque_Enable='+(d.torque_enable==null?'?':d.torque_enable)
+              +', load='+(d.load==null?'?':d.load)+', '+(d.temp==null?'?':d.temp+'°C')+')</span>';
+          }}).join('');
+          warn+='<p class="badge b-bad">'+tag+'명령을 못 따라가는 관절'+lines+'</p>';
+        }}
         if(hot.length) warn+='<p class="badge '+(a.maxtemp>=65?'b-bad':'b-warn')+'">'+tag
           +'서보 온도 '+a.maxtemp+'°C: '+hot.join(', ')+(a.maxtemp>=65?' — 즉시 토크를 끄세요':'')+'</p>';
         JOINTS.forEach(j=>{{
@@ -2419,8 +2437,21 @@ def _arms_state():
         hot = [n for n, t in a.temp.items() if t >= TEMP_WARN_C]
         stuck = ([n for n, e in a.track.items() if abs(e) > TRACK_WARN_DEG]
                  if a.torque else [])
+        diag = {}
+        for n in stuck:
+            te, ld = a.ten.get(n), a.load.get(n)
+            if te == 0:
+                why = "서보가 토크를 뺐습니다 (과부하 보호) — 전원 재투입 필요할 수 있음"
+            elif te == 1 and ld is not None and abs(ld) > 200:
+                why = f"토크는 켜져 있는데 부하 {abs(ld)} — 기계적으로 막혀 버티는 중 (과열 위험)"
+            elif te == 1:
+                why = f"토크 ON, 부하 {abs(ld) if ld is not None else '?'} — 서보가 명령을 안 받음"
+            else:
+                why = "상태를 읽지 못함"
+            diag[n] = {"torque_enable": te, "load": ld, "temp": a.temp.get(n), "why": why}
         out[s] = {"actual": a.actual, "target": a.target, "limits": a.limits,
                   "track": a.track, "temp": a.temp, "hot": hot, "stuck": stuck,
+                  "diag": diag,
                   "maxtemp": max(a.temp.values()) if a.temp else None}
     return out
 
