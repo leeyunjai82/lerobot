@@ -495,8 +495,14 @@ def child_env():
     return env
 
 
+class JobStartError(RuntimeError):
+    pass
+
+
 def start_job(kind, argv, cwd=None, use_pty=False):
     """argv 는 반드시 리스트 — shell=False 이므로 셸 인젝션이 불가능합니다."""
+    if shutil.which(argv[0]) is None:
+        raise JobStartError(f"실행 파일을 찾을 수 없습니다: {argv[0]} — lerobot conda env 안에서 lrweb 를 띄웠는지 확인")
     jid = f"{kind}_{time.strftime('%m%d_%H%M%S')}"
     log = JOB_DIR / f"{jid}.log"
     lf = open(log, "w")
@@ -631,9 +637,7 @@ class ArmCtl:
         robot = SOFollower(cfg)
         if not robot.calibration:
             raise RuntimeError(
-                f"캘리브레이션 파일이 없습니다: {robot.calibration_fpath}\n"
-                f"lerobot-calibrate --robot.type=so101_follower "
-                f"--robot.port={self.cfg['follower_port']} --robot.id={self.cfg['follower_id']}")
+                f"캘리브레이션 파일이 없습니다: {robot.calibration_fpath} — Calib 탭에서 만드세요")
         robot.connect(calibrate=False)      # calibrate=True 면 input() 에서 서버가 멈춥니다
         if not robot.bus.is_calibrated:
             # 파일과 모터 EEPROM 이 어긋난 경우 — lerobot calibrate() 의 '파일 사용' 분기와 동일
@@ -730,7 +734,7 @@ class LeaderCtl:
         tele = SOLeader(cfg)
         if not tele.calibration:
             raise RuntimeError(
-                f"리더 캘리브레이션 파일이 없습니다: {tele.calibration_fpath}")
+                f"리더 캘리브레이션 파일이 없습니다: {tele.calibration_fpath} — Calib 탭에서 만드세요")
         tele.connect(calibrate=False)
         if not tele.bus.is_calibrated:
             tele.bus.write_calibration(tele.calibration)
@@ -1012,6 +1016,8 @@ def robot_busy():
         return {"id": "manual-control", "kind": "control", "alive": True}
     if WATCH.on:
         return {"id": "port-watch (Setup 탭)", "kind": "setup", "alive": True}
+    if CALIB.active:
+        return {"id": "calibration (Calib 탭)", "kind": "calib", "alive": True}
     return busy_with(("record", "rollout"))
 
 
@@ -1025,6 +1031,8 @@ def exclusive_busy():
         return {"id": "manual-control (Control 탭)", "kind": "control", "alive": True}
     if WATCH.on:
         return {"id": "port-watch (Setup 탭)", "kind": "setup", "alive": True}
+    if CALIB.active:
+        return {"id": "calibration (Calib 탭)", "kind": "calib", "alive": True}
     return busy_with(("record", "rollout", "train"))
 
 
@@ -1200,7 +1208,7 @@ def nav_html(active=""):
     return (f'<div class=appbar><div class=brand>LRWEB <small>/ SO-101 PIPELINE</small></div>'
             f'<div class=nav>{tab("/", "Datasets", "ds")}{tab("/collect", "Collect", "co")}'
             f'{tab("/train", "Training", "tr")}{tab("/rollout", "Rollout", "ro")}'
-            f'{tab("/control", "Control", "ct")}{tab("/setup", "Setup", "st")}'
+            f'{tab("/control", "Control", "ct")}{tab("/calib", "Calib", "cb")}{tab("/setup", "Setup", "st")}'
             f'{tab("/jobs", "Jobs", "jb")}</div>{cluster}'
             f'<button class=fsbtn title="전체화면" aria-label="전체화면" onclick="toggleFS()">'
             f'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
@@ -1401,7 +1409,10 @@ def api_delete(ds: str):
             "--root", str(root),
             "--operation.type", "delete_episodes",
             "--operation.episode_indices", str(sorted(marks))]
-    jid = start_job("delete", argv)
+    try:
+        jid = start_job("delete", argv)
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     m = load_marks()
     m[ds] = []
     save_marks(m)
@@ -1529,7 +1540,10 @@ async def api_record(req: Request):
                    f"--dataset.fps={int(CFG['fps'])}"])
     except NotImplementedError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    jid = start_job("record", argv, use_pty=True)
+    try:
+        jid = start_job("record", argv, use_pty=True)
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, "job": jid}
 
 
@@ -1628,7 +1642,10 @@ async def api_train(req: Request):
             "--policy.type=act", f"--output_dir={out}",
             f"--steps={steps}", f"--batch_size={batch}", "--num_workers=4",
             "--save_freq=10000", "--policy.push_to_hub=false"]
-    jid = start_job("train", argv)
+    try:
+        jid = start_job("train", argv)
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, "job": jid}
 
 
@@ -1765,7 +1782,10 @@ async def api_rollout(req: Request):
                 + ["--strategy.type=base", f"--duration={dur}", f"--task={task}"])
     except NotImplementedError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    jid = start_job("rollout", argv)
+    try:
+        jid = start_job("rollout", argv)
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, "job": jid}
 
 
@@ -1800,7 +1820,8 @@ async def api_delete_checkpoint(req: Request):
 @app.get("/control", response_class=HTMLResponse)
 def control_page():
     busy = busy_with(("record", "rollout")) or (
-        {"id": "port-watch (Setup 탭)"} if WATCH.on else None)
+        {"id": "port-watch (Setup 탭)"} if WATCH.on else None) or (
+        {"id": "calibration (Calib 탭)"} if CALIB.active else None)
     if busy:
         return f"""{CSS}{nav_html('ct')}<div class=wrap>
         <p class=eyebrow>Manual control</p><h2>Control</h2>
@@ -2050,8 +2071,8 @@ async def ws_control(sock: WebSocket):
         await sock.send_text(json.dumps({"type": "init", "error": "인증 필요 — 페이지를 새로고침하세요"}))
         await sock.close()
         return
-    if busy_with(("record", "rollout")):
-        await sock.send_text(json.dumps({"type": "init", "error": "record/rollout 실행 중 — 제어 불가"}))
+    if busy_with(("record", "rollout")) or WATCH.on or CALIB.active:
+        await sock.send_text(json.dumps({"type": "init", "error": "record/rollout/Setup/Calib 사용 중 — 제어 불가"}))
         await sock.close()
         return
     if CTL_OWNER is not None:
@@ -2792,8 +2813,7 @@ function renderCalib(cal){
         +'<br><span class=tiny>'+E(c.path)+'</span></div>';
     });
   });
-  h+='<p class=muted>없으면 Control 탭이 연결되지 않습니다. 지금은 <span class=mono>lerobot-calibrate</span>'
-    +' 로 만들어야 하고, 3단계에서 웹으로 옮깁니다.</p>';
+  h+='<p class=muted>없으면 Control 탭이 연결되지 않습니다 — <a href="/calib">Calib 탭</a>에서 만드세요.</p>';
   $('calib').innerHTML=h;
 }
 
@@ -2811,6 +2831,413 @@ async function save(){
   setTimeout(function(){ location.reload(); },700);
 }
 boot();
+</script>"""
+
+
+
+# ----------------------------- 페이지: Calibration ----------------------------
+FULL_TURN_MOTOR = "wrist_roll"       # lerobot 과 동일: 0~4095 고정
+SPAN_OK_DEG = 30.0                   # 이보다 좁으면 "덜 움직임" 경고
+
+
+class CalibSession:
+    """lerobot SOFollower/SOLeader.calibrate() 를 웹용 상태 머신으로 풀어 쓴 것.
+
+    원본은 input() 두 번과 record_ranges_of_motion() 의 터미널 Enter 대기로 블로킹됩니다.
+    여기서는 같은 버스 프리미티브를 같은 순서로 부르되, 대기 지점을 웹 버튼으로 바꿉니다:
+      connect(calibrate=False) → disable_torque → Operating_Mode=POSITION
+      → [버튼] set_half_turn_homings()
+      → 라이브 min/max 누적 → [버튼] write_calibration + _save_calibration
+    파일 경로·포맷은 lerobot 객체의 calibration_fpath / _save_calibration 을 그대로 씁니다.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()      # 시리얼 포트는 스레드 안전하지 않음 — 모든 버스 접근을 직렬화
+        self._reset()
+
+    def _reset(self):
+        self.device = None
+        self.side = self.role = None
+        self.stage = "idle"     # idle | homing | ranging | done | error
+        self.pos, self.lo, self.hi, self.homing = {}, {}, {}, {}
+        self.err = ""
+        self.old_calib = None   # 취소 시 모터에 되돌려 놓을 이전 캘리브레이션
+        self.homed = False
+        self.on = False
+        self.thread = None
+        self.saved_path = ""
+        self.saved = {}
+
+    @property
+    def active(self):
+        return self.stage in ("homing", "ranging")
+
+    # ---- 시작 / 종료 -----------------------------------------------------------
+    def start(self, side, role):
+        if self.active:
+            raise RuntimeError("이미 캘리브레이션 진행 중")
+        arm = ARM_CFGS.get(side)
+        if not arm:
+            raise RuntimeError(f"알 수 없는 팔: {side}")
+        port = arm.get(f"{role}_port")
+        if not port:
+            raise RuntimeError(f"{side}/{role} 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
+        self._reset()
+        self.side, self.role = side, role
+        if role == "follower":
+            from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
+            dev = SOFollower(SOFollowerRobotConfig(id=arm["follower_id"], port=port,
+                                                   use_degrees=True, cameras={}))
+        else:
+            from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
+            dev = SOLeader(SOLeaderTeleopConfig(id=arm["leader_id"], port=port, use_degrees=True))
+        self.old_calib = dict(dev.calibration) if dev.calibration else None
+        dev.connect(calibrate=False)           # calibrate=True 면 input() 에서 멈춥니다
+        try:
+            from lerobot.motors.feetech import OperatingMode
+            # configure() 의 torque_disabled() 가 끝나며 토크를 다시 켜므로 여기서 확실히 끕니다
+            dev.bus.disable_torque()
+            for m in dev.bus.motors:
+                dev.bus.write("Operating_Mode", m, OperatingMode.POSITION.value)
+        except Exception:
+            try:
+                dev.disconnect()
+            except Exception:
+                pass
+            raise
+        self.device = dev
+        self.stage = "homing"
+        self.on = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while self.on:
+            try:
+                with self.lock:
+                    if self.device is None:
+                        break
+                    pos = self.device.bus.sync_read("Present_Position", normalize=False)
+                self.pos = {k: int(v) for k, v in pos.items()}
+                if self.stage == "ranging":
+                    for k, v in self.pos.items():
+                        self.lo[k] = min(self.lo.get(k, v), v)
+                        self.hi[k] = max(self.hi.get(k, v), v)
+                self.err = ""
+            except Exception as e:
+                self.err = str(e)
+            time.sleep(0.1)
+
+    def _close(self):
+        self.on = False
+        t, self.thread = self.thread, None
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=1.5)
+        dev, self.device = self.device, None
+        if dev is not None:
+            with self.lock:
+                try:
+                    dev.disconnect()
+                except Exception:
+                    pass
+
+    # ---- 단계 ----------------------------------------------------------------
+    def set_home(self):
+        if self.stage != "homing":
+            raise RuntimeError("지금은 중앙 자세 단계가 아닙니다")
+        with self.lock:
+            # reset_calibration() 이 안에서 호출됨 — Homing_Offset=0, Min/Max 전체범위, bus.calibration 초기화
+            self.homing = {k: int(v) for k, v in self.device.bus.set_half_turn_homings().items()}
+            pos = self.device.bus.sync_read("Present_Position", normalize=False)
+        self.homed = True
+        self.pos = {k: int(v) for k, v in pos.items()}
+        self.lo = dict(self.pos)
+        self.hi = dict(self.pos)
+        self.stage = "ranging"
+
+    def problems(self):
+        """저장을 막아야 하는 관절(min==max) 과 경고 관절(스팬 좁음)."""
+        block, warn = [], []
+        for m in CTL_JOINTS:
+            if m == FULL_TURN_MOTOR:
+                continue
+            span = self.hi.get(m, 0) - self.lo.get(m, 0)
+            if span <= 0:
+                block.append(m)
+            elif span * 360 / 4095 < SPAN_OK_DEG:
+                warn.append(m)
+        return block, warn
+
+    def finish(self):
+        if self.stage != "ranging":
+            raise RuntimeError("범위 기록 단계가 아닙니다")
+        block, _ = self.problems()
+        if block:
+            raise RuntimeError("아직 움직이지 않은 관절: " + ", ".join(block))
+        from lerobot.motors import MotorCalibration
+        dev = self.device
+        calib = {}
+        for m, motor in dev.bus.motors.items():
+            if m == FULL_TURN_MOTOR:
+                lo, hi = 0, 4095
+            else:
+                lo, hi = int(self.lo[m]), int(self.hi[m])
+            calib[m] = MotorCalibration(id=motor.id, drive_mode=0,
+                                        homing_offset=int(self.homing[m]),
+                                        range_min=lo, range_max=hi)
+        with self.lock:
+            dev.bus.write_calibration(calib)
+            dev.calibration = calib
+            dev._save_calibration()
+        self.saved_path = str(dev.calibration_fpath)
+        self.saved = {m: {"homing_offset": c.homing_offset,
+                          "range_min": c.range_min, "range_max": c.range_max}
+                      for m, c in calib.items()}
+        self.stage = "done"
+        self._close()
+
+    def cancel(self):
+        if self.device is not None and self.homed and self.old_calib:
+            # 중앙 자세 기록이 모터 EEPROM 을 이미 바꿨으므로 이전 값을 되돌려 놓습니다
+            with self.lock:
+                try:
+                    self.device.bus.write_calibration(self.old_calib)
+                except Exception as e:
+                    self.err = f"이전 캘리브레이션 복원 실패: {e}"
+        self._close()
+        self.stage = "idle"       # done/error 화면의 '닫기' 도 여기로 옵니다
+
+    def state(self):
+        rows = []
+        for m in CTL_JOINTS:
+            r = {"name": m, "pos": self.pos.get(m), "full_turn": m == FULL_TURN_MOTOR}
+            if self.stage in ("ranging", "done"):
+                lo, hi = self.lo.get(m), self.hi.get(m)
+                r.update({"min": lo, "max": hi,
+                          "span_deg": round((hi - lo) * 360 / 4095, 1) if lo is not None else None})
+            if self.homed and r["pos"] is not None:
+                r["deg"] = round((r["pos"] - 2047) * 360 / 4095, 1)
+            rows.append(r)
+        block, warn = self.problems() if self.stage == "ranging" else ([], [])
+        return {"stage": self.stage, "side": self.side, "role": self.role,
+                "rows": rows, "err": self.err, "block": block, "warn": warn,
+                "saved_path": self.saved_path, "saved": self.saved,
+                "span_ok_deg": SPAN_OK_DEG}
+
+
+CALIB = CalibSession()
+
+
+@app.get("/calib", response_class=HTMLResponse)
+def calib_page():
+    return CSS + nav_html("cb") + CALIB_HTML
+
+
+@app.get("/api/calib/state")
+def api_calib_state():
+    st = CALIB.state()
+    st["devices"] = calib_status()
+    busy = exclusive_busy() if not CALIB.active else None
+    st["busy"] = f"{busy['id']} 실행 중" if busy else ""
+    st["ports_configured"] = ports_configured()
+    return st
+
+
+@app.post("/api/calib/start")
+async def api_calib_start(req: Request):
+    b = await req.json()
+    side, role = b.get("side"), b.get("role")
+    if role not in ("follower", "leader") or side not in ARM_CFGS:
+        return JSONResponse({"error": "side/role 이 잘못됨"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 종료 후 시작하세요"}, status_code=400)
+    try:
+        await asyncio.to_thread(CALIB.start, side, role)
+    except Exception as e:
+        CALIB.stage = "error"
+        CALIB.err = f"{type(e).__name__}: {e}"
+        return JSONResponse({"error": CALIB.err}, status_code=400)
+    return {"ok": True}
+
+
+@app.post("/api/calib/home")
+async def api_calib_home():
+    try:
+        await asyncio.to_thread(CALIB.set_home)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True}
+
+
+@app.post("/api/calib/finish")
+async def api_calib_finish():
+    try:
+        await asyncio.to_thread(CALIB.finish)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "path": CALIB.saved_path}
+
+
+@app.post("/api/calib/cancel")
+async def api_calib_cancel():
+    await asyncio.to_thread(CALIB.cancel)
+    return {"ok": True}
+
+
+CALIB_HTML = """
+<style>
+.devgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:18px}
+.dev{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.dev h3{margin:0 0 6px;font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}
+.dev .p{font-family:var(--mono);font-size:11px;color:var(--dim);word-break:break-all;margin-bottom:10px}
+.stagebox{background:var(--surface);border:1px solid var(--accent);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+.stagebox h3{margin:0 0 6px;font-size:16px}
+.stagebox .inst{color:var(--muted);margin:0 0 14px;line-height:1.7}
+.bar{height:6px;background:var(--surface2);border-radius:3px;overflow:hidden;min-width:120px}
+.bar i{display:block;height:100%;background:var(--accent)}
+.bar.ok i{background:var(--ok)} .bar.warn i{background:var(--warn)} .bar.bad i{background:var(--bad)}
+td.mono{font-variant-numeric:tabular-nums}
+.stepdots{display:flex;gap:6px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:14px}
+.stepdots b{color:var(--text)}
+.stepdots span.on{color:var(--accent)}
+</style>
+<div class=wrap>
+<p class=eyebrow>Motor calibration</p><h2>Calibration</h2>
+<div id=busywarn></div>
+<div id=picker></div>
+<div id=stage></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const E=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function jget(u){ return (await fetch(u)).json(); }
+async function jpost(u,b){
+  const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+  return r.json();
+}
+let ST=null, timer=null;
+
+function renderPicker(s){
+  let h='';
+  if(!s.ports_configured)
+    h+='<p class="badge b-warn">포트가 지정되지 않았습니다 — <a href="/setup">Setup 탭</a>에서 먼저 정하세요</p>';
+  h+='<div class=devgrid>';
+  Object.keys(s.devices).forEach(side=>{
+    ['follower','leader'].forEach(role=>{
+      const d=s.devices[side][role];
+      const busy=s.stage==='homing'||s.stage==='ranging';
+      h+='<div class=dev><h3>'+E(side)+' · '+role+'</h3>'
+        +'<span class="badge '+(d.ok?'b-ok':'b-bad')+'">'+(d.ok?'캘리브레이션 있음':'없음')+'</span> '
+        +'<span class=mono style="font-size:12px">'+E(d.id)+'.json</span>'
+        +'<div class=p>'+E(d.path)+'</div>'
+        +'<button class=primary '+(busy||!s.ports_configured?'disabled':'')
+        +' onclick="start(\\''+E(side)+'\\',\\''+role+'\\')">'+(d.ok?'다시 캘리브레이션':'캘리브레이션 시작')+'</button>'
+        +'</div>';
+    });
+  });
+  h+='</div>';
+  $('picker').innerHTML=h;
+}
+
+function rows(s, withRange){
+  let h='<table><tr><th>joint</th><th class=num>raw</th>'
+    +(s.stage!=='homing'?'<th class=num>deg</th>':'')
+    +(withRange?'<th class=num>min</th><th class=num>max</th><th class=num>span</th><th style="width:160px"></th>':'')
+    +'</tr>';
+  s.rows.forEach(r=>{
+    h+='<tr><td class=mono>'+r.name+(r.full_turn?' <span class=muted style="font-size:11px">(전체 회전, 0~4095 고정)</span>':'')+'</td>'
+      +'<td class="num mono">'+(r.pos==null?'-':r.pos)+'</td>'
+      +(s.stage!=='homing'?'<td class="num mono">'+(r.deg==null?'-':r.deg.toFixed(1)+'°')+'</td>':'');
+    if(withRange){
+      if(r.full_turn){ h+='<td class=num>0</td><td class=num>4095</td><td class=num>360°</td><td></td>'; }
+      else{
+        const sp=r.span_deg||0;
+        const cls = sp<=0?'bad':(sp<s.span_ok_deg?'warn':'ok');
+        const pct=Math.min(100, sp/180*100);
+        h+='<td class="num mono">'+(r.min==null?'-':r.min)+'</td><td class="num mono">'+(r.max==null?'-':r.max)+'</td>'
+          +'<td class="num mono">'+sp.toFixed(1)+'°</td>'
+          +'<td><div class="bar '+cls+'"><i style="width:'+pct+'%"></i></div></td>';
+      }
+    }
+    h+='</tr>';
+  });
+  return h+'</table>';
+}
+
+function dots(n){
+  const names=['연결','중앙 자세','범위 기록','저장'];
+  return '<div class=stepdots>'+names.map((x,i)=>
+    '<span class="'+(i===n?'on':'')+'">'+(i<n?'✓ ':'')+(i===n?'<b>'+x+'</b>':x)+'</span>'+(i<3?' › ':'')).join('')+'</div>';
+}
+
+function renderStage(s){
+  const box=$('stage');
+  const head='<h3>'+E(s.side)+' · '+E(s.role)+'</h3>';
+  const err=s.err?'<p class="badge b-bad">'+E(s.err)+'</p>':'';
+  if(s.stage==='homing'){
+    const follower = s.role==='follower';
+    box.innerHTML='<div class=stagebox>'+head+dots(1)
+      +'<p class=inst>토크가 꺼져 있습니다'+(follower?' — <b>팔로워가 주저앉을 수 있으니 손으로 받치세요.</b>':'.')+'<br>'
+      +'<b>모든 관절을 가동 범위의 정중앙</b>에 놓으세요 (그리퍼는 반쯤 벌린 상태). '
+      +'lerobot 은 이 자세를 각 모터의 반 바퀴(2047 tick) 기준점으로 잡습니다.<br>'
+      +'그리퍼 포함 6개 관절 전부입니다. 준비되면 아래 버튼을 누르세요.</p>'
+      +err+rows(s,false)
+      +'<div class=toolbar style="margin-top:14px">'
+      +'<button class="primary big" onclick="home()">중앙 자세 기록</button>'
+      +'<button class=danger onclick="cancel()">취소</button></div></div>';
+  }else if(s.stage==='ranging'){
+    const blk=s.block.length, wrn=s.warn.length;
+    let note='';
+    if(blk) note='<p class="badge b-bad">아직 움직이지 않은 관절: '+s.block.join(', ')+'</p>';
+    else if(wrn) note='<p class="badge b-warn">'+s.span_ok_deg+'° 미만으로만 움직인 관절: '+s.warn.join(', ')+' — 의도한 게 아니면 더 움직이세요</p>';
+    else note='<p class="badge b-ok">모든 관절 기록됨 — 저장할 수 있습니다</p>';
+    box.innerHTML='<div class=stagebox>'+head+dots(2)
+      +'<p class=inst><b>wrist_roll 을 뺀 모든 관절</b>을 한 개씩, 한쪽 끝에서 반대쪽 끝까지 <b>천천히</b> 움직이세요. '
+      +'그리퍼도 완전히 열고 완전히 닫으세요.<br>'
+      +'여기서 기록되는 min/max 가 그대로 관절 한계가 됩니다 — 기계적 스톱에 <b>살짝 닿기 직전</b>까지만.<br>'
+      +'각 줄의 막대가 초록이 되면 충분합니다. 끝나면 <b>완료·저장</b>.</p>'
+      +err+note+rows(s,true)
+      +'<div class=toolbar style="margin-top:14px">'
+      +'<button class="primary big" onclick="finish()" '+(blk?'disabled':'')+'>완료·저장</button>'
+      +'<button class=danger onclick="cancel()">취소 (이전 값 복원)</button></div></div>';
+  }else if(s.stage==='done'){
+    box.innerHTML='<div class=stagebox>'+head+dots(3)
+      +'<p class="badge b-ok">저장됨</p><p class="mono" style="font-size:12px;color:var(--muted)">'+E(s.saved_path)+'</p>'
+      +rows(s,true)
+      +'<pre style="margin-top:12px">'+E(JSON.stringify(s.saved,null,2))+'</pre>'
+      +'<div class=toolbar style="margin-top:14px"><button class=primary onclick="closeDone()">닫기</button>'
+      +'<a href="/control"><button>Control 탭에서 확인</button></a></div></div>';
+  }else if(s.stage==='error'){
+    box.innerHTML='<div class=stagebox>'+head+'<p class="badge b-bad">'+E(s.err)+'</p>'
+      +'<div class=toolbar><button onclick="closeDone()">닫기</button></div></div>';
+  }else{
+    box.innerHTML='';
+  }
+}
+
+async function refresh(){
+  const s=await jget('/api/calib/state'); ST=s;
+  $('busywarn').innerHTML=s.busy?'<p class="badge b-warn">'+E(s.busy)+' — 끝나야 캘리브레이션을 시작할 수 있습니다</p>':'';
+  renderPicker(s); renderStage(s);
+}
+async function start(side,role){
+  const r=await jpost('/api/calib/start',{side:side,role:role});
+  if(r.error) alert(r.error);
+  refresh();
+}
+async function home(){ const r=await jpost('/api/calib/home'); if(r.error) alert(r.error); refresh(); }
+async function finish(){
+  if(ST&&ST.warn&&ST.warn.length&&!confirm('일부 관절이 좁게만 움직였습니다:\\n'+ST.warn.join(', ')+'\\n이대로 저장할까요?')) return;
+  const r=await jpost('/api/calib/finish'); if(r.error) alert(r.error); refresh();
+}
+async function cancel(){
+  if(!confirm('취소하면 지금까지 기록이 버려집니다.')) return;
+  await jpost('/api/calib/cancel'); refresh();
+}
+async function closeDone(){ await jpost('/api/calib/cancel'); refresh(); }
+addEventListener('pagehide',()=>{ if(ST&&(ST.stage==='homing'||ST.stage==='ranging')) navigator.sendBeacon('/api/calib/cancel'); });
+refresh(); timer=setInterval(refresh,250);
 </script>"""
 
 

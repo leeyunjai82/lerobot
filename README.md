@@ -32,6 +32,8 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
   리더 팔로우, 카메라 MJPEG 스트리밍, Three.js URDF 3D. 탭 이탈 시 자동 해제
 - **Setup**: USB 시리얼 포트 스캔·probe(모터 ID 확인)·**포트 감시로 leader/follower 판별**,
   카메라 스캔·등록, 한팔/양팔 모드 전환, 캘리브레이션 파일 상태 — 전부 웹에서
+- **Calib**: 팔로워/리더 캘리브레이션을 웹에서 — 중앙 자세 기록 → 라이브 min/max 표시 → 저장.
+  `lerobot-calibrate` 와 같은 버스 호출 순서, 같은 파일 경로·포맷
 - record/rollout/train/control 자원 기반 상호 배타 (학습+수동제어는 동시 허용)
 
 ## 설정 — `lrweb_config.json`
@@ -86,6 +88,24 @@ Setup 탭은 시리얼 번호가 있으면 `by-id`, 없으면 `by-path` 를 자�
 엔코더를 읽습니다. 팔 하나를 손으로 움직이면 그 포트의 `travel` 값이 올라갑니다 → 그 줄의 역할 선택.
 ⚠️ 토크가 꺼지므로 팔로워가 들려 있으면 주저앉습니다. 받치거나 내려놓고 시작하세요.
 
+## 캘리브레이션 — Calib 탭
+
+`lerobot-calibrate` 가 하는 일을 그대로, 터미널 `input()` 대기만 웹 버튼으로 바꾼 것입니다.
+
+| 단계 | 화면 | 내부 (lerobot 과 동일) |
+|---|---|---|
+| 연결 | 팔 선택 → 시작 | `connect(calibrate=False)` → `disable_torque()` → `Operating_Mode=POSITION` |
+| 중앙 자세 | 모든 관절을 가동 범위 중앙에 → **중앙 자세 기록** | `bus.set_half_turn_homings()` |
+| 범위 기록 | wrist_roll 빼고 관절마다 양 끝까지 → 막대가 초록이면 충분 | `Present_Position` (raw) 폴링, min/max 누적 |
+| 저장 | **완료·저장** | `bus.write_calibration()` + `_save_calibration()` → `<id>.json` |
+
+- 안 움직인 관절(min == max)이 있으면 저장이 막힙니다 (lerobot 도 여기서 `ValueError`)
+- 30° 미만으로만 움직인 관절은 경고만 하고 저장은 허용합니다
+- `wrist_roll` 은 0~4095 고정 (전체 회전)
+- **취소**하면 중앙 자세 기록으로 이미 바뀐 모터 EEPROM 을 이전 캘리브레이션 값으로 되돌립니다
+- ⚠️ 시작하면 토크가 꺼집니다. 팔로워는 손으로 받치세요
+- 기록되는 min/max 가 그대로 관절 한계가 됩니다 — 기계적 스톱에 **닿기 직전**까지만 움직이세요
+
 ## 접속
 
 기본은 인증 없음입니다. 그냥 `http://<host>:8080/` 으로 들어가면 됩니다.
@@ -122,7 +142,7 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 |---|---|---|
 | 1 | 버그 픽스 + lerobot 객체(`SOFollower`/`SOLeader`) 전환 + 설정 파일 | ✅ |
 | 2 | Setup 탭 — USB 포트 스캔·probe·leader/follower 판별·카메라·모드 전환을 웹에서 | ✅ |
-| 3 | Calibration 탭 — 웹에서 캘리브레이션 (`lerobot-calibrate` 불필요) | |
+| 3 | Calibration 탭 — 웹에서 캘리브레이션 (`lerobot-calibrate` 불필요) | ✅ |
 | 4 | Control 탭 팔별 스레드 분리 | |
 | 5 | record worker 프로세스 — PTY 제거, `record_loop()` 직접 호출, 수집 중 카메라 미리보기 | |
 | 6 | 양팔 (`bi_so_follower` / `bi_so_leader`) | |
