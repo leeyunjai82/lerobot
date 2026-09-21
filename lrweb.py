@@ -1125,6 +1125,95 @@ class PortWatcher:
 WATCH = PortWatcher()
 
 
+class MotorSetupSession:
+    """새 팔 모터 ID 세팅 — lerobot-setup-motors 의 웹 버전.
+
+    새 STS3215 는 전부 ID 1 이라, 모터를 **한 개씩만** 보드에 연결하고 순서대로 ID 를 씁니다.
+    lerobot 과 같은 순서(gripper=6 → … → shoulder_pan=1)로 bus.setup_motor(name) 을 부릅니다.
+    setup_motor 는 응답한 첫 모터를 그냥 골라 쓰므로, 쓰기 전에 응답 ID 가 정확히 1개인지 따로 확인합니다."""
+
+    ORDER = list(reversed(CTL_JOINTS))
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._reset()
+
+    def _reset(self):
+        self.bus = None
+        self.port = ""
+        self.stage = "idle"      # idle | running | done | error
+        self.idx = 0
+        self.done = []           # [{"name", "id", "from_id", "baud"}]
+        self.err = ""
+        self.last = ""
+
+    @property
+    def active(self):
+        return self.stage == "running"
+
+    @property
+    def current(self):
+        return self.ORDER[self.idx] if self.idx < len(self.ORDER) else None
+
+    def start(self, port):
+        if self.active:
+            raise RuntimeError("이미 모터 ID 세팅 진행 중")
+        from lerobot.motors.feetech import FeetechMotorsBus
+        self._reset()
+        bus = FeetechMotorsBus(port, _feetech_motors())
+        bus.connect(handshake=False)     # 아직 ID 가 안 맞으니 handshake 는 하면 안 됨
+        self.bus = bus
+        self.port = port
+        self.stage = "running"
+
+    def write_current(self):
+        if not self.active:
+            raise RuntimeError("진행 중이 아닙니다")
+        name = self.current
+        bus = self.bus
+        target = bus.motors[name].id
+        with self.lock:
+            baud, cur_id = bus._find_single_motor(name)     # 보드레이트 전부 훑어 모터 1개 탐색
+            bus.set_baudrate(baud)
+            ids = bus.broadcast_ping() or {}
+            if len(ids) > 1:
+                raise RuntimeError(f"모터가 {len(ids)}개 응답합니다 (ID {sorted(ids)}) — "
+                                   f"'{name}' 모터 하나만 보드에 연결하세요")
+            bus.setup_motor(name, initial_baudrate=baud, initial_id=cur_id)
+            bus.set_baudrate(bus.default_baudrate)
+            after = bus.broadcast_ping() or {}
+        if target not in after:
+            raise RuntimeError(f"ID {target} 기록 후 응답이 없습니다 — 전원/배선 확인 후 다시 시도")
+        self.done.append({"name": name, "id": target, "from_id": int(cur_id), "baud": int(baud)})
+        self.last = f"{name}: ID {cur_id} → {target} (baud {baud} → {bus.default_baudrate})"
+        self.idx += 1
+        if self.idx >= len(self.ORDER):
+            self.stage = "done"
+            self._close()
+
+    def _close(self):
+        bus, self.bus = self.bus, None
+        if bus is not None:
+            with self.lock:
+                try:
+                    bus.disconnect(disable_torque=False)
+                except Exception:
+                    pass
+
+    def cancel(self):
+        self._close()
+        self.stage = "idle"
+
+    def state(self):
+        return {"stage": self.stage, "port": self.port, "order": self.ORDER,
+                "idx": self.idx, "current": self.current,
+                "current_id": (self.idx + 1 <= len(self.ORDER)) and (len(self.ORDER) - self.idx) or None,
+                "done": self.done, "err": self.err, "last": self.last}
+
+
+MOTORSETUP = MotorSetupSession()
+
+
 def busy_with(kinds):
     for j in jobs_index():
         if j["alive"] and j["kind"] in kinds:
@@ -1140,6 +1229,8 @@ def robot_busy():
         return {"id": "port-watch (Setup 탭)", "kind": "setup", "alive": True}
     if CALIB.active:
         return {"id": "calibration (Calib 탭)", "kind": "calib", "alive": True}
+    if MOTORSETUP.active:
+        return {"id": "motor-id-setup (Setup 탭)", "kind": "setup", "alive": True}
     return busy_with(("record", "rollout"))
 
 
@@ -1155,6 +1246,8 @@ def exclusive_busy():
         return {"id": "port-watch (Setup 탭)", "kind": "setup", "alive": True}
     if CALIB.active:
         return {"id": "calibration (Calib 탭)", "kind": "calib", "alive": True}
+    if MOTORSETUP.active:
+        return {"id": "motor-id-setup (Setup 탭)", "kind": "setup", "alive": True}
     return busy_with(("record", "rollout", "train"))
 
 
@@ -1951,7 +2044,8 @@ async def api_delete_checkpoint(req: Request):
 def control_page():
     busy = busy_with(("record", "rollout")) or (
         {"id": "port-watch (Setup 탭)"} if WATCH.on else None) or (
-        {"id": "calibration (Calib 탭)"} if CALIB.active else None)
+        {"id": "calibration (Calib 탭)"} if CALIB.active else None) or (
+        {"id": "motor-id-setup (Setup 탭)"} if MOTORSETUP.active else None)
     if busy:
         return f"""{CSS}{nav_html('ct')}<div class=wrap>
         <p class=eyebrow>Manual control</p><h2>Control</h2>
@@ -2203,7 +2297,7 @@ async def ws_control(sock: WebSocket):
         await sock.send_text(json.dumps({"type": "init", "error": "인증 필요 — 페이지를 새로고침하세요"}))
         await sock.close()
         return
-    if busy_with(("record", "rollout")) or WATCH.on or CALIB.active:
+    if busy_with(("record", "rollout")) or WATCH.on or CALIB.active or MOTORSETUP.active:
         await sock.send_text(json.dumps({"type": "init", "error": "record/rollout/Setup/Calib 사용 중 — 제어 불가"}))
         await sock.close()
         return
@@ -2577,6 +2671,46 @@ async def api_setup_watch_stop():
     return {"ok": True}
 
 
+@app.get("/api/setup/motors")
+def api_motors_state():
+    return MOTORSETUP.state()
+
+
+@app.post("/api/setup/motors/start")
+async def api_motors_start(req: Request):
+    b = await req.json()
+    port = (b.get("port") or "").strip()
+    if not port.startswith("/dev/"):
+        return JSONResponse({"error": "포트는 /dev/ 로 시작해야 합니다"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중"}, status_code=400)
+    try:
+        await asyncio.to_thread(MOTORSETUP.start, port)
+    except Exception as e:
+        MOTORSETUP.stage = "error"
+        MOTORSETUP.err = f"{type(e).__name__}: {e}"
+        return JSONResponse({"error": MOTORSETUP.err}, status_code=400)
+    return {"ok": True}
+
+
+@app.post("/api/setup/motors/write")
+async def api_motors_write():
+    try:
+        await asyncio.to_thread(MOTORSETUP.write_current)
+        MOTORSETUP.err = ""
+    except Exception as e:
+        MOTORSETUP.err = f"{type(e).__name__}: {e}"
+        return JSONResponse({"error": MOTORSETUP.err}, status_code=400)
+    return {"ok": True, "last": MOTORSETUP.last}
+
+
+@app.post("/api/setup/motors/cancel")
+async def api_motors_cancel():
+    await asyncio.to_thread(MOTORSETUP.cancel)
+    return {"ok": True}
+
+
 @app.post("/api/setup/config")
 async def api_setup_config(req: Request):
     busy = exclusive_busy()
@@ -2606,6 +2740,9 @@ SETUP_HTML = """
 .slot input.port{flex:1;min-width:240px;font-family:var(--mono);font-size:12.5px}
 .slot input.cid{width:130px;font-family:var(--mono);font-size:12.5px}
 .tiny{font-size:11px;color:var(--dim);font-family:var(--mono)}
+.stagebox{background:var(--surface);border:1px solid var(--accent);border-radius:10px;padding:16px 18px}
+.stagebox h3{margin:0 0 6px;font-size:15px}
+.stagebox .inst{color:var(--muted);margin:0 0 12px;line-height:1.7}
 </style>
 <div class=wrap>
 <p class=eyebrow>Hardware setup</p><h2>Setup</h2>
@@ -2637,6 +2774,18 @@ SETUP_HTML = """
     보드에 USB 시리얼 번호가 없으면(<b>sn 없음</b>) 같은 모델 2개가 by-id 로 구분이 안 되기 때문입니다.
     by-path 는 꽂은 USB 물리 포트에 고정되므로, <b>팔을 항상 같은 USB 구멍에 꽂아야</b> 합니다.
   </p>
+</div>
+
+<p class=eyebrow>2b · 모터 ID 세팅 — 새 팔 조립 시</p>
+<div class=card>
+  <p class=muted style="margin-top:0">새 STS3215 는 전부 ID 1 입니다. probe 에서 <b>1,2,3,4,5,6</b> 이 다 뜨면 이 단계는 건너뛰세요.
+  하나만 뜨거나 응답이 없으면 여기서 ID 를 씁니다 — <b>모터를 한 개씩만 보드에 꽂아</b> 순서대로 진행합니다
+  (여러 개가 같은 ID 1 로 붙어 있으면 응답이 충돌합니다).</p>
+  <div class=toolbar>
+    <select id=msport></select>
+    <button id=msstart class=primary onclick="msStart()">모터 ID 세팅 시작</button>
+  </div>
+  <div id=msbox></div>
 </div>
 
 <p class=eyebrow>3 · 카메라</p>
@@ -2705,6 +2854,7 @@ async function boot(){
   $('mrt').value=(CFG.max_relative_target==null?'':CFG.max_relative_target);
   $('task').value=CFG.default_task||'';
   renderArms(); renderPorts(); renderCurCams(); renderCalib(s.calib); dump();
+  fillMsPorts(); msRefresh();
 }
 function dump(){ $('cfgdump').textContent=JSON.stringify(CFG,null,2); }
 
@@ -2839,7 +2989,7 @@ function btn(label,fn,cls){
   if(cls)b.className=cls; b.style.marginLeft='6px'; b.onclick=fn; return b;
 }
 
-async function loadPorts(){ PORTS=(await jget('/api/setup/ports')).ports; renderPorts(); }
+async function loadPorts(){ PORTS=(await jget('/api/setup/ports')).ports; renderPorts(); fillMsPorts(); }
 
 async function doProbe(dev,full){
   const cell=$('m_'+dev); cell.textContent='...';
@@ -2872,6 +3022,52 @@ async function stopWatch(){
   await jpost('/api/setup/watch/stop');
 }
 addEventListener('pagehide',()=>{ if(WATCHING) navigator.sendBeacon('/api/setup/watch/stop'); });
+
+/* ---------- 모터 ID 세팅 ---------- */
+let MS=null, mstimer=null;
+function fillMsPorts(){
+  const sel=$('msport'); const cur=sel.value; sel.innerHTML='';
+  PORTS.forEach(p=>{ const o=document.createElement('option'); o.value=p.dev; o.textContent=p.dev+(p.usb&&p.usb.product?'  ('+p.usb.product+')':''); sel.appendChild(o); });
+  if(cur) sel.value=cur;
+}
+async function msStart(){
+  const port=$('msport').value; if(!port){ alert('포트를 고르세요'); return; }
+  if(!confirm('모터를 한 개씩만 보드에 연결한 상태여야 합니다. 시작할까요?')) return;
+  const r=await jpost('/api/setup/motors/start',{port:port});
+  if(r.error){ alert(r.error); }
+  msRefresh(); if(!mstimer) mstimer=setInterval(msRefresh,1000);
+}
+async function msWrite(){
+  const b=document.querySelector('#msbox button.primary'); if(b) b.disabled=true;
+  const r=await jpost('/api/setup/motors/write'); msRefresh();
+}
+async function msCancel(){ await jpost('/api/setup/motors/cancel'); msRefresh(); }
+async function msRefresh(){
+  MS=await jget('/api/setup/motors');
+  const box=$('msbox');
+  if(MS.stage==='idle'){ box.innerHTML=''; if(mstimer){clearInterval(mstimer); mstimer=null;} return; }
+  const doneList=MS.done.map(d=>'<span class="badge b-ok">'+E(d.name)+' = ID '+d.id+'</span>').join(' ');
+  let h='<div style="margin-top:6px">'+(doneList||'<span class=muted>아직 기록된 모터 없음</span>')+'</div>';
+  if(MS.stage==='running'){
+    const n=MS.idx+1, total=MS.order.length, targetId=total-MS.idx;
+    h+='<div class=stagebox style="margin-top:12px"><h3>'+n+' / '+total+' · <span class=mono>'+E(MS.current)+'</span> → ID '+targetId+'</h3>'
+      +'<p class=inst>보드에 <b>'+E(MS.current)+'</b> 모터 <b>하나만</b> 연결하고 전원이 들어온 상태에서 아래 버튼을 누르세요. '
+      +'다른 모터는 케이블을 빼 두세요. 이미 ID 를 쓴 모터도 아직 붙이지 마세요.</p>'
+      +(MS.err?'<p class="badge b-bad">'+E(MS.err)+'</p>':'')
+      +(MS.last?'<p class="mono muted" style="font-size:12px">'+E(MS.last)+'</p>':'')
+      +'<div class=toolbar><button class="primary big" onclick="msWrite()">ID '+targetId+' 쓰기</button>'
+      +'<button class=danger onclick="msCancel()">중단</button></div></div>';
+  }else if(MS.stage==='done'){
+    h+='<p class="badge b-ok" style="margin-top:10px">6개 모터 ID 세팅 완료 — 이제 모터를 전부 데이지체인으로 연결하고 probe 로 1~6 확인 → Calib 탭</p>'
+      +'<div class=toolbar><button onclick="msCancel()">닫기</button></div>';
+    if(mstimer){clearInterval(mstimer); mstimer=null;}
+  }else if(MS.stage==='error'){
+    h+='<p class="badge b-bad" style="margin-top:10px">'+E(MS.err)+'</p><div class=toolbar><button onclick="msCancel()">닫기</button></div>';
+    if(mstimer){clearInterval(mstimer); mstimer=null;}
+  }
+  box.innerHTML=h;
+}
+addEventListener('pagehide',()=>{ if(MS&&MS.stage==='running') navigator.sendBeacon('/api/setup/motors/cancel'); });
 
 /* ---------- 카메라 ---------- */
 async function loadCams(){
