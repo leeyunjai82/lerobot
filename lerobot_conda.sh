@@ -1,39 +1,57 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  Jetson AGX Thor : LeRobot 환경 (conda, docker 미사용)
+#  LeRobot + lrweb 환경 셋업 (conda, docker 미사용)
+#  Jetson Thor(aarch64 / CUDA 13) 와 x86_64(CUDA 13) 를 자동 분기합니다.
 #
-#  위치: /home/circulus/project/lerobot/lerobot_conda.sh
-#
-#  핵심 주의사항 2가지:
-#   1) PyTorch를 pip 기본 인덱스에서 받으면 CUDA를 못 잡습니다.
-#      반드시 aarch64-sbsa / CUDA 13 전용 휠 인덱스를 써야 합니다.
-#   2) 그 휠이 cp312로 빌드되어 있어서 conda 파이썬도 3.12여야 합니다.
-#
-#  실행:
-#     mkdir -p ~/project/lerobot && cd ~/project/lerobot
+#  새 기기에서:
+#     mkdir -p ~/project && cd ~/project
+#     git clone https://github.com/leeyunjai82/lerobot.git lerobot
+#     cd lerobot
 #     chmod +x lerobot_conda.sh
 #     sudo -v
 #     nohup ./lerobot_conda.sh > /dev/null 2>&1 &
 #     tail -f lerobot_conda.log
+#
+#  끝나면:
+#     source ~/project/lerobot/activate.sh
+#     cd ~/project/lerobot && nohup python lrweb.py > lrweb.log 2>&1 &
+#     → http://<ip>:8080/setup 에서 포트·카메라 지정, /calib 에서 캘리브레이션
+#
+#  핵심 주의사항 (Thor):
+#   1) PyTorch 를 pip 기본 인덱스에서 받으면 CUDA 를 못 잡습니다.
+#      aarch64-sbsa / CUDA 13 전용 휠 인덱스를 써야 합니다.
+#   2) 그 휠이 cp312 라서 conda 파이썬도 3.12 여야 합니다.
 # ============================================================================
 set -Eeuo pipefail
 
 # ------------------------------- 설정 ---------------------------------------
-PROJECT_ROOT="/home/circulus/project"
-WORKDIR="${PROJECT_ROOT}/lerobot"
+WORKDIR="${HOME}/project/lerobot"          # 이 레포 (lrweb.py 가 있는 곳)
 LOGFILE="${WORKDIR}/lerobot_conda.log"
 CONDA_DIR="${HOME}/miniforge3"
 ENV_NAME="lerobot"
-PY_VER="3.12"                       # Thor 휠이 cp312. 바꾸지 말 것
+PY_VER="3.12"                              # Thor 휠이 cp312. 바꾸지 말 것
 LEROBOT_SRC="${WORKDIR}/lerobot-src"
+LEROBOT_COMMIT="e40b58a8dfa9e7b86918c374791599d070518d11"   # README 와 동일. lrweb 가 이 API 에 맞춰져 있음
 DATA_DIR="${WORKDIR}/data"
 
-# Thor(sbsa/CUDA13)용 PyTorch 휠 인덱스 후보
-TORCH_INDEXES=(
-  "https://pypi.jetson-ai-lab.io/sbsa/cu130"
-  "https://pypi.jetson-ai-lab.io/sbsa/cu129"
-  "https://pypi.jetson-ai-lab.dev/sbsa/cu130"
-)
+ARCH="$(uname -m)"
+case "${ARCH}" in
+  aarch64)
+    MINIFORGE="Miniforge3-Linux-aarch64.sh"
+    TORCH_INDEXES=(
+      "https://pypi.jetson-ai-lab.io/sbsa/cu130"
+      "https://pypi.jetson-ai-lab.io/sbsa/cu129"
+      "https://pypi.jetson-ai-lab.dev/sbsa/cu130"
+    )
+    TORCH_PKGS="torch torchvision torchaudio"
+    ;;
+  x86_64)
+    MINIFORGE="Miniforge3-Linux-x86_64.sh"
+    TORCH_INDEXES=("https://download.pytorch.org/whl/cu130")
+    TORCH_PKGS="torch torchvision"
+    ;;
+  *) echo "지원하지 않는 아키텍처: ${ARCH}"; exit 1 ;;
+esac
 # ---------------------------------------------------------------------------
 
 mkdir -p "${WORKDIR}" "${DATA_DIR}"
@@ -44,7 +62,8 @@ warn() { echo "[$(date '+%F %T')] !! $*"; }
 die()  { echo "[$(date '+%F %T')] XX 치명적 실패: $*"; exit 1; }
 trap 'warn "line ${LINENO} 오류. 로그: ${LOGFILE}"' ERR
 
-log "시작. 작업경로=${WORKDIR}"
+log "시작. arch=${ARCH} 작업경로=${WORKDIR}"
+[[ -f "${WORKDIR}/lrweb.py" ]] || die "${WORKDIR}/lrweb.py 가 없습니다. 이 레포를 ~/project/lerobot 에 clone 한 뒤 실행하세요"
 
 # ------------------------------------------------------------- 0. 시스템 의존성
 log "0. 시스템 패키지"
@@ -52,12 +71,13 @@ sudo apt-get update -qq
 sudo apt-get install -y \
   git cmake build-essential pkg-config \
   ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  libgl1 libglib2.0-0 libusb-1.0-0-dev \
+  libgl1 libglib2.0-0 libusb-1.0-0-dev v4l-utils \
   python3-pip curl
 
-# 시리얼 포트 권한 (SO-101 리더/팔로워)
-sudo usermod -aG dialout "${USER}" || true
+# 시리얼(모터 보드)·카메라 권한. udev 심볼릭 링크는 만들지 않습니다 — 포트는 웹 Setup 탭에서 지정합니다.
+sudo usermod -aG dialout,video "${USER}" || true
 sudo tee /etc/udev/rules.d/99-so101.rules >/dev/null <<'RULES'
+# USB-serial 보드 권한 (WCH CH34x / Silicon Labs CP210x / FTDI). 어느 칩인지는 lsusb 로 확인.
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", MODE="0666", GROUP="dialout"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", MODE="0666", GROUP="dialout"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0666", GROUP="dialout"
@@ -68,7 +88,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger || true
 log "1. miniforge 설치"
 if [[ ! -d "${CONDA_DIR}" ]]; then
   curl -fsSL -o /tmp/miniforge.sh \
-    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh"
+    "https://github.com/conda-forge/miniforge/releases/latest/download/${MINIFORGE}"
   bash /tmp/miniforge.sh -b -p "${CONDA_DIR}"
 else
   echo "이미 설치됨: ${CONDA_DIR}"
@@ -87,24 +107,24 @@ else
 fi
 conda activate "${ENV_NAME}"
 python -V
-
 python -m pip install --upgrade pip setuptools wheel
 
-# -------------------------------------------------------- 3. PyTorch (Thor 전용)
-log "3. PyTorch 설치 (aarch64-sbsa / CUDA 13 전용 휠)"
+# ------------------------------------------------------------------ 3. PyTorch
+log "3. PyTorch 설치 (${ARCH}, CUDA 13 휠)"
 TORCH_OK=0
 for idx in "${TORCH_INDEXES[@]}"; do
   echo "--- 인덱스 시도: ${idx}"
-  if pip install --index-url "${idx}" torch torchvision torchaudio; then
+  # shellcheck disable=SC2086
+  if pip install --index-url "${idx}" ${TORCH_PKGS}; then
     TORCH_OK=1
     echo "--- 성공: ${idx}"
     break
   fi
   warn "실패: ${idx}"
 done
-(( TORCH_OK == 0 )) && die "PyTorch 설치 실패. https://pypi.jetson-ai-lab.io 에서 sbsa/cuXXX 경로 확인 후 TORCH_INDEXES 수정"
+(( TORCH_OK == 0 )) && die "PyTorch 설치 실패. 인덱스 경로 확인 후 TORCH_INDEXES 수정"
 
-log "3-1. CUDA 인식 확인"
+check_cuda() {
 python - <<'PY'
 import torch, sys
 print("torch      :", torch.__version__)
@@ -112,67 +132,67 @@ print("cuda avail :", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("device     :", torch.cuda.get_device_name(0))
 else:
-    print("!! CUDA 미인식 — 잘못된 휠입니다. 여기서 멈추고 인덱스 다시 확인하세요.")
+    print("!! CUDA 미인식 — 잘못된 휠입니다.")
     sys.exit(1)
 PY
+}
+log "3-1. CUDA 인식 확인"
+check_cuda || die "CUDA 미인식. 여기서 멈춥니다"
 
 # ------------------------------------------------------------------ 4. LeRobot
-log "4. LeRobot 설치 (소스, feetech 서보 지원 포함)"
-if [[ ! -d "${LEROBOT_SRC}" ]]; then
+log "4. LeRobot 소스 (commit ${LEROBOT_COMMIT:0:8})"
+if [[ ! -d "${LEROBOT_SRC}/.git" ]]; then
   git clone https://github.com/huggingface/lerobot.git "${LEROBOT_SRC}"
-else
-  git -C "${LEROBOT_SRC}" pull --ff-only || warn "pull 실패, 기존 트리 사용"
 fi
+git -C "${LEROBOT_SRC}" fetch --all --tags || warn "fetch 실패, 로컬 트리 사용"
+git -C "${LEROBOT_SRC}" checkout -q "${LEROBOT_COMMIT}" \
+  || die "lerobot commit ${LEROBOT_COMMIT} 체크아웃 실패"
 cd "${LEROBOT_SRC}"
 
-# 중요: torch를 재설치해서 덮어쓰지 않도록 방지
-cat > /tmp/no-torch-constraint.txt <<'CON'
-torch
-torchvision
-torchaudio
-CON
-pip install -e ".[feetech]" --no-deps
-pip install -e ".[feetech]" 2>/dev/null || {
-  warn "전체 의존성 설치 중 일부 실패. 개별 설치 재시도"
-  pip install \
-    "datasets" "huggingface_hub" "opencv-python" "imageio[ffmpeg]" \
-    "av" "einops" "gymnasium" "hydra-core" "termcolor" "wandb" \
-    "deepdiff" "draccus" "jsonlines" "packaging" "rerun-sdk" \
-    "feetech-servo-sdk" || warn "일부 패키지 실패 (로그 확인)"
-}
-
-log "4-1. torch가 덮어써지지 않았는지 재확인"
-python - <<'PY'
-import torch
-print("torch      :", torch.__version__)
-print("cuda avail :", torch.cuda.is_available())
-if not torch.cuda.is_available():
-    print("!! lerobot 설치 과정에서 torch가 CPU 휠로 덮어써졌습니다.")
-    print("   조치: pip uninstall -y torch torchvision torchaudio 후 3단계 인덱스로 재설치")
+log "4-1. lerobot[feetech,training] 설치 (torch 는 위 휠 유지)"
+# torch 를 pip 기본 인덱스 것으로 덮어쓰지 않도록 현재 버전으로 핀
+python - <<'PY' > /tmp/torch-constraint.txt
+import torch, torchvision
+print(f"torch=={torch.__version__}")
+print(f"torchvision=={torchvision.__version__}")
 PY
+cat /tmp/torch-constraint.txt
+PIP_CONSTRAINT=/tmp/torch-constraint.txt pip install -e ".[feetech,training]" \
+  || die "lerobot 설치 실패 (로그 확인)"
+
+# torchcodec 은 Jetson 에서 문제를 일으켜 pyav 디코딩으로 통일합니다 (README 와 동일)
+pip uninstall -y torchcodec || true
+pip install "av>=15.0.0,<16.0.0"
+
+log "4-2. lrweb 의존성"
+pip install "fastapi<1.0" uvicorn
+
+log "4-3. torch 가 덮어써지지 않았는지 재확인"
+check_cuda || die "lerobot 설치 과정에서 torch 가 CPU 휠로 바뀌었습니다. pip uninstall -y torch torchvision 후 3단계 인덱스로 재설치"
 
 # ----------------------------------------------------------------- 5. 임포트 검증
 log "5. 최종 검증"
 python - <<'PY'
 import torch
-print("torch :", torch.__version__, "| cuda:", torch.cuda.is_available())
-try:
-    import lerobot
-    print("lerobot: OK")
-except Exception as e:
-    print("lerobot import 실패:", e)
+print("torch   :", torch.__version__, "| cuda:", torch.cuda.is_available())
+import lerobot
+from lerobot.robots.so_follower import SOFollower
+from lerobot.robots.bi_so_follower import BiSOFollower
+from lerobot.motors.feetech import FeetechMotorsBus
+from lerobot.scripts.lerobot_record import record_loop
+import fastapi, uvicorn, cv2, av
+print("lerobot :", "OK (so_follower / bi_so_follower / feetech / record_loop)")
+print("fastapi :", fastapi.__version__, "| cv2:", cv2.__version__, "| av:", av.__version__)
 PY
 
 # ------------------------------------------------------------ 6. 활성화 헬퍼
-log "6. 헬퍼 생성"
+log "6. activate.sh"
 cat > "${WORKDIR}/activate.sh" <<EOF
 #!/usr/bin/env bash
-# 사용: source ~/project/lerobot/activate.sh
 source ${CONDA_DIR}/etc/profile.d/conda.sh
 conda activate ${ENV_NAME}
 export HF_HOME=${DATA_DIR}/hf
 cd ${LEROBOT_SRC}
-echo "lerobot 환경 활성화됨 (python \$(python -V 2>&1))"
 EOF
 chmod +x "${WORKDIR}/activate.sh"
 
@@ -181,17 +201,22 @@ log "완료"
 cat <<EOF
 
   conda env : ${ENV_NAME}  (python ${PY_VER})
-  소스      : ${LEROBOT_SRC}
-  데이터    : ${DATA_DIR}
+  lerobot   : ${LEROBOT_SRC} @ ${LEROBOT_COMMIT:0:8}
+  데이터    : ${DATA_DIR}   (HF_HOME=${DATA_DIR}/hf → 캘리브레이션은 \$HF_HOME/lerobot/calibration)
   활성화    : source ${WORKDIR}/activate.sh
 
-  --- 팔 연결 후 ---
+  --- lrweb 실행 ---
   source ${WORKDIR}/activate.sh
-  lerobot-find-port
-  lerobot-calibrate --robot.type=so101_follower --robot.port=/dev/ttyACM0 --robot.id=follower
-  lerobot-calibrate --teleop.type=so101_leader  --teleop.port=/dev/ttyACM1 --teleop.id=leader
+  cd ${WORKDIR} && nohup python lrweb.py > lrweb.log 2>&1 &
+  → http://<ip>:8080
 
-  * dialout 그룹 반영을 위해 재로그인 한 번 필요할 수 있습니다.
-  * 학습 시에는 사내 LLM을 내리세요: docker stop vllm-server
+  --- 웹에서 순서대로 ---
+  Setup   : 한팔/양팔 → 포트 스캔 → 포트 감시로 팔 판별 → 카메라 스캔·추가 → 저장
+  Calib   : 팔로워·리더 각각 (양팔이면 4개)
+  Control : 슬라이더 범위 확인
+  Collect : 수집
+
+  * dialout / video 그룹 반영을 위해 재로그인(또는 재부팅) 한 번 필요합니다.
+  * 학습 시 GPU 를 쓰는 다른 서비스(vLLM 등)는 내리세요.
 
 EOF
