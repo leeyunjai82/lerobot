@@ -82,22 +82,20 @@ DEFAULT_CONFIG = {
     # None 이면 lerobot 쪽 상대이동 캡을 쓰지 않습니다 (Control 탭의 자체 적분기가 담당).
     # 값을 주면 send_action 마다 Present_Position 을 한 번 더 읽으므로 루프가 느려집니다.
     "max_relative_target": None,
+    # 포트는 비워 둡니다 — udev 심볼릭 링크(/dev/so101_follower 같은) 를 전제하지 않습니다.
+    # Setup 탭에서 스캔·판별해서 채웁니다.
     "arms": [
         {
             "side": "main",
-            "follower_port": "/dev/so101_follower",
+            "follower_port": "",
             "follower_id": "follower",
-            "leader_port": "/dev/so101_leader",
+            "leader_port": "",
             "leader_id": "leader",
-            "cameras": {
-                "wrist": {"index_or_path": 0, "width": 640, "height": 480, "fps": 30},
-            },
+            "cameras": {},
         }
     ],
     # 특정 팔에 속하지 않는 카메라 (양팔에서도 접두사 없이 유지됩니다)
-    "cameras": {
-        "top": {"index_or_path": 2, "width": 640, "height": 480, "fps": 30},
-    },
+    "cameras": {},
 }
 
 
@@ -118,33 +116,54 @@ def load_config():
             print(f"[lrweb] 설정 파일 생성 실패: {e}")
     if not cfg.get("arms"):
         cfg["arms"] = json.loads(json.dumps(DEFAULT_CONFIG["arms"]))
+    # mode 가 1차 기준입니다. arms 길이가 안 맞으면 mode 에 맞춰 잘라내거나 채웁니다.
+    cfg["mode"] = "bimanual" if str(cfg.get("mode", "")).lower() in ("bimanual", "bi", "dual") else "single"
+    want = 2 if cfg["mode"] == "bimanual" else 1
+    cfg["arms"] = cfg["arms"][:want]
+    while len(cfg["arms"]) < want:
+        cfg["arms"].append({})
+    names = ("main",) if want == 1 else ("left", "right")
     for i, arm in enumerate(cfg["arms"]):
-        arm.setdefault("side", "main" if len(cfg["arms"]) == 1 else ("left", "right")[i])
+        arm["side"] = names[i]
+        suffix = "" if want == 1 else f"_{names[i]}"
         arm.setdefault("cameras", {})
-        arm.setdefault("follower_id", f"follower_{arm['side']}" if len(cfg["arms"]) > 1 else "follower")
-        arm.setdefault("leader_id", f"leader_{arm['side']}" if len(cfg["arms"]) > 1 else "leader")
+        arm.setdefault("follower_port", "")
+        arm.setdefault("leader_port", "")
+        arm.setdefault("follower_id", f"follower{suffix}")
+        arm.setdefault("leader_id", f"leader{suffix}")
     cfg.setdefault("cameras", {})
     return cfg
 
 
-CFG = load_config()
-ARM_CFGS = {a["side"]: a for a in CFG["arms"]}
-SIDES = list(ARM_CFGS)
-BIMANUAL = len(SIDES) > 1
-
-
-def all_camera_specs():
+def all_camera_specs(cfg, arm_cfgs, bimanual):
     """{표시이름: spec} — 한팔에서는 팔 카메라와 공용 카메라를 그냥 합칩니다."""
     out = {}
-    for side, arm in ARM_CFGS.items():
+    for side, arm in arm_cfgs.items():
         for name, spec in arm["cameras"].items():
-            out[f"{side}_{name}" if BIMANUAL else name] = spec
-    for name, spec in CFG["cameras"].items():
+            out[f"{side}_{name}" if bimanual else name] = spec
+    for name, spec in cfg["cameras"].items():
         out[name] = spec
     return out
 
 
-CAM_SPECS = all_camera_specs()
+def _rebind(cfg):
+    """설정에서 파생되는 전역을 다시 만듭니다 (Setup 탭 저장 시 재호출)."""
+    global CFG, ARM_CFGS, SIDES, BIMANUAL, CAM_SPECS, ARMS, LEADERS
+    CFG = cfg
+    ARM_CFGS = {a["side"]: a for a in cfg["arms"]}
+    SIDES = list(ARM_CFGS)
+    BIMANUAL = len(SIDES) > 1
+    CAM_SPECS = all_camera_specs(cfg, ARM_CFGS, BIMANUAL)
+    ARMS = {s: ArmCtl(c) for s, c in ARM_CFGS.items()}
+    LEADERS = {s: LeaderCtl(c) for s, c in ARM_CFGS.items()}
+
+
+CFG = ARM_CFGS = SIDES = CAM_SPECS = ARMS = LEADERS = None
+BIMANUAL = False
+
+
+def ports_configured():
+    return all(a.get("follower_port") for a in ARM_CFGS.values())
 
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -407,6 +426,8 @@ def robot_cli_args():
     if BIMANUAL:
         raise NotImplementedError("양팔(bi_so_follower)은 아직 미지원 — arms 를 1개로 두세요")
     arm = ARM_CFGS[SIDES[0]]
+    if not arm.get("follower_port"):
+        raise NotImplementedError("팔로워 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
     cams = dict(arm["cameras"])
     cams.update(CFG["cameras"])
     return ["--robot.type=so101_follower",
@@ -419,6 +440,8 @@ def teleop_cli_args():
     if BIMANUAL:
         raise NotImplementedError("양팔(bi_so_leader)은 아직 미지원 — arms 를 1개로 두세요")
     arm = ARM_CFGS[SIDES[0]]
+    if not arm.get("leader_port"):
+        raise NotImplementedError("리더 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
     return ["--teleop.type=so101_leader",
             f"--teleop.port={arm['leader_port']}",
             f"--teleop.id={arm['leader_id']}"]
@@ -593,6 +616,8 @@ class ArmCtl:
 
     def connect(self):
         from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
+        if not self.cfg.get("follower_port"):
+            raise RuntimeError("팔로워 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
         # ensure_safe_goal_position 은 float 만 받습니다 (int 면 TypeError) — 반드시 캐스팅
         mrt = CFG.get("max_relative_target")
         mrt = float(mrt) if isinstance(mrt, (int, float)) and not isinstance(mrt, bool) else None
@@ -785,14 +810,193 @@ class CamStreamer:
         self.on = False
 
 
-ARMS = {side: ArmCtl(cfg) for side, cfg in ARM_CFGS.items()}
-LEADERS = {side: LeaderCtl(cfg) for side, cfg in ARM_CFGS.items()}
 CAMS = CamStreamer()
 CTL_OWNER = None    # 현재 Control 탭을 점유한 WebSocket
+
+_rebind(load_config())      # ArmCtl/LeaderCtl 정의 이후에 호출해야 합니다
 
 
 def any_arm_connected():
     return any(a.connected for a in ARMS.values())
+
+
+# ----------------------------- 포트 / 카메라 탐색 (Setup 탭) -------------------
+def _read_sysfs(p):
+    try:
+        return p.read_text().strip()
+    except Exception:
+        return ""
+
+
+def usb_info(dev):
+    """/dev/ttyACM0 → 그 뒤의 USB 장치 정보 (sysfs 를 부모 방향으로 거슬러 올라감)."""
+    node = Path("/sys/class/tty") / os.path.basename(dev) / "device"
+    if not node.exists():
+        return {}
+    p = node.resolve()
+    for _ in range(8):
+        if (p / "idVendor").exists():
+            return {"vid": _read_sysfs(p / "idVendor"),
+                    "pid": _read_sysfs(p / "idProduct"),
+                    "manufacturer": _read_sysfs(p / "manufacturer"),
+                    "product": _read_sysfs(p / "product"),
+                    "serial": _read_sysfs(p / "serial")}
+        if p.parent == p:
+            break
+        p = p.parent
+    return {}
+
+
+def _alias_map(dirname):
+    """/dev/serial/by-id 등 → {실제 장치경로: 별칭경로}"""
+    out = {}
+    d = Path(dirname)
+    if not d.is_dir():
+        return out
+    for link in sorted(d.iterdir()):
+        try:
+            out.setdefault(os.path.realpath(link), str(link))
+        except OSError:
+            pass
+    return out
+
+
+def list_serial_ports():
+    """시리얼 후보 나열. udev 심볼릭 링크가 전혀 없어도 동작합니다."""
+    by_id = _alias_map("/dev/serial/by-id")
+    by_path = _alias_map("/dev/serial/by-path")
+    devs = set()
+    for pat in ("/dev/ttyACM*", "/dev/ttyUSB*"):
+        devs.update(glob.glob(pat))
+    devs.update(by_id)          # 위 패턴에 안 걸리는 이름까지 포함
+    devs.update(by_path)
+    used = {}
+    for side, arm in ARM_CFGS.items():
+        for role in ("follower", "leader"):
+            p = arm.get(f"{role}_port")
+            if p:
+                used.setdefault(os.path.realpath(p) if os.path.exists(p) else p, []).append(
+                    f"{side}/{role}" if BIMANUAL else role)
+    out = []
+    for dev in sorted(devs):
+        info = usb_info(dev)
+        out.append({
+            "dev": dev,
+            "by_id": by_id.get(dev, ""),
+            "by_path": by_path.get(dev, ""),
+            "usb": info,
+            "label": (f"{info.get('manufacturer', '')} {info.get('product', '')}".strip()
+                      or os.path.basename(dev)),
+            "used_by": used.get(dev, []),
+        })
+    return out
+
+
+def list_video_devices():
+    """카메라 후보. lerobot OpenCVCamera.find_cameras() 를 쓰되,
+    실패하면 /dev/video* 나열로 폴백합니다."""
+    by_id = _alias_map("/dev/v4l/by-id")
+    found = []
+    try:
+        from lerobot.cameras.opencv import OpenCVCamera
+        for c in OpenCVCamera.find_cameras():
+            dev = str(c.get("id"))
+            prof = c.get("default_stream_profile") or {}
+            found.append({"dev": dev, "by_id": by_id.get(os.path.realpath(dev), "")
+                          if dev.startswith("/dev/") else "",
+                          "width": prof.get("width"), "height": prof.get("height"),
+                          "fps": prof.get("fps"), "name": c.get("name", "")})
+    except Exception as e:
+        for dev in sorted(glob.glob("/dev/video*")):
+            found.append({"dev": dev, "by_id": by_id.get(os.path.realpath(dev), ""),
+                          "width": None, "height": None, "fps": None, "name": f"(probe 실패: {e})"})
+    return found
+
+
+def _feetech_motors(norm_degrees=True):
+    from lerobot.motors import Motor, MotorNormMode
+    return {n: Motor(i + 1, "sts3215",
+                     MotorNormMode.RANGE_0_100 if n == "gripper"
+                     else (MotorNormMode.DEGREES if norm_degrees else MotorNormMode.RANGE_M100_100))
+            for i, n in enumerate(CTL_JOINTS)}
+
+
+def probe_port(port, full=False):
+    """포트에 붙은 Feetech 모터 ID 를 나열합니다.
+    full=False 면 기본 보드레이트(1 Mbps)만 — 웹에서 쓰기에 scan_port 는 너무 느립니다."""
+    from lerobot.motors.feetech import FeetechMotorsBus
+    if full:
+        found = FeetechMotorsBus.scan_port(port)
+        return {"baudrates": {str(b): sorted(ids) for b, ids in found.items()}}
+    bus = FeetechMotorsBus(port, {})
+    bus.connect(handshake=False)
+    try:
+        bus.set_baudrate(FeetechMotorsBus.default_baudrate)
+        ids_models = bus.broadcast_ping() or {}
+    finally:
+        try:
+            bus.disconnect(disable_torque=False)
+        except Exception:
+            pass
+    return {"baudrate": FeetechMotorsBus.default_baudrate,
+            "ids": sorted(ids_models),
+            "models": {str(i): m for i, m in ids_models.items()}}
+
+
+class PortWatcher:
+    """여러 포트를 동시에 토크 OFF 로 열어 두고 Present_Position 을 읽습니다.
+    사용자가 팔 하나를 손으로 움직이면 값이 변하는 포트가 그 팔입니다 —
+    leader/follower 판별의 유일하게 확실한 방법(전기적으로는 구분 불가)."""
+
+    def __init__(self):
+        self.on = False
+        self.state = {}          # port -> {"pos":{}, "span":{}, "err":str}
+        self.threads = []
+
+    def start(self, ports):
+        self.stop()
+        self.state = {p: {"pos": {}, "span": {}, "err": ""} for p in ports}
+        self.on = True
+        for p in ports:
+            t = threading.Thread(target=self._loop, args=(p,), daemon=True)
+            t.start()
+            self.threads.append(t)
+
+    def _loop(self, port):
+        from lerobot.motors.feetech import FeetechMotorsBus
+        st = self.state[port]
+        bus = None
+        try:
+            bus = FeetechMotorsBus(port, _feetech_motors())
+            bus.connect(handshake=False)
+            bus.disable_torque()          # 손으로 움직일 수 있게
+            lo, hi = {}, {}
+            while self.on:
+                pos = bus.sync_read("Present_Position", normalize=False)
+                for k, v in pos.items():
+                    lo[k] = min(lo.get(k, v), v)
+                    hi[k] = max(hi.get(k, v), v)
+                st["pos"] = {k: int(v) for k, v in pos.items()}
+                st["span"] = {k: int(hi[k] - lo[k]) for k in pos}
+                st["err"] = ""
+                time.sleep(0.1)
+        except Exception as e:
+            st["err"] = str(e)
+        finally:
+            if bus is not None:
+                try:
+                    bus.disconnect(disable_torque=False)
+                except Exception:
+                    pass
+
+    def stop(self):
+        self.on = False
+        for t in self.threads:
+            t.join(timeout=1.5)
+        self.threads = []
+
+
+WATCH = PortWatcher()
 
 
 def busy_with(kinds):
@@ -803,9 +1007,11 @@ def busy_with(kinds):
 
 
 def robot_busy():
-    """팔(시리얼)을 쓰는 작업: record/rollout + Control 탭 수동 제어"""
+    """팔(시리얼)을 쓰는 작업: record/rollout + Control 탭 수동 제어 + Setup 포트 감시"""
     if any_arm_connected():
         return {"id": "manual-control", "kind": "control", "alive": True}
+    if WATCH.on:
+        return {"id": "port-watch (Setup 탭)", "kind": "setup", "alive": True}
     return busy_with(("record", "rollout"))
 
 
@@ -817,6 +1023,8 @@ def gpu_or_loop_busy():
 def exclusive_busy():
     if any_arm_connected():
         return {"id": "manual-control (Control 탭)", "kind": "control", "alive": True}
+    if WATCH.on:
+        return {"id": "port-watch (Setup 탭)", "kind": "setup", "alive": True}
     return busy_with(("record", "rollout", "train"))
 
 
@@ -959,6 +1167,14 @@ if('serviceWorker' in navigator){ navigator.serviceWorker.register('/sw.js').cat
 </script>"""
 
 
+def setup_needed_html():
+    """포트가 아직 지정되지 않았을 때 각 탭 상단에 띄우는 안내."""
+    if ports_configured():
+        return ""
+    return ('<p class="badge b-warn">포트가 지정되지 않았습니다 — '
+            '<a href="/setup">Setup 탭</a>에서 USB 포트를 먼저 정하세요</p>')
+
+
 def nav_html(active=""):
     running = [j for j in jobs_index() if j["alive"]]
     if any_arm_connected():
@@ -970,6 +1186,12 @@ def nav_html(active=""):
                    f'{esc(j["kind"].upper())} · {esc(j["id"])}{extra}</div>')
     else:
         cluster = '<div class=statuscluster><span class=dot></span>IDLE</div>'
+    mode_badge = ('<span class="badge b-run">양팔</span>' if BIMANUAL
+                  else '<span class="badge">한팔</span>')
+    if not ports_configured():
+        mode_badge += ' <a href="/setup"><span class="badge b-warn">포트 미설정</span></a>'
+    cluster = cluster.replace('<div class=statuscluster>',
+                              f'<div class=statuscluster>{mode_badge}&nbsp;')
 
     def tab(href, label, key):
         on = ' class=on' if key == active else ''
@@ -978,7 +1200,8 @@ def nav_html(active=""):
     return (f'<div class=appbar><div class=brand>LRWEB <small>/ SO-101 PIPELINE</small></div>'
             f'<div class=nav>{tab("/", "Datasets", "ds")}{tab("/collect", "Collect", "co")}'
             f'{tab("/train", "Training", "tr")}{tab("/rollout", "Rollout", "ro")}'
-            f'{tab("/control", "Control", "ct")}{tab("/jobs", "Jobs", "jb")}</div>{cluster}'
+            f'{tab("/control", "Control", "ct")}{tab("/setup", "Setup", "st")}'
+            f'{tab("/jobs", "Jobs", "jb")}</div>{cluster}'
             f'<button class=fsbtn title="전체화면" aria-label="전체화면" onclick="toggleFS()">'
             f'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
             f'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
@@ -1226,7 +1449,7 @@ def collect_page():
         </script>"""
     busy = exclusive_busy()
     busywarn = (f'<p class="badge b-warn">실행 중: {esc(busy["id"])} — 끝나야 수집을 시작할 수 있습니다</p>'
-                if busy else "")
+                if busy else "") + setup_needed_html()
     resume_opts = "".join(f'<option value="{esc(d["name"])}">{esc(d["name"])} ({esc(d["episodes"])}ep)</option>'
                           for d in list_datasets())
     return f"""{CSS}{nav_html('co')}<div class=wrap>
@@ -1476,7 +1699,7 @@ def rollout_page():
         </script>"""
     busy = exclusive_busy()
     busywarn = (f'<p class="badge b-warn">실행 중: {esc(busy["id"])} — 끝나야 추론을 시작할 수 있습니다</p>'
-                if busy else "")
+                if busy else "") + setup_needed_html()
     ckpts = list_checkpoints()
     ck_opts = "".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in ckpts)
     empty = "" if ckpts else '<p class=muted>체크포인트가 없습니다 — Training에서 학습을 먼저 완료하세요</p>'
@@ -1576,11 +1799,16 @@ async def api_delete_checkpoint(req: Request):
 # ----------------------------- 페이지: Control (수동 제어) --------------------
 @app.get("/control", response_class=HTMLResponse)
 def control_page():
-    busy = busy_with(("record", "rollout"))
+    busy = busy_with(("record", "rollout")) or (
+        {"id": "port-watch (Setup 탭)"} if WATCH.on else None)
     if busy:
         return f"""{CSS}{nav_html('ct')}<div class=wrap>
         <p class=eyebrow>Manual control</p><h2>Control</h2>
         <p class="badge b-warn">실행 중: {esc(busy["id"])} — 끝나야 수동 제어를 쓸 수 있습니다</p></div>"""
+    if not ports_configured():
+        return f"""{CSS}{nav_html('ct')}<div class=wrap>
+        <p class=eyebrow>Manual control</p><h2>Control</h2>
+        {setup_needed_html()}</div>"""
     cam_panels = "".join(
         f'<div class=cw><span class=cl>{esc(n)}</span><img id="cam_{esc(n)}"></div>'
         for n in CAM_SPECS)
@@ -1998,6 +2226,593 @@ def serve_urdf(rest: str):
     if not str(p).startswith(str(URDF_DIR.resolve())) or not p.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(p)
+
+
+# ----------------------------- 페이지: Setup (포트/카메라) --------------------
+def calib_status():
+    """설정된 id 별 캘리브레이션 파일 존재 여부."""
+    out = {}
+    for side, arm in ARM_CFGS.items():
+        out[side] = {
+            "follower": {
+                "id": arm["follower_id"],
+                "path": str(CALIB_ROOT / "robots/so_follower" / f"{arm['follower_id']}.json"),
+                "ok": (CALIB_ROOT / "robots/so_follower" / f"{arm['follower_id']}.json").is_file()},
+            "leader": {
+                "id": arm["leader_id"],
+                "path": str(CALIB_ROOT / "teleoperators/so_leader" / f"{arm['leader_id']}.json"),
+                "ok": (CALIB_ROOT / "teleoperators/so_leader" / f"{arm['leader_id']}.json").is_file()},
+        }
+    return out
+
+
+def _validate_cam(name, spec, seen):
+    if not safe_name(name):
+        return f"카메라 이름은 영문/숫자/._- 만: {name!r}"
+    if name in seen:
+        return f"카메라 이름 중복: {name}"
+    seen.add(name)
+    if not isinstance(spec, dict):
+        return f"카메라 {name} 형식 오류"
+    idx = spec.get("index_or_path")
+    if isinstance(idx, str):
+        if not idx.startswith("/dev/"):
+            return f"카메라 {name} 경로는 /dev/ 로 시작해야 합니다"
+    elif not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+        return f"카메라 {name} 인덱스가 잘못됨"
+    for k, lo, hi in (("width", 32, 8192), ("height", 32, 8192), ("fps", 1, 240)):
+        v = spec.get(k)
+        if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+            return f"카메라 {name} 의 {k} 값이 잘못됨"
+    return None
+
+
+def validate_config(cfg):
+    """저장 전 검증. 문제가 있으면 메시지를, 없으면 None 을 반환합니다."""
+    if not isinstance(cfg, dict):
+        return "설정 형식 오류"
+    mode = cfg.get("mode")
+    if mode not in ("single", "bimanual"):
+        return "mode 는 single 또는 bimanual"
+    arms = cfg.get("arms")
+    want = 2 if mode == "bimanual" else 1
+    if not isinstance(arms, list) or len(arms) != want:
+        return f"mode={mode} 인데 arms 가 {len(arms) if isinstance(arms, list) else '?'}개입니다 (필요: {want})"
+    sides = [a.get("side") for a in arms if isinstance(a, dict)]
+    expect = {"main"} if want == 1 else {"left", "right"}
+    if set(sides) != expect or len(set(sides)) != want:
+        return f"mode={mode} 의 side 는 {sorted(expect)} 여야 합니다"
+    seen_ports, cam_names, calib_ids = {}, set(), {}
+    for arm in arms:
+        if not isinstance(arm, dict):
+            return "arms 원소 형식 오류"
+        side = arm.get("side", "")
+        if not safe_name(side):
+            return f"side 이름이 잘못됨: {side!r}"
+        for role in ("follower", "leader"):
+            cid = arm.get(f"{role}_id", "")
+            if not safe_name(cid):
+                return f"{side}/{role} id 는 영문/숫자/._- 만"
+            key = (role, cid)
+            if key in calib_ids:
+                return f"{role} id 중복: {cid} — 캘리브레이션 파일이 겹칩니다"
+            calib_ids[key] = side
+            port = (arm.get(f"{role}_port") or "").strip()
+            if not port:
+                continue
+            if not port.startswith("/dev/"):
+                return f"{side}/{role} 포트는 /dev/ 로 시작해야 합니다: {port}"
+            real = os.path.realpath(port)
+            if real in seen_ports:
+                return f"같은 포트를 두 곳에 지정했습니다: {port} ({seen_ports[real]} 와 중복)"
+            seen_ports[real] = f"{side}/{role}"
+        # 양팔에서는 팔 카메라 이름에 side 접두사가 붙으므로 팔끼리 같은 이름(wrist)이 허용됩니다
+        arm_cam_names = set()
+        for name, spec in (arm.get("cameras") or {}).items():
+            err = _validate_cam(name, spec, arm_cam_names)
+            if err:
+                return err
+            full = f"{side}_{name}" if len(arms) > 1 else name
+            if full in cam_names:
+                return f"카메라 이름 충돌: {full}"
+            cam_names.add(full)
+    for name, spec in (cfg.get("cameras") or {}).items():
+        err = _validate_cam(name, spec, set())
+        if err:
+            return err
+        if name in cam_names:
+            return f"공용 카메라 이름이 팔 카메라와 충돌: {name}"
+        cam_names.add(name)
+    try:
+        if not 1 <= int(cfg.get("fps", 30)) <= 120:
+            raise ValueError
+    except (TypeError, ValueError):
+        return "fps 는 1~120"
+    mrt = cfg.get("max_relative_target")
+    if mrt is not None and not (isinstance(mrt, (int, float)) and not isinstance(mrt, bool)
+                                and 0 < float(mrt) <= 180):
+        return "max_relative_target 은 비우거나 0~180 사이의 수"
+    return None
+
+
+@app.get("/setup", response_class=HTMLResponse)
+def setup_page():
+    return CSS + nav_html("st") + SETUP_HTML
+
+
+@app.get("/api/setup/state")
+def api_setup_state():
+    busy = exclusive_busy()
+    return {"config": CFG, "ports": list_serial_ports(), "calib": calib_status(),
+            "busy": f"{busy['id']} 실행 중" if busy else ""}
+
+
+@app.get("/api/setup/ports")
+def api_setup_ports():
+    return {"ports": list_serial_ports()}
+
+
+@app.get("/api/setup/cameras")
+def api_setup_cameras():
+    if CAMS.on or busy_with(("record", "rollout")):
+        return JSONResponse({"error": "카메라 사용 중 — Control/Collect 를 먼저 종료하세요"}, status_code=400)
+    return {"cameras": list_video_devices()}
+
+
+@app.post("/api/setup/probe")
+async def api_setup_probe(req: Request):
+    b = await req.json()
+    port = (b.get("port") or "").strip()
+    if not port.startswith("/dev/"):
+        return JSONResponse({"error": "포트는 /dev/ 로 시작해야 합니다"}, status_code=400)
+    if WATCH.on:
+        return JSONResponse({"error": "포트 감시 중에는 probe 불가 — 감시를 먼저 중지하세요"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중"}, status_code=400)
+    try:
+        return await asyncio.to_thread(probe_port, port, bool(b.get("full")))
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+@app.post("/api/setup/watch")
+async def api_setup_watch_start(req: Request):
+    b = await req.json()
+    ports = [p for p in (b.get("ports") or []) if isinstance(p, str) and p.startswith("/dev/")]
+    if not ports:
+        return JSONResponse({"error": "감시할 포트가 없습니다"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중"}, status_code=400)
+    await asyncio.to_thread(WATCH.start, ports[:8])
+    return {"ok": True, "ports": ports[:8]}
+
+
+@app.get("/api/setup/watch")
+def api_setup_watch_state():
+    return {"on": WATCH.on, "state": WATCH.state}
+
+
+@app.post("/api/setup/watch/stop")
+async def api_setup_watch_stop():
+    await asyncio.to_thread(WATCH.stop)
+    return {"ok": True}
+
+
+@app.post("/api/setup/config")
+async def api_setup_config(req: Request):
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 종료 후 저장하세요"}, status_code=400)
+    b = await req.json()
+    cfg = b.get("config")
+    err = validate_config(cfg)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    merged.update(cfg)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
+    _rebind(load_config())
+    return {"ok": True, "config": CFG}
+
+
+SETUP_HTML = """
+<style>
+.armcard{background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  padding:16px 18px;margin-bottom:14px}
+.armcard h3{margin:0 0 12px;font-family:var(--mono);font-size:12px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--accent)}
+.slot{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.slot .role{font-family:var(--mono);font-size:12px;width:74px;color:var(--muted)}
+.slot input.port{flex:1;min-width:240px;font-family:var(--mono);font-size:12.5px}
+.slot input.cid{width:130px;font-family:var(--mono);font-size:12.5px}
+.tiny{font-size:11px;color:var(--dim);font-family:var(--mono)}
+</style>
+<div class=wrap>
+<p class=eyebrow>Hardware setup</p><h2>Setup</h2>
+<div id=busywarn></div>
+
+<p class=eyebrow>1 · 모드</p>
+<div class=toolbar>
+  <button id=b1 onclick="setMode('single')">한팔</button>
+  <button id=b2 onclick="setMode('bimanual')">양팔 (left / right)</button>
+  <span class=muted id=modehint></span>
+</div>
+<div id=arms></div>
+
+<p class=eyebrow>2 · USB 시리얼 포트</p>
+<div class=card>
+  <div class=toolbar>
+    <button onclick="loadPorts()">다시 스캔</button>
+    <button id=bwatch class=primary onclick="toggleWatch()">포트 감시 시작 (팔 판별)</button>
+    <span class=muted>감시를 켜고 팔 하나를 손으로 움직이면 그 포트의 travel 이 올라갑니다.
+      전기적으로는 leader/follower 를 구분할 수 없어서, 이게 확실한 판별 방법입니다.</span>
+    <p class="badge b-warn" style="margin:8px 0 0">감시는 모든 포트의 토크를 끕니다 —
+      팔로워가 들려 있으면 그대로 주저앉습니다. 팔을 받치거나 내려놓고 시작하세요.</p>
+  </div>
+  <table id=porttbl></table>
+  <p class=muted style="margin-top:10px">
+    travel = 감시 시작 이후 엔코더가 움직인 최대 폭(tick, 4096 = 1바퀴).
+    probe 는 1 Mbps 기본 보드레이트만 봅니다 — 응답이 없으면 <b>전체 스캔</b>으로 보드레이트를 찾으세요.<br>
+    지정에는 가능한 한 <span class=mono>/dev/serial/by-path</span> 를 씁니다.
+    보드에 USB 시리얼 번호가 없으면(<b>sn 없음</b>) 같은 모델 2개가 by-id 로 구분이 안 되기 때문입니다.
+    by-path 는 꽂은 USB 물리 포트에 고정되므로, <b>팔을 항상 같은 USB 구멍에 꽂아야</b> 합니다.
+  </p>
+</div>
+
+<p class=eyebrow>3 · 카메라</p>
+<div class=card>
+  <div class=toolbar>
+    <button onclick="loadCams()">카메라 스캔</button>
+    <span class=muted>/dev/video* 를 전부 열어 봅니다 — Control/Collect 실행 중에는 막힙니다.</span>
+  </div>
+  <table id=camtbl></table>
+  <div style="margin-top:16px">
+    <p class=eyebrow>등록된 카메라</p>
+    <table id=curcamtbl></table>
+    <p class=muted style="margin-top:8px">양팔이면 팔 카메라 키에 <span class=mono>left_</span> /
+    <span class=mono>right_</span> 접두사가 붙고, 공용 카메라(top)는 접두사 없이 그대로 갑니다 —
+    lerobot <span class=mono>bi_so_follower</span> 규칙과 같습니다.</p>
+  </div>
+</div>
+
+<p class=eyebrow>4 · 기타</p>
+<div class=card>
+  <div class=formgrid>
+    <label class=f>robot_id <input id=robot_id size=12></label>
+    <label class=f>fps <input id=fps size=5></label>
+    <label class=f>max_relative_target(°, 비우면 미사용) <input id=mrt size=6></label>
+    <label class=f style="flex:1;min-width:240px">기본 태스크 설명 <input id=task></label>
+  </div>
+  <div id=calib></div>
+</div>
+
+<div class=toolbar>
+  <button class=primary onclick="save()">설정 저장 &amp; 적용</button>
+  <span class=muted id=savemsg></span>
+</div>
+<p class=eyebrow>현재 설정 (lrweb_config.json)</p><pre id=cfgdump></pre>
+</div>
+<script>
+let CFG=null, PORTS=[], VCAMS=[], WATCHING=false, timer=null, LASTWATCH=null;
+const $=id=>document.getElementById(id);
+const E=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const dirty=m=>{ $('savemsg').innerHTML='<span class=b-warn>'+E(m)+' — 저장 버튼을 눌러야 적용됩니다</span>'; };
+
+async function jget(u){ return (await fetch(u)).json(); }
+async function jpost(u,b){
+  const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
+                        body:JSON.stringify(b||{})});
+  return r.json();
+}
+
+/* 보드에 USB 시리얼이 없으면 by-id 가 같은 모델끼리 겹칩니다 → by-path 우선 */
+function stableOf(p){
+  const hasSn = p.usb && p.usb.serial;
+  return (hasSn ? (p.by_id || p.by_path) : (p.by_path || p.by_id)) || p.dev;
+}
+function sameDev(a,b){
+  if(!a||!b) return false;
+  if(a===b) return true;
+  const f=x=>{ const p=PORTS.find(q=>q.dev===x||q.by_id===x||q.by_path===x); return p?p.dev:x; };
+  return f(a)===f(b);
+}
+
+async function boot(){
+  const s=await jget('/api/setup/state');
+  CFG=s.config; PORTS=s.ports;
+  $('busywarn').innerHTML = s.busy ? '<p class="badge b-warn">'+E(s.busy)+' — 저장/감시가 막힙니다</p>' : '';
+  $('robot_id').value=CFG.robot_id||''; $('fps').value=CFG.fps||30;
+  $('mrt').value=(CFG.max_relative_target==null?'':CFG.max_relative_target);
+  $('task').value=CFG.default_task||'';
+  renderArms(); renderPorts(); renderCurCams(); renderCalib(s.calib); dump();
+}
+function dump(){ $('cfgdump').textContent=JSON.stringify(CFG,null,2); }
+
+/* ---------- 팔 ---------- */
+function setMode(m){
+  if(CFG.mode===m) return;
+  if(m==='bimanual'){
+    const a=CFG.arms[0];
+    a.side='left';
+    if(a.follower_id==='follower') a.follower_id='follower_left';
+    if(a.leader_id==='leader')     a.leader_id='leader_left';
+    CFG.arms=[a,{side:'right',follower_port:'',follower_id:'follower_right',
+                 leader_port:'',leader_id:'leader_right',cameras:{}}];
+  }else{
+    if(CFG.arms.length>1 && !confirm('오른팔 설정(포트·카메라)을 지웁니다. 계속할까요?')) return;
+    const a=CFG.arms[0];
+    a.side='main';
+    if(a.follower_id==='follower_left') a.follower_id='follower';
+    if(a.leader_id==='leader_left')     a.leader_id='leader';
+    CFG.arms=[a];
+  }
+  CFG.mode=m;
+  renderArms(); renderPorts(); renderCurCams(); dump(); dirty('모드 변경');
+}
+
+function renderArms(){
+  const bi=CFG.mode==='bimanual';
+  $('b1').className=bi?'':'primary';
+  $('b2').className=bi?'primary':'';
+  $('modehint').innerHTML = bi
+    ? '양팔 = lerobot <span class=mono>bi_so_follower</span> / <span class=mono>bi_so_leader</span>. '
+      +'수집·학습·추론은 아직 미지원(6단계)이고, 설정과 Control 탭 표시만 먼저 됩니다.'
+    : '한팔 = lerobot <span class=mono>so101_follower</span> / <span class=mono>so101_leader</span>.';
+  const box=$('arms'); box.innerHTML='';
+  CFG.arms.forEach(a=>{
+    const d=document.createElement('div'); d.className='armcard';
+    d.innerHTML='<h3>'+E(a.side)+'</h3>';
+    ['follower','leader'].forEach(role=>{
+      const row=document.createElement('div'); row.className='slot';
+      row.innerHTML='<span class=role>'+role+'</span>';
+      const ip=document.createElement('input'); ip.className='port';
+      ip.placeholder='/dev/serial/by-path/... (아래 표에서 지정하거나 직접 입력)';
+      ip.value=a[role+'_port']||'';
+      ip.onchange=()=>{ a[role+'_port']=ip.value.trim(); renderPorts(); dump(); dirty('포트 변경'); };
+      const lb=document.createElement('span'); lb.className='tiny'; lb.textContent='calib id';
+      const id=document.createElement('input'); id.className='cid'; id.value=a[role+'_id']||'';
+      id.onchange=()=>{ a[role+'_id']=id.value.trim(); dump(); dirty('캘리브 id 변경'); };
+      row.appendChild(ip); row.appendChild(lb); row.appendChild(id);
+      d.appendChild(row);
+    });
+    box.appendChild(d);
+  });
+}
+
+/* ---------- 포트 ---------- */
+function slotOf(dev){
+  for(const a of CFG.arms)
+    for(const role of ['follower','leader'])
+      if(sameDev(a[role+'_port'],dev)) return a.side+'|'+role;
+  return '';
+}
+function assign(dev,val){
+  const stable=stableOf(PORTS.find(p=>p.dev===dev)||{dev});
+  CFG.arms.forEach(a=>['follower','leader'].forEach(r=>{
+    if(sameDev(a[r+'_port'],dev)) a[r+'_port']='';
+  }));
+  if(val){
+    const [side,role]=val.split('|');
+    const a=CFG.arms.find(x=>x.side===side);
+    if(a) a[role+'_port']=stable;
+  }
+  renderArms(); renderPorts(); dump(); dirty('포트 지정');
+}
+
+function renderPorts(state){
+  if(state) LASTWATCH=state;
+  const st=state||LASTWATCH;
+  const t=$('porttbl');
+  t.innerHTML='<tr><th>device</th><th>USB</th><th class=num>모터 ID</th>'
+             +'<th class=num>travel</th><th>역할</th><th></th></tr>';
+  if(!PORTS.length){
+    t.innerHTML+='<tr><td colspan=6 class=muted>시리얼 장치가 없습니다 — '
+                +'USB 를 꽂고 다시 스캔하세요 (권한 문제면 dialout 그룹 확인)</td></tr>';
+    return;
+  }
+  PORTS.forEach(p=>{
+    const w=st?st[p.dev]:null;
+    const spans=w&&w.span?Object.values(w.span):[];
+    const travel=spans.length?Math.max.apply(null,spans):null;
+    const stable=stableOf(p);
+    const sn=p.usb&&p.usb.serial;
+    const usb=(p.usb&&p.usb.vid)
+      ? E(p.label)+'<br><span class="muted mono" style="font-size:11px">'+E(p.usb.vid)+':'+E(p.usb.pid)
+        +(sn?' sn='+E(p.usb.serial):' <b class=b-warn>sn 없음</b>')+'</span>'
+      : '<span class=muted>-</span>';
+
+    const tr=document.createElement('tr');
+    const c1=document.createElement('td'); c1.className='mono';
+    c1.innerHTML=E(p.dev)+(stable!==p.dev?'<br><span class="tiny">'+E(stable)+'</span>':'');
+    const c2=document.createElement('td'); c2.innerHTML=usb;
+    const c3=document.createElement('td'); c3.className='num'; c3.id='m_'+p.dev;
+    c3.innerHTML=(w&&w.err)?'<span class=b-bad title="'+E(w.err)+'">err</span>':'-';
+    const c4=document.createElement('td'); c4.className='num';
+    c4.innerHTML=travel==null?'-':'<b>'+travel+'</b>';
+    if(travel!=null&&travel>60) c4.style.color='var(--ok)';
+
+    const c5=document.createElement('td');
+    const sel=document.createElement('select');
+    const opts=[['','미지정']];
+    CFG.arms.forEach(a=>{
+      opts.push([a.side+'|follower', (CFG.arms.length>1?a.side+' ':'')+'follower']);
+      opts.push([a.side+'|leader',   (CFG.arms.length>1?a.side+' ':'')+'leader']);
+    });
+    opts.forEach(([v,l])=>{
+      const o=document.createElement('option'); o.value=v; o.textContent=l; sel.appendChild(o);
+    });
+    sel.value=slotOf(p.dev);
+    sel.onchange=()=>assign(p.dev,sel.value);
+    c5.appendChild(sel);
+
+    const c6=document.createElement('td'); c6.style.textAlign='right';
+    c6.appendChild(btn('probe',()=>doProbe(p.dev,false)));
+    c6.appendChild(btn('전체 스캔',()=>doProbe(p.dev,true)));
+
+    [c1,c2,c3,c4,c5,c6].forEach(c=>tr.appendChild(c));
+    t.appendChild(tr);
+  });
+}
+function btn(label,fn,cls){
+  const b=document.createElement('button'); b.textContent=label;
+  if(cls)b.className=cls; b.style.marginLeft='6px'; b.onclick=fn; return b;
+}
+
+async function loadPorts(){ PORTS=(await jget('/api/setup/ports')).ports; renderPorts(); }
+
+async function doProbe(dev,full){
+  const cell=$('m_'+dev); cell.textContent='...';
+  const d=await jpost('/api/setup/probe',{port:dev,full:full});
+  if(d.error){ cell.innerHTML='<span class=b-bad title="'+E(d.error)+'">실패</span>'; return; }
+  if(full){
+    const parts=Object.keys(d.baudrates).map(b=>b+': ['+d.baudrates[b].join(',')+']');
+    cell.innerHTML=parts.length?parts.map(E).join('<br>'):'<span class=muted>없음</span>';
+  }else{
+    cell.innerHTML=d.ids.length
+      ? '<span class="badge '+(d.ids.length===6?'b-ok':'b-warn')+'">'+d.ids.join(',')+'</span>'
+      : '<span class=muted>응답 없음</span>';
+  }
+}
+
+async function toggleWatch(){
+  if(WATCHING){ await stopWatch(); return; }
+  const d=await jpost('/api/setup/watch',{ports:PORTS.map(p=>p.dev)});
+  if(d.error){ alert(d.error); return; }
+  WATCHING=true;
+  $('bwatch').textContent='감시 중지'; $('bwatch').className='danger';
+  timer=setInterval(async()=>{
+    const s=await jget('/api/setup/watch');
+    if(s.on) renderPorts(s.state);
+  },400);
+}
+async function stopWatch(){
+  clearInterval(timer); timer=null; WATCHING=false;
+  $('bwatch').textContent='포트 감시 시작 (팔 판별)'; $('bwatch').className='primary';
+  await jpost('/api/setup/watch/stop');
+}
+addEventListener('pagehide',()=>{ if(WATCHING) navigator.sendBeacon('/api/setup/watch/stop'); });
+
+/* ---------- 카메라 ---------- */
+async function loadCams(){
+  const d=await jget('/api/setup/cameras');
+  if(d.error){ alert(d.error); return; }
+  VCAMS=d.cameras; renderVCams();
+}
+function renderVCams(){
+  const t=$('camtbl');
+  t.innerHTML='<tr><th>device</th><th>기본 해상도</th><th>대상</th><th>이름</th><th></th></tr>';
+  if(!VCAMS.length){
+    t.innerHTML+='<tr><td colspan=5 class=muted>스캔된 카메라 없음</td></tr>'; return;
+  }
+  VCAMS.forEach(c=>{
+    const stable=c.by_id||c.dev;
+    const tr=document.createElement('tr');
+    const c1=document.createElement('td'); c1.className='mono';
+    c1.innerHTML=E(c.dev)+(stable!==c.dev?'<br><span class=tiny>'+E(stable)+'</span>':'');
+    const c2=document.createElement('td'); c2.className='mono';
+    c2.textContent=(c.width||'?')+'x'+(c.height||'?')+' @'+Math.round(c.fps||0);
+    const c3=document.createElement('td');
+    const sel=document.createElement('select');
+    CFG.arms.forEach(a=>{
+      const o=document.createElement('option');
+      o.value='arm:'+a.side; o.textContent=CFG.arms.length>1?(a.side+' 팔'):'팔';
+      sel.appendChild(o);
+    });
+    const o=document.createElement('option'); o.value='shared'; o.textContent='공용 (top 등)';
+    sel.appendChild(o);
+    c3.appendChild(sel);
+    const c4=document.createElement('td');
+    const nm=document.createElement('input'); nm.size=8; nm.value='wrist';
+    sel.onchange=()=>{ nm.value = sel.value==='shared' ? 'top' : 'wrist'; };
+    c4.appendChild(nm);
+    const c5=document.createElement('td'); c5.style.textAlign='right';
+    c5.appendChild(btn('추가',()=>addCam(stable,sel.value,nm.value.trim()),'primary'));
+    [c1,c2,c3,c4,c5].forEach(x=>tr.appendChild(x));
+    t.appendChild(tr);
+  });
+}
+function addCam(dev,target,name){
+  if(!/^[A-Za-z0-9._-]+$/.test(name)){ alert('이름은 영문/숫자/._- 만'); return; }
+  const fps=parseInt($('fps').value)||30;
+  const spec={index_or_path:dev,width:640,height:480,fps:fps};
+  if(target==='shared'){ CFG.cameras=CFG.cameras||{}; CFG.cameras[name]=spec; }
+  else{
+    const a=CFG.arms.find(x=>x.side===target.slice(4));
+    a.cameras=a.cameras||{}; a.cameras[name]=spec;
+  }
+  renderCurCams(); dump(); dirty('카메라 추가');
+}
+function renderCurCams(){
+  const t=$('curcamtbl');
+  t.innerHTML='<tr><th>키</th><th>device</th><th class=num>해상도</th><th class=num>fps</th><th></th></tr>';
+  let n=0;
+  const groups=[];
+  CFG.arms.forEach(a=>groups.push([a.cameras||{}, CFG.arms.length>1?a.side+'_':'']));
+  groups.push([CFG.cameras||{}, '']);
+  groups.forEach(g=>{
+    const obj=g[0], prefix=g[1];
+    Object.keys(obj).forEach(name=>{
+      n++;
+      const s=obj[name];
+      const tr=document.createElement('tr');
+      const c1=document.createElement('td'); c1.className='mono'; c1.textContent=prefix+name;
+      const c2=document.createElement('td'); c2.className='mono';
+      c2.style.fontSize='11px'; c2.textContent=s.index_or_path;
+      const c3=document.createElement('td'); c3.className='num';
+      c3.innerHTML='<input size=4> x <input size=4>';
+      const c4=document.createElement('td'); c4.className='num'; c4.innerHTML='<input size=3>';
+      const ins=[].concat([].slice.call(c3.querySelectorAll('input')),
+                          [].slice.call(c4.querySelectorAll('input')));
+      ins[0].value=s.width; ins[1].value=s.height; ins[2].value=s.fps;
+      ins.forEach(i=>i.onchange=()=>{
+        s.width=parseInt(ins[0].value)||640; s.height=parseInt(ins[1].value)||480;
+        s.fps=parseInt(ins[2].value)||30; dump(); dirty('카메라 변경');
+      });
+      const c5=document.createElement('td'); c5.style.textAlign='right';
+      c5.appendChild(btn('삭제',()=>{ delete obj[name]; renderCurCams(); dump(); dirty('카메라 삭제'); },'danger'));
+      [c1,c2,c3,c4,c5].forEach(x=>tr.appendChild(x));
+      t.appendChild(tr);
+    });
+  });
+  if(!n) t.innerHTML+='<tr><td colspan=5 class=muted>등록된 카메라 없음 — 위에서 스캔 후 추가하세요</td></tr>';
+}
+
+/* ---------- 캘리브레이션 상태 ---------- */
+function renderCalib(cal){
+  let h='<p class=eyebrow>캘리브레이션 파일</p>';
+  Object.keys(cal).forEach(side=>{
+    Object.keys(cal[side]).forEach(role=>{
+      const c=cal[side][role];
+      h+='<div class=mono style="font-size:12px;margin-bottom:5px">'
+        +'<span class="badge '+(c.ok?'b-ok':'b-bad')+'">'+(c.ok?'있음':'없음')+'</span> '
+        +E(side)+' / '+E(role)+' · '+E(c.id)+'.json'
+        +'<br><span class=tiny>'+E(c.path)+'</span></div>';
+    });
+  });
+  h+='<p class=muted>없으면 Control 탭이 연결되지 않습니다. 지금은 <span class=mono>lerobot-calibrate</span>'
+    +' 로 만들어야 하고, 3단계에서 웹으로 옮깁니다.</p>';
+  $('calib').innerHTML=h;
+}
+
+/* ---------- 저장 ---------- */
+async function save(){
+  CFG.robot_id=$('robot_id').value.trim();
+  CFG.fps=parseInt($('fps').value)||30;
+  const m=$('mrt').value.trim();
+  CFG.max_relative_target = m===''? null : parseFloat(m);
+  CFG.default_task=$('task').value;
+  if(WATCHING) await stopWatch();
+  const d=await jpost('/api/setup/config',{config:CFG});
+  if(d.error){ $('savemsg').innerHTML='<span class=b-bad>'+E(d.error)+'</span>'; return; }
+  $('savemsg').innerHTML='<span class=b-ok>저장·적용됨</span>';
+  setTimeout(function(){ location.reload(); },700);
+}
+boot();
+</script>"""
+
 
 
 # ----------------------------- 페이지: Jobs ----------------------------------

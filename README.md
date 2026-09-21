@@ -30,42 +30,61 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 - **Rollout**: 체크포인트 자동 스캔 → 자율 구동 시작/중지
 - **Control**: 팔로워 수동 제어 — 슬라이더(속도 제한), 토크/E-STOP,
   리더 팔로우, 카메라 MJPEG 스트리밍, Three.js URDF 3D. 탭 이탈 시 자동 해제
+- **Setup**: USB 시리얼 포트 스캔·probe(모터 ID 확인)·**포트 감시로 leader/follower 판별**,
+  카메라 스캔·등록, 한팔/양팔 모드 전환, 캘리브레이션 파일 상태 — 전부 웹에서
 - record/rollout/train/control 자원 기반 상호 배타 (학습+수동제어는 동시 허용)
 
 ## 설정 — `lrweb_config.json`
 
-첫 실행 때 기본값으로 생성됩니다. `arms` 는 **처음부터 리스트**입니다 —
-한팔이면 원소 1개(`side: "main"`), 양팔이면 `"left"`/`"right"` 2개로 늘어납니다.
+첫 실행 때 **포트가 비어 있는** 기본값으로 생성됩니다. udev 심볼릭 링크(`/dev/so101_follower` 같은)를
+전제하지 않습니다 — **Setup 탭**에서 스캔·판별해서 채웁니다. 손으로 편집해도 됩니다.
 
 ```json
 {
-  "mode": "single",
+  "mode": "bimanual",
   "robot_id": "so101",
   "fps": 30,
   "default_task": "Pick up the block and place it in the box",
   "max_relative_target": null,
   "arms": [
-    {
-      "side": "main",
-      "follower_port": "/dev/so101_follower",
-      "follower_id": "follower",
-      "leader_port": "/dev/so101_leader",
-      "leader_id": "leader",
-      "cameras": { "wrist": { "index_or_path": 0, "width": 640, "height": 480, "fps": 30 } }
-    }
+    { "side": "left",
+      "follower_port": "/dev/serial/by-path/pci-0000:00-usb-0:1.1:1.0", "follower_id": "follower_left",
+      "leader_port":   "/dev/serial/by-path/pci-0000:00-usb-0:1.2:1.0", "leader_id":   "leader_left",
+      "cameras": { "wrist": { "index_or_path": "/dev/v4l/by-id/usb-...-video-index0", "width": 640, "height": 480, "fps": 30 } } },
+    { "side": "right",
+      "follower_port": "/dev/serial/by-path/pci-0000:00-usb-0:1.3:1.0", "follower_id": "follower_right",
+      "leader_port":   "/dev/serial/by-path/pci-0000:00-usb-0:1.4:1.0", "leader_id":   "leader_right",
+      "cameras": { "wrist": { "index_or_path": "/dev/v4l/by-id/usb-...-video-index0", "width": 640, "height": 480, "fps": 30 } } }
   ],
-  "cameras": { "top": { "index_or_path": 2, "width": 640, "height": 480, "fps": 30 } }
+  "cameras": { "top": { "index_or_path": "/dev/v4l/by-id/usb-...-video-index0", "width": 640, "height": 480, "fps": 30 } }
 }
 ```
 
-- `follower_id` / `leader_id` → 캘리브레이션 파일 이름입니다.
-  팔로워는 `$HF_HOME/lerobot/calibration/robots/so_follower/<follower_id>.json`,
-  리더는 `.../teleoperators/so_leader/<leader_id>.json`
-- `cameras`(최상위) = 특정 팔에 속하지 않는 카메라. 한팔에서는 팔 카메라와 그냥 합쳐집니다
+- **`mode`** 가 1차 기준입니다. `single` 이면 `arms` 1개(`side: "main"`), `bimanual` 이면 2개(`left`/`right`).
+  안 맞으면 로드 시 `mode` 에 맞춰 잘라내거나 빈 팔을 채웁니다
+- 양팔에서 팔 카메라 키는 `left_wrist` / `right_wrist` 로 접두사가 붙고, 최상위 `cameras`(top)는
+  접두사 없이 그대로 — lerobot `bi_so_follower` 규칙과 동일합니다
+- `follower_id` / `leader_id` → 캘리브레이션 파일 이름.
+  팔로워 `$HF_HOME/lerobot/calibration/robots/so_follower/<follower_id>.json`,
+  리더 `.../teleoperators/so_leader/<leader_id>.json`. 양팔은 같은 디렉터리에 `_left` / `_right` 로
 - `max_relative_target` — lerobot 쪽 상대이동 캡(도). 켜면 `send_action` 마다
-  `Present_Position` 을 한 번 더 읽으므로 제어 루프가 느려집니다. 기본 `null`
-  (Control 탭의 자체 속도 제한 적분기가 담당)
-- `arms` 를 2개로 늘리면 아직 `NotImplementedError` 입니다 (로드맵 6단계)
+  `Present_Position` 을 한 번 더 읽어 제어 루프가 느려집니다. 기본 `null`
+- 양팔 모드에서 수집·학습·추론은 아직 막혀 있습니다 (로드맵 6단계). 설정과 Control 탭 표시는 됩니다
+
+### 포트 지정 — 왜 `by-path` 인가
+
+같은 컨트롤러 보드 2개(양팔이면 4개)는 전기적으로 구분이 안 됩니다. 재부팅하면 `/dev/ttyACM0`, `1` 순서도 바뀝니다.
+
+- `/dev/serial/by-id/…` 는 USB 시리얼 번호 기반 — 보드가 시리얼 번호를 안 내보내면(Setup 탭에 **sn 없음**)
+  같은 모델끼리 이름이 겹쳐서 못 씁니다
+- `/dev/serial/by-path/…` 는 **꽂은 USB 물리 포트** 기반 — 항상 유일합니다. 대신 **팔을 항상 같은 USB 구멍에 꽂아야** 합니다
+
+Setup 탭은 시리얼 번호가 있으면 `by-id`, 없으면 `by-path` 를 자동으로 고릅니다.
+카메라도 같은 이유로 `/dev/v4l/by-id/…` 를 우선합니다.
+
+**leader / follower 판별**: Setup 탭에서 *포트 감시* 를 켜면 모든 후보 포트를 토크 OFF 로 열고
+엔코더를 읽습니다. 팔 하나를 손으로 움직이면 그 포트의 `travel` 값이 올라갑니다 → 그 줄의 역할 선택.
+⚠️ 토크가 꺼지므로 팔로워가 들려 있으면 주저앉습니다. 받치거나 내려놓고 시작하세요.
 
 ## 접속
 
@@ -102,7 +121,7 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 | 단계 | 내용 | 상태 |
 |---|---|---|
 | 1 | 버그 픽스 + lerobot 객체(`SOFollower`/`SOLeader`) 전환 + 설정 파일 | ✅ |
-| 2 | Setup 탭 — USB 포트 스캔·probe·leader/follower 판별을 웹에서 | |
+| 2 | Setup 탭 — USB 포트 스캔·probe·leader/follower 판별·카메라·모드 전환을 웹에서 | ✅ |
 | 3 | Calibration 탭 — 웹에서 캘리브레이션 (`lerobot-calibrate` 불필요) | |
 | 4 | Control 탭 팔별 스레드 분리 | |
 | 5 | record worker 프로세스 — PTY 제거, `record_loop()` 직접 호출, 수집 중 카메라 미리보기 | |
