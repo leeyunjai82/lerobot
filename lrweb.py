@@ -1019,6 +1019,45 @@ def list_serial_ports():
     return out
 
 
+CAM_SNAPS = {}      # realpath(dev) -> jpeg bytes (Setup 탭 카메라 식별용 썸네일)
+
+
+def _snap_key(dev):
+    dev = str(dev)
+    return os.path.realpath(dev) if dev.startswith("/dev/") else dev
+
+
+def camera_snapshot(dev, warm=6, width=320):
+    """카메라를 잠깐 열어 한 장 찍습니다. 어느 장치가 어느 카메라인지 눈으로 확인하는 용도.
+    자동 노출이 안정될 때까지 몇 장 버립니다."""
+    try:
+        import cv2
+    except ImportError:
+        return None
+    d = str(dev)
+    target = int(d) if d.isdigit() else d
+    cap = cv2.VideoCapture(target)
+    try:
+        if not cap.isOpened():
+            return None
+        frame = None
+        for _ in range(warm):
+            ok, f = cap.read()
+            if ok:
+                frame = f
+        if frame is None:
+            return None
+        h, w = frame.shape[:2]
+        if w > width:
+            frame = cv2.resize(frame, (width, max(1, int(h * width / w))))
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None
+    finally:
+        cap.release()
+
+
 def list_video_devices():
     """카메라 후보. lerobot OpenCVCamera.find_cameras() 를 쓰되,
     실패하면 /dev/video* 나열로 폴백합니다.
@@ -1045,6 +1084,15 @@ def list_video_devices():
     except Exception as e:
         for dev in sorted(glob.glob("/dev/video*")):
             found.append(entry(dev, None, f"(probe 실패: {e})"))
+    CAM_SNAPS.clear()
+    for f in found:
+        jpg = camera_snapshot(f["dev"])
+        if jpg:
+            CAM_SNAPS[_snap_key(f["dev"])] = jpg
+            for alias in (f["by_id"], f["by_path"]):
+                if alias:
+                    CAM_SNAPS[_snap_key(alias)] = jpg
+        f["snap"] = bool(jpg)
     return found
 
 
@@ -2680,6 +2728,15 @@ async def api_setup_watch_stop():
     return {"ok": True}
 
 
+@app.get("/api/setup/camsnap")
+def api_camsnap(dev: str):
+    jpg = CAM_SNAPS.get(_snap_key(dev))
+    if not jpg:
+        return JSONResponse({"error": "스냅샷 없음 — 카메라 스캔을 먼저 하세요"}, status_code=404)
+    return Response(content=jpg, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/setup/motors")
 def api_motors_state():
     return MOTORSETUP.state()
@@ -2749,6 +2806,10 @@ SETUP_HTML = """
 .slot input.port{flex:1;min-width:240px;font-family:var(--mono);font-size:12.5px}
 .slot input.cid{width:130px;font-family:var(--mono);font-size:12.5px}
 .tiny{font-size:11px;color:var(--dim);font-family:var(--mono)}
+.camthumb{width:160px;height:120px;object-fit:cover;background:#000;border-radius:6px;display:block;
+  border:1px solid var(--line)}
+.camthumb.noimg{display:flex;align-items:center;justify-content:center;color:var(--dim);
+  font-family:var(--mono);font-size:11px}
 .stagebox{background:var(--surface);border:1px solid var(--accent);border-radius:10px;padding:16px 18px}
 .stagebox h3{margin:0 0 6px;font-size:15px}
 .stagebox .inst{color:var(--muted);margin:0 0 12px;line-height:1.7}
@@ -2804,7 +2865,8 @@ SETUP_HTML = """
 <div class=card>
   <div class=toolbar>
     <button onclick="loadCams()">카메라 스캔</button>
-    <span class=muted>/dev/video* 를 전부 열어 봅니다 — Control/Collect 실행 중에는 막힙니다.
+    <span class=muted>/dev/video* 를 전부 열어 한 장씩 찍습니다 — <b>어느 장치가 어느 카메라인지 화면으로 확인</b>하세요.
+      카메라 수에 따라 몇 초 걸리고, Control/Collect 실행 중에는 막힙니다.
       카메라도 같은 규칙입니다 — 시리얼 번호가 있으면 by-id, 없으면(같은 모델 2개가 겹침) by-path 라 그때는 같은 USB 구멍에 꽂아야 합니다.</span>
   </div>
   <table id=camtbl></table>
@@ -3119,14 +3181,19 @@ async function loadCams(){
 }
 function renderVCams(){
   const t=$('camtbl');
-  t.innerHTML='<tr><th>device</th><th>기본 해상도</th><th>대상</th><th>이름</th><th></th></tr>';
+  t.innerHTML='<tr><th>화면</th><th>device</th><th>기본 해상도</th><th>대상</th><th>이름</th><th></th></tr>';
   if(!VCAMS.length){
-    t.innerHTML+='<tr><td colspan=5 class=muted>스캔된 카메라 없음</td></tr>'; return;
+    t.innerHTML+='<tr><td colspan=6 class=muted>스캔된 카메라 없음</td></tr>'; return;
   }
+  const ts=Date.now();
   VCAMS.forEach(c=>{
     const stable=stableOf(c);      /* 시리얼 번호 있으면 by-id, 없으면 by-path (포트와 같은 규칙) */
     const sn=c.usb&&c.usb.serial;
     const tr=document.createElement('tr');
+    const c0=document.createElement('td');
+    c0.innerHTML = c.snap
+      ? '<img class=camthumb src="/api/setup/camsnap?dev='+encodeURIComponent(c.dev)+'&t='+ts+'">'
+      : '<div class="camthumb noimg">영상 없음</div>';
     const c1=document.createElement('td'); c1.className='mono';
     c1.innerHTML=E(c.dev)+(stable!==c.dev?'<br><span class=tiny>'+E(stable)+'</span>':'')
       +(c.usb&&c.usb.vid?'<br><span class=tiny>'+E(c.usb.vid)+':'+E(c.usb.pid)+(sn?' sn='+E(sn):' <b class=b-warn>sn 없음 → by-path</b>')+'</span>':'');
@@ -3148,7 +3215,7 @@ function renderVCams(){
     c4.appendChild(nm);
     const c5=document.createElement('td'); c5.style.textAlign='right';
     c5.appendChild(btn('추가',()=>addCam(stable,sel.value,nm.value.trim()),'primary'));
-    [c1,c2,c3,c4,c5].forEach(x=>tr.appendChild(x));
+    [c0,c1,c2,c3,c4,c5].forEach(x=>tr.appendChild(x));
     t.appendChild(tr);
   });
 }
@@ -3165,7 +3232,8 @@ function addCam(dev,target,name){
 }
 function renderCurCams(){
   const t=$('curcamtbl');
-  t.innerHTML='<tr><th>키</th><th>device</th><th class=num>해상도</th><th class=num>fps</th><th></th></tr>';
+  t.innerHTML='<tr><th>화면</th><th>키</th><th>device</th><th class=num>해상도</th><th class=num>fps</th><th></th></tr>';
+  const ts=Date.now();
   let n=0;
   const groups=[];
   CFG.arms.forEach(a=>groups.push([a.cameras||{}, CFG.arms.length>1?a.side+'_':'']));
@@ -3176,6 +3244,11 @@ function renderCurCams(){
       n++;
       const s=obj[name];
       const tr=document.createElement('tr');
+      const c0=document.createElement('td');
+      c0.innerHTML='<img class=camthumb src="/api/setup/camsnap?dev='
+        +encodeURIComponent(s.index_or_path)+'&t='+ts+'" '
+        +'onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),'
+        +'{className:\'camthumb noimg\',textContent:\'스캔 필요\'}))">';
       const c1=document.createElement('td'); c1.className='mono'; c1.textContent=prefix+name;
       const c2=document.createElement('td'); c2.className='mono';
       c2.style.fontSize='11px'; c2.textContent=s.index_or_path;
@@ -3191,11 +3264,11 @@ function renderCurCams(){
       });
       const c5=document.createElement('td'); c5.style.textAlign='right';
       c5.appendChild(btn('삭제',()=>{ delete obj[name]; renderCurCams(); dump(); dirty('카메라 삭제'); },'danger'));
-      [c1,c2,c3,c4,c5].forEach(x=>tr.appendChild(x));
+      [c0,c1,c2,c3,c4,c5].forEach(x=>tr.appendChild(x));
       t.appendChild(tr);
     });
   });
-  if(!n) t.innerHTML+='<tr><td colspan=5 class=muted>등록된 카메라 없음 — 위에서 스캔 후 추가하세요</td></tr>';
+  if(!n) t.innerHTML+='<tr><td colspan=6 class=muted>등록된 카메라 없음 — 위에서 스캔 후 추가하세요</td></tr>';
 }
 
 /* ---------- 캘리브레이션 상태 ---------- */

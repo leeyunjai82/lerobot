@@ -35,7 +35,8 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
   양팔에서도 왕복 지연이 쌓이지 않습니다. 탭 이탈 시 자동 해제
 - **Setup**: USB 시리얼 포트 스캔·probe(모터 ID 확인)·**포트 감시로 leader/follower 판별**,
   **새 팔 모터 ID 세팅**(`lerobot-setup-motors` 의 웹 버전 — 모터 한 개씩 꽂고 gripper=6 → shoulder_pan=1),
-  카메라 스캔·등록, 한팔/양팔 모드 전환, 캘리브레이션 파일 상태 — 전부 웹에서
+  **카메라 스캔 시 썸네일 촬영**(어느 `/dev/videoN` 이 어느 카메라인지 눈으로 확인)·등록,
+  한팔/양팔 모드 전환, 캘리브레이션 파일 상태 — 전부 웹에서
 - **Calib**: 팔로워/리더 캘리브레이션을 웹에서 — 중앙 자세 기록 → 라이브 min/max 표시 → 저장.
   `lerobot-calibrate` 와 같은 버스 호출 순서, 같은 파일 경로·포맷
 - record/rollout/train/control 자원 기반 상호 배타 (학습+수동제어는 동시 허용)
