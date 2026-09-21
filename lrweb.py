@@ -3351,6 +3351,8 @@ boot();
 
 # ----------------------------- 페이지: Calibration ----------------------------
 FULL_TURN_MOTOR = "wrist_roll"       # lerobot 과 동일: 0~4095 고정
+RES = 4096                           # sts3215 엔코더 해상도
+RES_HALF = RES // 2
 SPAN_OK_DEG = 30.0                   # 이보다 좁으면 "덜 움직임" 경고
 
 
@@ -3374,6 +3376,9 @@ class CalibSession:
         self.side = self.role = None
         self.stage = "idle"     # idle | homing | ranging | done | error
         self.pos, self.lo, self.hi, self.homing = {}, {}, {}, {}
+        # 엔코더는 0~4095 단일 회전이라 경계를 넘으면 값이 튑니다.
+        # 연속 표본의 차이로 언랩해서 '진짜 이동량' 을 누적합니다.
+        self.prev_raw, self.unw = {}, {}
         self.err = ""
         self.old_calib = None   # 취소 시 모터에 되돌려 놓을 이전 캘리브레이션
         self.homed = False
@@ -3435,8 +3440,17 @@ class CalibSession:
                 self.pos = {k: int(v) for k, v in pos.items()}
                 if self.stage == "ranging":
                     for k, v in self.pos.items():
-                        self.lo[k] = min(self.lo.get(k, v), v)
-                        self.hi[k] = max(self.hi.get(k, v), v)
+                        prev = self.prev_raw.get(k, v)
+                        d = v - prev
+                        if d > RES_HALF:            # 4095 → 0 방향으로 넘어감
+                            d -= RES
+                        elif d < -RES_HALF:         # 0 → 4095 방향으로 넘어감
+                            d += RES
+                        self.prev_raw[k] = v
+                        u = self.unw.get(k, v) + d
+                        self.unw[k] = u
+                        self.lo[k] = min(self.lo.get(k, u), u)
+                        self.hi[k] = max(self.hi.get(k, u), u)
                 self.err = ""
             except Exception as e:
                 self.err = str(e)
@@ -3465,27 +3479,40 @@ class CalibSession:
             pos = self.device.bus.sync_read("Present_Position", normalize=False)
         self.homed = True
         self.pos = {k: int(v) for k, v in pos.items()}
+        self.prev_raw = dict(self.pos)
+        self.unw = dict(self.pos)
         self.lo = dict(self.pos)
         self.hi = dict(self.pos)
         self.stage = "ranging"
 
     def problems(self):
-        """저장을 막아야 하는 관절(min==max) 과 경고 관절(스팬 좁음)."""
-        block, warn = [], []
+        """(안 움직인 관절, 너무 좁게 움직인 관절, 엔코더 경계를 넘은 관절)."""
+        block, warn, wrap = [], [], []
         for m in CTL_JOINTS:
             if m == FULL_TURN_MOTOR:
                 continue
-            span = self.hi.get(m, 0) - self.lo.get(m, 0)
-            if span <= 0:
+            lo, hi = self.lo.get(m, 0), self.hi.get(m, 0)
+            span = hi - lo
+            # 언랩한 범위가 0~4095 를 벗어나면 중앙 자세가 가동범위의 중앙이 아니라
+            # 한쪽 끝에서 엔코더가 0/4095 를 넘어간 것입니다. 이 값을 저장하면
+            # 서보의 Min/Max_Position_Limit 가 엉뚱하게 잡혀 스톱을 밀게 됩니다.
+            if lo < 0 or hi > RES - 1 or span >= RES:
+                wrap.append(m)
+            elif span <= 0:
                 block.append(m)
-            elif span * 360 / 4095 < SPAN_OK_DEG:
+            elif span * 360 / (RES - 1) < SPAN_OK_DEG:
                 warn.append(m)
-        return block, warn
+        return block, warn, wrap
 
     def finish(self):
         if self.stage != "ranging":
             raise RuntimeError("범위 기록 단계가 아닙니다")
-        block, _ = self.problems()
+        block, _, wrap = self.problems()
+        if wrap:
+            raise RuntimeError(
+                "엔코더 경계(0/4095)를 넘은 관절: " + ", ".join(wrap)
+                + " — 중앙 자세가 가동범위의 중앙이 아닙니다. 취소하고, 해당 관절을 "
+                  "양 끝의 정확히 가운데에 놓은 뒤 다시 시작하세요.")
         if block:
             raise RuntimeError("아직 움직이지 않은 관절: " + ", ".join(block))
         from lerobot.motors import MotorCalibration
@@ -3493,7 +3520,7 @@ class CalibSession:
         calib = {}
         for m, motor in dev.bus.motors.items():
             if m == FULL_TURN_MOTOR:
-                lo, hi = 0, 4095
+                lo, hi = 0, RES - 1
             else:
                 lo, hi = int(self.lo[m]), int(self.hi[m])
             calib[m] = MotorCalibration(id=motor.id, drive_mode=0,
@@ -3528,13 +3555,14 @@ class CalibSession:
             if self.stage in ("ranging", "done"):
                 lo, hi = self.lo.get(m), self.hi.get(m)
                 r.update({"min": lo, "max": hi,
-                          "span_deg": round((hi - lo) * 360 / 4095, 1) if lo is not None else None})
+                          "span_deg": round((hi - lo) * 360 / (RES - 1), 1) if lo is not None else None,
+                          "wrapped": lo is not None and (lo < 0 or hi > RES - 1)})
             if self.homed and r["pos"] is not None:
-                r["deg"] = round((r["pos"] - 2047) * 360 / 4095, 1)
+                r["deg"] = round((r["pos"] - (RES - 1) / 2) * 360 / (RES - 1), 1)
             rows.append(r)
-        block, warn = self.problems() if self.stage == "ranging" else ([], [])
+        block, warn, wrap = self.problems() if self.stage == "ranging" else ([], [], [])
         return {"stage": self.stage, "side": self.side, "role": self.role,
-                "rows": rows, "err": self.err, "block": block, "warn": warn,
+                "rows": rows, "err": self.err, "block": block, "warn": warn, "wrap": wrap,
                 "saved_path": self.saved_path, "saved": self.saved,
                 "span_ok_deg": SPAN_OK_DEG}
 
@@ -3667,10 +3695,10 @@ function rows(s, withRange){
       if(r.full_turn){ h+='<td class=num>0</td><td class=num>4095</td><td class=num>360°</td><td></td>'; }
       else{
         const sp=r.span_deg||0;
-        const cls = sp<=0?'bad':(sp<s.span_ok_deg?'warn':'ok');
+        const cls = r.wrapped?'bad':(sp<=0?'bad':(sp<s.span_ok_deg?'warn':'ok'));
         const pct=Math.min(100, sp/180*100);
         h+='<td class="num mono">'+(r.min==null?'-':r.min)+'</td><td class="num mono">'+(r.max==null?'-':r.max)+'</td>'
-          +'<td class="num mono">'+sp.toFixed(1)+'°</td>'
+          +'<td class="num mono">'+(r.wrapped?'<span class=b-bad>'+sp.toFixed(1)+'° ⚠</span>':sp.toFixed(1)+'°')+'</td>'
           +'<td><div class="bar '+cls+'"><i style="width:'+pct+'%"></i></div></td>';
       }
     }
@@ -3695,15 +3723,19 @@ function renderStage(s){
       +'<p class=inst>토크가 꺼져 있습니다'+(follower?' — <b>팔로워가 주저앉을 수 있으니 손으로 받치세요.</b>':'.')+'<br>'
       +'<b>모든 관절을 가동 범위의 정중앙</b>에 놓으세요 (그리퍼는 반쯤 벌린 상태). '
       +'lerobot 은 이 자세를 각 모터의 반 바퀴(2047 tick) 기준점으로 잡습니다.<br>'
+      +'<b>여기서 중앙을 벗어나면</b> 반대쪽 끝까지 움직일 때 엔코더가 0/4095 를 넘어가 '
+      +'기록이 망가집니다 (다음 단계에서 걸러냅니다). 한쪽 끝에 치우치지 않게 하세요.<br>'
       +'그리퍼 포함 6개 관절 전부입니다. 준비되면 아래 버튼을 누르세요.</p>'
       +err+rows(s,false)
       +'<div class=toolbar style="margin-top:14px">'
       +'<button class="primary big" onclick="home()">중앙 자세 기록</button>'
       +'<button class=danger onclick="cancel()">취소</button></div></div>';
   }else if(s.stage==='ranging'){
-    const blk=s.block.length, wrn=s.warn.length;
+    const wrp=(s.wrap||[]).length, blk=s.block.length, wrn=s.warn.length;
     let note='';
-    if(blk) note='<p class="badge b-bad">아직 움직이지 않은 관절: '+s.block.join(', ')+'</p>';
+    if(wrp) note='<p class="badge b-bad">엔코더 경계(0/4095)를 넘었습니다: '+s.wrap.join(', ')
+      +'<br>중앙 자세가 가동범위의 중앙이 아닙니다. <b>취소</b>하고 해당 관절을 양 끝의 정확히 가운데에 놓은 뒤 다시 시작하세요.</p>';
+    else if(blk) note='<p class="badge b-bad">아직 움직이지 않은 관절: '+s.block.join(', ')+'</p>';
     else if(wrn) note='<p class="badge b-warn">'+s.span_ok_deg+'° 미만으로만 움직인 관절: '+s.warn.join(', ')+' — 의도한 게 아니면 더 움직이세요</p>';
     else note='<p class="badge b-ok">모든 관절 기록됨 — 저장할 수 있습니다</p>';
     box.innerHTML='<div class=stagebox>'+head+dots(2)
@@ -3713,7 +3745,7 @@ function renderStage(s){
       +'각 줄의 막대가 초록이 되면 충분합니다. 끝나면 <b>완료·저장</b>.</p>'
       +err+note+rows(s,true)
       +'<div class=toolbar style="margin-top:14px">'
-      +'<button class="primary big" onclick="finish()" '+(blk?'disabled':'')+'>완료·저장</button>'
+      +'<button class="primary big" onclick="finish()" '+((blk||wrp)?'disabled':'')+'>완료·저장</button>'
       +'<button class=danger onclick="cancel()">취소 (이전 값 복원)</button></div></div>';
   }else if(s.stage==='done'){
     box.innerHTML='<div class=stagebox>'+head+dots(3)
