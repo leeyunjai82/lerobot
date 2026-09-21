@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  lrweb.py v10.0 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
+#  lrweb.py v11 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
+#
+#  v11 (4~6단계)
+#   - Control: 팔별 제어 스레드 (양팔에서 왕복 지연이 직렬로 안 쌓임)
+#   - Collect: lerobot-record CLI + PTY 제거 → 이 파일을 --worker 로 띄워 record_loop() 직접 호출.
+#              상태/미리보기/명령이 전부 파일(RUN_DIR) → 수집 중 카메라 미리보기, lrweb 재시작에도 세션 유지
+#   - 양팔: bi_so_follower / bi_so_leader (설정 mode=bimanual). 데이터셋·체크포인트 모드 호환성 검사
 #
 #  v10 (1단계: 버그 픽스 + lerobot 객체 전환 + 설정 파일)
 #   - Control 탭이 lerobot.robots.SOFollower / lerobot.teleoperators.SOLeader 사용
@@ -28,12 +34,12 @@ import glob
 import html
 import json
 import os
-import pty as _pty
 import re
 import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -59,7 +65,21 @@ MARKS_FILE = PROJ / "lrweb_marks.json"
 CONFIG_FILE = PROJ / "lrweb_config.json"
 TOKEN_FILE = PROJ / "lrweb_token.txt"
 URDF_DIR = PROJ / "urdf"
-CALIB_ROOT = PROJ / "data/hf/lerobot/calibration"
+
+
+def _lerobot_calib_root():
+    """lerobot utils/constants.py 와 같은 규칙: HF_LEROBOT_CALIBRATION > HF_LEROBOT_HOME/calibration
+    > HF_HOME/lerobot/calibration > ~/.cache/huggingface/lerobot/calibration.
+    activate.sh 의 HF_HOME 기준이면 ~/project/lerobot/data/hf/lerobot/calibration 입니다."""
+    if os.environ.get("HF_LEROBOT_CALIBRATION"):
+        return Path(os.environ["HF_LEROBOT_CALIBRATION"]).expanduser()
+    if os.environ.get("HF_LEROBOT_HOME"):
+        return Path(os.environ["HF_LEROBOT_HOME"]).expanduser() / "calibration"
+    hf_home = Path(os.environ.get("HF_HOME") or (HOME / ".cache/huggingface")).expanduser()
+    return hf_home / "lerobot" / "calibration"
+
+
+CALIB_ROOT = _lerobot_calib_root()
 PORT = 8080
 
 # ------------------------------- 상수 ---------------------------------------
@@ -69,7 +89,10 @@ FEEDBACK_HZ = 10
 MAX_STEP_DEG = 2.5        # 슬라이더 제어 시 스텝당 최대 이동
 FOLLOW_STEP_DEG = 6.0     # 리더 팔로우 시 스텝당 최대 이동 (반응성↑)
 CTL_STREAM_FPS = 15
+PREVIEW_FPS = 10          # record worker 가 미리보기 JPEG 을 갱신하는 주기
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+# record worker ↔ 웹 사이의 상태/미리보기/명령 파일. 초당 수십 회 쓰므로 tmpfs 를 우선합니다.
+RUN_DIR = Path("/dev/shm/lrweb") if Path("/dev/shm").is_dir() else PROJ / "lrweb_run"
 
 # ------------------------------- 설정 ---------------------------------------
 # arms 는 처음부터 리스트입니다. 한팔이면 원소 1개(side="main"),
@@ -352,6 +375,16 @@ def list_datasets():
     return out
 
 
+def checkpoint_robot_type(rel):
+    """pretrained_model/train_config.json → dataset.repo_id → 로컬 데이터셋 robot_type (best-effort)."""
+    tc = load_json(OUT_ROOT / rel / "train_config.json", {})
+    repo = ((tc.get("dataset") or {}).get("repo_id") or "")
+    name = repo.split("/", 1)[-1] if repo else ""
+    if not safe_name(name):
+        return ""
+    return load_json(DATA_ROOT / name / "meta/info.json", {}).get("robot_type", "")
+
+
 def list_checkpoints():
     """outputs/*/checkpoints/*/pretrained_model 탐색.
     'last'가 숫자 체크포인트를 가리키는 심볼릭 링크면 중복 제거(숫자 쪽 유지)."""
@@ -421,13 +454,44 @@ def _cam_cli(specs):
     return "{" + ", ".join(items) + "}"
 
 
+def robot_name():
+    """lerobot 이 데이터셋 meta/info.json 의 robot_type 에 기록하는 이름."""
+    return "bi_so_follower" if BIMANUAL else "so_follower"
+
+
+def bimanual_base_id(role, arm_cfgs=None):
+    """양팔에서 lerobot BiSO* 는 per-arm 캘리브레이션 id 를 '{id}_left' / '{id}_right' 로 만듭니다.
+    설정의 follower_id 가 'X_left' / 'X_right' 면 BiSOFollowerConfig(id='X') 가 됩니다."""
+    arm_cfgs = arm_cfgs or ARM_CFGS
+    left = arm_cfgs["left"][f"{role}_id"]
+    right = arm_cfgs["right"][f"{role}_id"]
+    if not (left.endswith("_left") and right.endswith("_right") and left[:-5] == right[:-6]):
+        raise ValueError(f"양팔 {role} id 는 같은 이름에 _left / _right 를 붙여야 합니다 "
+                         f"(예: {role}_left / {role}_right) — 현재 {left} / {right}")
+    return left[:-5]
+
+
+def _need_ports(role):
+    for side, arm in ARM_CFGS.items():
+        if not arm.get(f"{role}_port"):
+            raise NotImplementedError(
+                f"{side + ' ' if BIMANUAL else ''}{'팔로워' if role == 'follower' else '리더'} 포트가 "
+                f"지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
+
+
 def robot_cli_args():
-    """한팔: so101_follower / 양팔: bi_so_follower (양팔은 6단계에서 활성화)"""
+    """lerobot CLI(rollout) 용 --robot.* 인자. 한팔: so101_follower / 양팔: bi_so_follower"""
+    _need_ports("follower")
     if BIMANUAL:
-        raise NotImplementedError("양팔(bi_so_follower)은 아직 미지원 — arms 를 1개로 두세요")
+        L, R = ARM_CFGS["left"], ARM_CFGS["right"]
+        return ["--robot.type=bi_so_follower",
+                f"--robot.id={bimanual_base_id('follower')}",
+                f"--robot.left_arm_config.port={L['follower_port']}",
+                f"--robot.left_arm_config.cameras={_cam_cli(L['cameras'])}",
+                f"--robot.right_arm_config.port={R['follower_port']}",
+                f"--robot.right_arm_config.cameras={_cam_cli(R['cameras'])}",
+                f"--robot.cameras={_cam_cli(CFG['cameras'])}"]
     arm = ARM_CFGS[SIDES[0]]
-    if not arm.get("follower_port"):
-        raise NotImplementedError("팔로워 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
     cams = dict(arm["cameras"])
     cams.update(CFG["cameras"])
     return ["--robot.type=so101_follower",
@@ -437,20 +501,20 @@ def robot_cli_args():
 
 
 def teleop_cli_args():
+    _need_ports("leader")
     if BIMANUAL:
-        raise NotImplementedError("양팔(bi_so_leader)은 아직 미지원 — arms 를 1개로 두세요")
+        L, R = ARM_CFGS["left"], ARM_CFGS["right"]
+        return ["--teleop.type=bi_so_leader",
+                f"--teleop.id={bimanual_base_id('leader')}",
+                f"--teleop.left_arm_config.port={L['leader_port']}",
+                f"--teleop.right_arm_config.port={R['leader_port']}"]
     arm = ARM_CFGS[SIDES[0]]
-    if not arm.get("leader_port"):
-        raise NotImplementedError("리더 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
     return ["--teleop.type=so101_leader",
             f"--teleop.port={arm['leader_port']}",
             f"--teleop.id={arm['leader_id']}"]
 
 
 # ----------------------------- 작업(job) 관리 --------------------------------
-PTYS = {}   # jid -> pty master fd (record 키 입력용, lrweb 프로세스 생존 동안만 유효)
-
-
 def pid_alive(pid):
     if not pid:
         return False
@@ -499,42 +563,54 @@ class JobStartError(RuntimeError):
     pass
 
 
-def start_job(kind, argv, cwd=None, use_pty=False):
-    """argv 는 반드시 리스트 — shell=False 이므로 셸 인젝션이 불가능합니다."""
+def run_dir(jid):
+    return RUN_DIR / jid
+
+
+def start_job(kind, argv, cwd=None, spec=None):
+    """argv 는 반드시 리스트 — shell=False 이므로 셸 인젝션이 불가능합니다.
+    spec 은 worker 가 읽을 작업 명세(dict) — job json 에 같이 저장됩니다."""
     if shutil.which(argv[0]) is None:
         raise JobStartError(f"실행 파일을 찾을 수 없습니다: {argv[0]} — lerobot conda env 안에서 lrweb 를 띄웠는지 확인")
     jid = f"{kind}_{time.strftime('%m%d_%H%M%S')}"
     log = JOB_DIR / f"{jid}.log"
+    # worker 가 자기 job json 을 읽으므로 프로세스보다 먼저 써야 합니다
+    save_json(JOB_DIR / f"{jid}.json",
+              {"id": jid, "kind": kind, "cmd": " ".join(str(a) for a in argv), "pid": None,
+               "log": str(log), "started": time.strftime("%F %T"), "spec": spec})
+    argv = [str(a).replace("{jid}", jid) for a in argv]
     lf = open(log, "w")
-    kw = dict(cwd=cwd or str(HOME), stdout=lf, stderr=subprocess.STDOUT,
-              env=child_env(), preexec_fn=os.setsid)
     try:
-        if use_pty:
-            master, slave = _pty.openpty()
-            try:
-                p = subprocess.Popen(argv, stdin=slave, **kw)
-            finally:
-                os.close(slave)
-            PTYS[jid] = master
-        else:
-            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, **kw)
+        p = subprocess.Popen(argv, cwd=cwd or str(HOME), stdin=subprocess.DEVNULL,
+                             stdout=lf, stderr=subprocess.STDOUT,
+                             env=child_env(), preexec_fn=os.setsid)
     finally:
         lf.close()      # 자식이 dup 를 들고 있으므로 부모 쪽은 닫습니다 (fd 누수 방지)
-    save_json(JOB_DIR / f"{jid}.json",
-              {"id": jid, "kind": kind, "cmd": " ".join(argv), "pid": p.pid,
-               "log": str(log), "started": time.strftime("%F %T")})
+    j = load_json(JOB_DIR / f"{jid}.json", {})
+    j["pid"] = p.pid
+    j["cmd"] = " ".join(argv)
+    save_json(JOB_DIR / f"{jid}.json", j)
     return jid
 
 
-def send_key(jid, key):
-    fd = PTYS.get(jid)
-    if fd is None:
+def send_cmd(jid, key):
+    """record worker 에 n/r/q 전달 — 파일 큐. lrweb 를 재시작해도 그대로 동작합니다."""
+    if not safe_name(jid):
         return False
+    rd = run_dir(jid)
     try:
-        os.write(fd, key.encode())
+        rd.mkdir(parents=True, exist_ok=True)
+        with open(rd / "cmd", "a") as f:
+            f.write(key)
         return True
     except OSError:
         return False
+
+
+def record_status(jid):
+    if not safe_name(jid):
+        return {}
+    return load_json(run_dir(jid) / "status.json", {})
 
 
 def kill_job(jid):
@@ -564,12 +640,7 @@ def delete_job(jid):
             (JOB_DIR / f"{jid}{suffix}").unlink()
         except FileNotFoundError:
             pass
-    fd = PTYS.pop(jid, None)
-    if fd is not None:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    shutil.rmtree(run_dir(jid), ignore_errors=True)
     return True
 
 
@@ -609,6 +680,10 @@ class ArmCtl:
         self.limits = {}
         self.err = ""
         self.follow = False
+        self.lock = threading.Lock()   # 시리얼은 스레드 안전하지 않음 — 루프/명령 직렬화
+        self.leader = None
+        self.running = False
+        self.thread = None
 
     # --- 연결 ---------------------------------------------------------------
     @property
@@ -668,29 +743,71 @@ class ArmCtl:
             self.limits[name] = (round(lo, 1), round(hi, 1))
 
     def disconnect(self):
-        if self.robot is not None:
-            try:
-                self.robot.disconnect()     # disable_torque_on_disconnect=True 가 기본
-            except Exception:
-                pass
-        self.robot = None
-        self.torque = False
-        self.follow = False
-        self.err = ""
+        self.stop_loop()
+        with self.lock:
+            if self.robot is not None:
+                try:
+                    self.robot.disconnect()     # disable_torque_on_disconnect=True 가 기본
+                except Exception:
+                    pass
+            self.robot = None
+            self.torque = False
+            self.follow = False
+            self.err = ""
 
-    # --- 입출력 -------------------------------------------------------------
+    # --- 팔별 제어 스레드 (4단계) ---------------------------------------------
+    # 팔마다 스레드 하나: 리더 읽기 → 적분기 step → 주기적 실측. 팔이 늘어도 왕복 지연이
+    # 직렬로 쌓이지 않습니다. WebSocket 은 상태를 퍼가기만 합니다.
+    def start_loop(self, leader):
+        self.leader = leader
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, name=f"arm-{self.side}", daemon=True)
+        self.thread.start()
+
+    def stop_loop(self):
+        self.running = False
+        t, self.thread = self.thread, None
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=1.5)
+
+    def _loop(self):
+        last_fb = 0.0
+        while self.running and self.connected:
+            t0 = time.monotonic()
+            try:
+                with self.lock:
+                    if self.robot is None:
+                        break
+                    ldr = self.leader
+                    if self.follow and ldr is not None and ldr.connected:
+                        for n, v in ldr.read().items():
+                            if n in CTL_JOINTS:
+                                self.target[n] = v
+                    self.step()
+                    if t0 - last_fb > 1.0 / FEEDBACK_HZ:
+                        self.actual = self.read()
+                        last_fb = t0
+                self.err = ""
+            except Exception as e:
+                self.err = str(e)
+            time.sleep(max(0.0, 1.0 / CONTROL_HZ - (time.monotonic() - t0)))
+
+    # --- 입출력 (호출자가 lock 을 잡거나, 루프 스레드 안에서만) -------------------
     def read(self):
         obs = self.robot.get_observation()
         return {k[:-4]: float(v) for k, v in obs.items() if k.endswith(".pos")}
 
     def set_torque(self, on: bool):
-        (self.robot.bus.enable_torque if on else self.robot.bus.disable_torque)()
-        self.torque = on
-        if on:
-            # 점프 방지: 현재 자세를 명령/목표의 시작점으로
-            self.actual = self.read()
-            self.target = dict(self.actual)
-            self.cmd = dict(self.actual)
+        with self.lock:
+            (self.robot.bus.enable_torque if on else self.robot.bus.disable_torque)()
+            self.torque = on
+            if on:
+                # 점프 방지: 현재 자세를 명령/목표의 시작점으로
+                self.actual = self.read()
+                self.target = dict(self.actual)
+                self.cmd = dict(self.actual)
 
     def step(self):
         """cmd 를 target 으로 제한 속도 이동. 엔코더 값은 절대 안 섞음(떨림 방지).
@@ -721,6 +838,7 @@ class LeaderCtl:
         self.cfg = arm_cfg
         self.side = arm_cfg["side"]
         self.tele = None
+        self.lock = threading.Lock()
 
     @property
     def connected(self):
@@ -741,15 +859,19 @@ class LeaderCtl:
         self.tele = tele
 
     def read(self):
-        return {k[:-4]: float(v) for k, v in self.tele.get_action().items() if k.endswith(".pos")}
+        with self.lock:
+            if self.tele is None:
+                return {}
+            return {k[:-4]: float(v) for k, v in self.tele.get_action().items() if k.endswith(".pos")}
 
     def disconnect(self):
-        if self.tele is not None:
-            try:
-                self.tele.disconnect()
-            except Exception:
-                pass
-        self.tele = None
+        with self.lock:
+            if self.tele is not None:
+                try:
+                    self.tele.disconnect()
+                except Exception:
+                    pass
+            self.tele = None
 
 
 class CamStreamer:
@@ -1249,14 +1371,16 @@ def api_sw():
 # ----------------------------- 페이지: 데이터셋 -------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
-    rows = "".join(
-        f'<tr><td><a href="/ds/{esc(d["name"])}" class=mono>{esc(d["name"])}</a></td>'
-        f'<td class=num>{esc(d["episodes"])}</td><td class=num>{esc(d["frames"])}</td>'
-        f'<td class=num>{esc(d["fps"])}</td>'
-        f'<td class=mono style="color:var(--muted)">{esc(d["robot_type"])}</td>'
-        f'<td style="text-align:right">'
-        f'<button class=danger onclick="delDs({jsattr(d["name"])})">삭제</button></td></tr>'
-        for d in list_datasets())
+    def _row(d):
+        mismatch = ' <span class="badge b-warn">모드 불일치</span>' \
+            if d["robot_type"] and d["robot_type"] != robot_name() else ""
+        return (f'<tr><td><a href="/ds/{esc(d["name"])}" class=mono>{esc(d["name"])}</a></td>'
+                f'<td class=num>{esc(d["episodes"])}</td><td class=num>{esc(d["frames"])}</td>'
+                f'<td class=num>{esc(d["fps"])}</td>'
+                f'<td class=mono style="color:var(--muted)">{esc(d["robot_type"])}{mismatch}</td>'
+                f'<td style="text-align:right">'
+                f'<button class=danger onclick="delDs({jsattr(d["name"])})">삭제</button></td></tr>')
+    rows = "".join(_row(d) for d in list_datasets())
     empty = ('' if rows else
              '<tr><td colspan=6 class=muted>데이터셋이 없습니다 — Collect 탭에서 수집을 시작하세요</td></tr>')
     return f"""{CSS}{nav_html('ds')}<div class=wrap>
@@ -1424,47 +1548,16 @@ def api_delete(ds: str):
 def collect_page():
     rec = next((j for j in jobs_index() if j["kind"] == "record" and j["alive"]), None)
     if rec:
-        has_pty = rec["id"] in PTYS
-        keywarn = "" if has_pty else ('<p class="badge b-warn">키 입력 불가 — lrweb 재시작 이후의 세션이라 '
-                                      '시간 기반으로만 진행됩니다. 종료는 중지 버튼 사용</p>')
-        keys = ""
-        if has_pty:
-            keys = """<div class=keys>
-            <button class="primary big" onclick="key('n')">n &nbsp;다음</button>
-            <button class=big onclick="key('r')">r &nbsp;재녹화</button>
-            <button class="danger big" onclick="key('q')">q &nbsp;종료·저장</button></div>"""
-        return f"""{CSS}{nav_html('co')}<div class=wrap>
-        <p class=eyebrow>Recording</p><h2>수집 진행 중</h2>
-        <div class=runbar><span class="badge b-run">recording</span>
-          <span class=mono>{esc(rec["id"])}</span>
-          <button class=danger onclick="stopRec()">강제 중지</button></div>
-        {keywarn}{keys}
-        <p class=eyebrow>Log</p><pre id=tail>...</pre></div>
-        <script>
-        const JID={js(rec["id"])};
-        async function key(k){{ await fetch('/api/sendkey/'+JID+'/'+k,{{method:'POST'}}); }}
-        async function stopRec(){{
-          if(!confirm('강제 중지할까요? (가능하면 q 종료·저장을 쓰세요)'))return;
-          await fetch('/api/kill/'+JID,{{method:'POST'}}); setTimeout(()=>location.reload(),1500);
-        }}
-        async function refresh(){{
-          const r=await fetch('/api/joblog/'+JID); const d=await r.json();
-          document.getElementById('tail').textContent=d.tail||'';
-          if(!d.alive) location.reload();
-        }}
-        refresh(); setInterval(refresh,2000);
-        document.addEventListener('keydown',e=>{{
-          if(e.target.tagName==='INPUT')return;
-          if(['n','r','q'].includes(e.key)) key(e.key);
-        }});
-        </script>"""
+        return (CSS + nav_html("co") + f"<script>const JID={js(rec['id'])};</script>" + COLLECT_RUN_HTML)
     busy = exclusive_busy()
     busywarn = (f'<p class="badge b-warn">실행 중: {esc(busy["id"])} — 끝나야 수집을 시작할 수 있습니다</p>'
                 if busy else "") + setup_needed_html()
-    resume_opts = "".join(f'<option value="{esc(d["name"])}">{esc(d["name"])} ({esc(d["episodes"])}ep)</option>'
-                          for d in list_datasets())
+    resume_opts = "".join(
+        f'<option value="{esc(d["name"])}" {"" if d["robot_type"] in ("", robot_name()) else "disabled"}>'
+        f'{esc(d["name"])} ({esc(d["episodes"])}ep{"" if d["robot_type"] in ("", robot_name()) else " · " + esc(d["robot_type"]) + " — 모드 불일치"})</option>'
+        for d in list_datasets())
     return f"""{CSS}{nav_html('co')}<div class=wrap>
-    <p class=eyebrow>Teleoperation record</p><h2>Collect</h2>
+    <p class=eyebrow>Teleoperation record · {"양팔 bi_so_follower" if BIMANUAL else "한팔 so101_follower"}</p><h2>Collect</h2>
     {busywarn}
     <div class=card>
     <div class=formgrid>
@@ -1485,7 +1578,8 @@ def collect_page():
       <button class=primary onclick="startRec()">수집 시작</button>
     </div>
     <p class=muted>시작 즉시 에피소드 0 녹화가 시작됩니다 — 물체·리더암을 먼저 준비하세요.
-    시작 후 이 페이지에서 n(다음) / r(재녹화) / q(종료) 버튼 또는 키보드로 조작합니다.</p>
+    시작 후 이 페이지에서 n(다음) / r(재녹화) / q(종료) 버튼 또는 키보드로 조작하고, 카메라 미리보기가 같이 뜹니다.<br>
+    카메라: <span class=mono>{esc(", ".join(CAM_SPECS) or "없음 — Setup 탭에서 등록")}</span></p>
     </div></div>
     <script>
     function modeSw(){{
@@ -1517,42 +1611,69 @@ async def api_record(req: Request):
     neps = _clamp_int(b.get("num_episodes"), 50, 1, 100000)
     ept = _clamp_int(b.get("episode_time_s"), 30, 1, 3600)
     rst = _clamp_int(b.get("reset_time_s"), 15, 0, 3600)
+    try:
+        _need_ports("follower")
+        _need_ports("leader")
+        if BIMANUAL:
+            bimanual_base_id("follower")
+            bimanual_base_id("leader")
+    except (NotImplementedError, ValueError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    missing = [f"{side}/{role}" for side, roles in calib_status().items()
+               for role, c in roles.items() if not c["ok"]]
+    if missing:
+        return JSONResponse({"error": "캘리브레이션 없음: " + ", ".join(missing) + " — Calib 탭에서 먼저"},
+                            status_code=400)
+    if not CAM_SPECS:
+        return JSONResponse({"error": "카메라가 등록되지 않았습니다 — Setup 탭에서 추가하세요"}, status_code=400)
     if b.get("mode") == "resume":
         ds = (b.get("resume_ds") or "").strip()
         if not safe_name(ds):
             return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
         root = DATA_ROOT / ds
-        if not root.exists():
+        if not (root / "meta/info.json").exists():
             return JSONResponse({"error": "데이터셋 없음"}, status_code=400)
-        ds_args = [f"--dataset.repo_id=local/{ds}", f"--dataset.root={root}", "--resume=true"]
+        rt = load_json(root / "meta/info.json", {}).get("robot_type", "")
+        if rt and rt != robot_name():
+            return JSONResponse({"error": f"데이터셋은 {rt} 로 수집됨 — 현재 모드({robot_name()})와 다릅니다"},
+                                status_code=400)
+        resume, name = True, ds
     else:
         name = (b.get("name") or "").strip()
         if not safe_name(name):
             return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
-        ds_args = [f"--dataset.repo_id=local/{name}"]
+        if (DATA_ROOT / name).exists():
+            return JSONResponse({"error": f"이미 있는 데이터셋: {name} — 다른 이름을 쓰거나 '기존에 이어서' 선택"},
+                                status_code=400)
+        resume = False
+    spec = {"mode": CFG["mode"], "arms": json.loads(json.dumps(CFG["arms"])),
+            "cameras": json.loads(json.dumps(CFG["cameras"])), "fps": int(CFG["fps"]),
+            "task": task, "num_episodes": neps, "episode_time_s": ept, "reset_time_s": rst,
+            "repo_id": f"local/{name}", "root": str(DATA_ROOT / name), "resume": resume,
+            "streaming_encoding": bool(CFG.get("streaming_encoding", False))}
     try:
-        argv = (["lerobot-record"] + robot_cli_args() + teleop_cli_args() + ds_args
-                + [f"--dataset.num_episodes={neps}",
-                   f"--dataset.single_task={task}",
-                   f"--dataset.episode_time_s={ept}",
-                   f"--dataset.reset_time_s={rst}",
-                   "--dataset.push_to_hub=false",
-                   f"--dataset.fps={int(CFG['fps'])}"])
-    except NotImplementedError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-    try:
-        jid = start_job("record", argv, use_pty=True)
+        jid = start_job("record", [sys.executable, str(Path(__file__).resolve()), "--worker", "record", "{jid}"],
+                        spec=spec)
     except JobStartError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, "job": jid}
+
+
+@app.get("/api/record_status/{jid}")
+def api_record_status(jid: str):
+    if not safe_name(jid):
+        return JSONResponse({"error": "잘못된 작업 id"}, status_code=400)
+    j = load_json(JOB_DIR / f"{jid}.json", {})
+    return JSONResponse({"status": record_status(jid), "tail": log_tail(jid),
+                         "alive": pid_alive(j.get("pid"))})
 
 
 @app.post("/api/sendkey/{jid}/{key}")
 def api_sendkey(jid: str, key: str):
     if key not in ("n", "r", "q"):
         return JSONResponse({"error": "허용되지 않은 키"}, status_code=400)
-    ok = send_key(jid, key)
-    return {"ok": ok} if ok else JSONResponse({"error": "키 전달 실패 (PTY 없음)"}, status_code=400)
+    ok = send_cmd(jid, key)
+    return {"ok": ok} if ok else JSONResponse({"error": "키 전달 실패"}, status_code=400)
 
 
 @app.get("/api/joblog/{jid}")
@@ -1718,10 +1839,15 @@ def rollout_page():
     busywarn = (f'<p class="badge b-warn">실행 중: {esc(busy["id"])} — 끝나야 추론을 시작할 수 있습니다</p>'
                 if busy else "") + setup_needed_html()
     ckpts = list_checkpoints()
-    ck_opts = "".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in ckpts)
+    ck_opts = ""
+    for c in ckpts:
+        rt = checkpoint_robot_type(c)
+        bad = bool(rt) and rt != robot_name()
+        ck_opts += (f'<option value="{esc(c)}" {"disabled" if bad else ""}>{esc(c)}'
+                    f'{" · " + esc(rt) + " — 모드 불일치" if bad else (" · " + esc(rt) if rt else "")}</option>')
     empty = "" if ckpts else '<p class=muted>체크포인트가 없습니다 — Training에서 학습을 먼저 완료하세요</p>'
     return f"""{CSS}{nav_html('ro')}<div class=wrap>
-    <p class=eyebrow>Autonomous run</p><h2>Rollout</h2>
+    <p class=eyebrow>Autonomous run · {"양팔 bi_so_follower" if BIMANUAL else "한팔 so101_follower"}</p><h2>Rollout</h2>
     {busywarn}{empty}
     <div class=card>
     <div class=formgrid>
@@ -1777,10 +1903,14 @@ async def api_rollout(req: Request):
         return JSONResponse({"error": "체크포인트 없음"}, status_code=400)
     dur = _clamp_int(b.get("duration"), 60, 0, 86400)
     task = (b.get("task") or CFG["default_task"]).strip()
+    rt = checkpoint_robot_type(rel)
+    if rt and rt != robot_name():
+        return JSONResponse({"error": f"체크포인트는 {rt} 데이터로 학습됨 — 현재 모드({robot_name()})와 다릅니다"},
+                            status_code=400)
     try:
-        argv = (["lerobot-rollout", f"--policy.path={ck}"] + robot_cli_args()
+        argv = (["python", "-m", "lerobot.scripts.lerobot_rollout", f"--policy.path={ck}"] + robot_cli_args()
                 + ["--strategy.type=base", f"--duration={dur}", f"--task={task}"])
-    except NotImplementedError as e:
+    except (NotImplementedError, ValueError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     try:
         jid = start_job("rollout", argv)
@@ -1833,6 +1963,8 @@ def control_page():
     cam_panels = "".join(
         f'<div class=cw><span class=cl>{esc(n)}</span><img id="cam_{esc(n)}"></div>'
         for n in CAM_SPECS)
+    if not CAM_SPECS:
+        cam_panels = ""
     arm_panels = "".join(
         f'<div class=armbox data-side="{esc(s)}">'
         f'{"<div class=armhead>" + esc(s) + "</div>" if BIMANUAL else ""}'
@@ -2116,6 +2248,9 @@ async def ws_control(sock: WebSocket):
                     ARMS[side].set_torque(True)
                 ARMS[side].follow = True
 
+        for side, arm in ARMS.items():
+            arm.start_loop(LEADERS[side])
+
         async def rx():
             nonlocal synced
             async for msg in sock.iter_text():
@@ -2160,37 +2295,12 @@ async def ws_control(sock: WebSocket):
                         except Exception:
                             pass
 
-        def _tick(do_feedback):
-            """한 제어 주기 — 스레드에서 실행 (팔별 시리얼 왕복)."""
-            err = ""
-            for side, arm in ARMS.items():
-                if not arm.connected:
-                    continue
-                try:
-                    ldr = LEADERS[side]
-                    if arm.follow and ldr.connected:
-                        for n, v in ldr.read().items():
-                            if n in CTL_JOINTS:
-                                arm.target[n] = v
-                    arm.step()
-                    if do_feedback:
-                        arm.actual = arm.read()
-                        arm.err = ""
-                except Exception as e:
-                    arm.err = str(e)
-                    err = str(e)
-            return err
-
         rx_task = asyncio.create_task(rx())
-        last_fb = 0.0
         try:
             while True:
                 t0 = time.monotonic()
-                do_fb = (t0 - last_fb) > 1.0 / FEEDBACK_HZ
-                err = await asyncio.to_thread(_tick, do_fb)
-                if do_fb:
-                    last_fb = t0
                 any_arm = _first_arm()
+                err = next((a.err for a in ARMS.values() if a.err), "")
                 await sock.send_text(json.dumps({
                     "type": "state", "arms": _arms_state(),
                     "torque": any_arm.torque, "follow": any_arm.follow,
@@ -2205,6 +2315,8 @@ async def ws_control(sock: WebSocket):
     finally:
         CTL_OWNER = None
         CAMS.close()                      # 탭 이탈 = 카메라 해제
+        for arm in ARMS.values():
+            arm.stop_loop()
         for ldr in LEADERS.values():
             ldr.disconnect()
         for arm in ARMS.values():
@@ -2216,10 +2328,45 @@ def _first_arm():
 
 
 # Control 카메라 MJPEG 스트림
+def _mjpeg_from_files(jid, cam):
+    """record worker 가 RUN_DIR 에 떨어뜨리는 JPEG 을 mtime 이 바뀔 때마다 흘려보냅니다."""
+    boundary = b"--frame"
+    f = run_dir(jid) / f"cam_{cam}.jpg"
+    jf = JOB_DIR / f"{jid}.json"
+
+    def gen():
+        last_m, last_sent = 0.0, 0.0
+        idle = 0
+        while True:
+            try:
+                m = f.stat().st_mtime
+            except OSError:
+                m = 0.0
+            now = time.monotonic()
+            if m and (m != last_m or now - last_sent > 1.0):
+                try:
+                    data = f.read_bytes()
+                except OSError:
+                    data = b""
+                if data:
+                    last_m, last_sent = m, now
+                    yield (boundary + b"\r\nContent-Type: image/jpeg\r\n"
+                           + f"Content-Length: {len(data)}\r\n\r\n".encode() + data + b"\r\n")
+            idle += 1
+            if idle % 20 == 0 and not pid_alive(load_json(jf, {}).get("pid")):
+                break
+            time.sleep(1.0 / PREVIEW_FPS)
+
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
 @app.get("/stream/{cam}")
 def stream_cam(cam: str):
     if not CAMS.on:
-        return JSONResponse({"error": "카메라 미가동 (Control 탭에서만 스트리밍)"}, status_code=503)
+        rec = next((j for j in jobs_index() if j["kind"] == "record" and j["alive"]), None)
+        if rec and (cam in CAM_SPECS or safe_name(cam)):
+            return _mjpeg_from_files(rec["id"], cam)
+        return JSONResponse({"error": "카메라 미가동 (Control 탭 또는 수집 중에만 스트리밍)"}, status_code=503)
     if cam not in CAM_SPECS:
         return JSONResponse({"error": "unknown camera"}, status_code=404)
     boundary = b"--frame"
@@ -2303,6 +2450,15 @@ def validate_config(cfg):
     expect = {"main"} if want == 1 else {"left", "right"}
     if set(sides) != expect or len(set(sides)) != want:
         return f"mode={mode} 의 side 는 {sorted(expect)} 여야 합니다"
+    if mode == "bimanual":
+        try:
+            by_side = {a.get("side"): a for a in arms}
+            bimanual_base_id("follower", by_side)
+            bimanual_base_id("leader", by_side)
+        except (KeyError, TypeError, AttributeError):
+            return "양팔 id 형식 오류"
+        except ValueError as e:
+            return str(e)
     seen_ports, cam_names, calib_ids = {}, set(), {}
     for arm in arms:
         if not isinstance(arm, dict):
@@ -2580,7 +2736,7 @@ function renderArms(){
   $('b2').className=bi?'primary':'';
   $('modehint').innerHTML = bi
     ? '양팔 = lerobot <span class=mono>bi_so_follower</span> / <span class=mono>bi_so_leader</span>. '
-      +'수집·학습·추론은 아직 미지원(6단계)이고, 설정과 Control 탭 표시만 먼저 됩니다.'
+      +'calib id 는 같은 이름에 _left / _right 를 붙여야 합니다 (lerobot 이 {id}_left 로 파일을 찾습니다).'
     : '한팔 = lerobot <span class=mono>so101_follower</span> / <span class=mono>so101_leader</span>.';
   const box=$('arms'); box.innerHTML='';
   CFG.arms.forEach(a=>{
@@ -2593,7 +2749,8 @@ function renderArms(){
       ip.placeholder='/dev/serial/by-path/... (아래 표에서 지정하거나 직접 입력)';
       ip.value=a[role+'_port']||'';
       ip.onchange=()=>{ a[role+'_port']=ip.value.trim(); renderPorts(); dump(); dirty('포트 변경'); };
-      const lb=document.createElement('span'); lb.className='tiny'; lb.textContent='calib id';
+      const lb=document.createElement('span'); lb.className='tiny';
+      lb.textContent = CFG.mode==='bimanual' ? 'calib id (X_left / X_right)' : 'calib id';
       const id=document.createElement('input'); id.className='cid'; id.value=a[role+'_id']||'';
       id.onchange=()=>{ a[role+'_id']=id.value.trim(); dump(); dirty('캘리브 id 변경'); };
       row.appendChild(ip); row.appendChild(lb); row.appendChild(id);
@@ -3242,6 +3399,391 @@ refresh(); timer=setInterval(refresh,250);
 
 
 
+# ----------------------------- Record worker (별도 프로세스, 5단계) ----------------
+# lerobot-record 를 셸로 띄우고 PTY 로 키를 넣던 것을 없앴습니다. 대신 이 파일 자체를
+#   python lrweb.py --worker record <jid>
+# 로 띄워 lerobot 의 record_loop() 를 직접 부릅니다. events 딕트가 곧 n/r/q 입니다.
+#   상태   : RUN_DIR/<jid>/status.json       (worker → 웹, PREVIEW_FPS 로 갱신)
+#   미리보기: RUN_DIR/<jid>/cam_<name>.jpg   (worker → 웹, 원자적 교체)
+#   명령   : RUN_DIR/<jid>/cmd               (웹 → worker, n/r/q 문자를 append)
+# 전부 파일이라 lrweb 를 재시작해도 세션을 잃지 않습니다.
+
+def _cam_configs(specs):
+    from lerobot.cameras.opencv import OpenCVCameraConfig
+    out = {}
+    for name, sp in specs.items():
+        idx = sp["index_or_path"]
+        idx = idx if isinstance(idx, int) else Path(str(idx))
+        out[name] = OpenCVCameraConfig(index_or_path=idx, fps=int(sp["fps"]),
+                                       width=int(sp["width"]), height=int(sp["height"]))
+    return out
+
+
+def make_devices(spec):
+    """spec = 시작 시점의 설정 스냅샷. (robot, teleop, 하위 팔 객체 목록) — 한팔/양팔 분기.
+    하위 팔 객체 목록은 캘리브레이션 파일 확인·기록용입니다."""
+    arms = {a["side"]: a for a in spec["arms"]}
+    if spec["mode"] == "bimanual":
+        from lerobot.robots.bi_so_follower import BiSOFollower, BiSOFollowerConfig
+        from lerobot.robots.so_follower import SOFollowerConfig
+        from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
+        from lerobot.teleoperators.so_leader import SOLeaderConfig
+        L, R = arms["left"], arms["right"]
+        robot = BiSOFollower(BiSOFollowerConfig(
+            id=bimanual_base_id("follower", arms),
+            left_arm_config=SOFollowerConfig(port=L["follower_port"], cameras=_cam_configs(L["cameras"])),
+            right_arm_config=SOFollowerConfig(port=R["follower_port"], cameras=_cam_configs(R["cameras"])),
+            cameras=_cam_configs(spec["cameras"])))
+        teleop = BiSOLeader(BiSOLeaderConfig(
+            id=bimanual_base_id("leader", arms),
+            left_arm_config=SOLeaderConfig(port=L["leader_port"]),
+            right_arm_config=SOLeaderConfig(port=R["leader_port"])))
+        subs = [robot.left_arm, robot.right_arm, teleop.left_arm, teleop.right_arm]
+    else:
+        from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
+        from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
+        arm = spec["arms"][0]
+        cams = dict(arm["cameras"])
+        cams.update(spec["cameras"])
+        robot = SOFollower(SOFollowerRobotConfig(id=arm["follower_id"], port=arm["follower_port"],
+                                                 use_degrees=True, cameras=_cam_configs(cams)))
+        teleop = SOLeader(SOLeaderTeleopConfig(id=arm["leader_id"], port=arm["leader_port"],
+                                               use_degrees=True))
+        subs = [robot, teleop]
+    return robot, teleop, subs
+
+
+class _Preview:
+    """robot.get_observation() 을 감싸 최신 카메라 프레임을 잡아두고, 별도 스레드가
+    PREVIEW_FPS 로 JPEG + status.json 을 씁니다. record 루프에는 인코딩 비용을 얹지 않습니다."""
+
+    def __init__(self, robot, rd, status):
+        self.rd = rd
+        self.status = status
+        self.latest = {}
+        self.on = True
+        orig = robot.get_observation
+
+        def tee():
+            obs = orig()
+            for k, v in obs.items():
+                if getattr(v, "ndim", 0) == 3:
+                    self.latest[k] = v
+            return obs
+
+        robot.get_observation = tee     # 인스턴스 속성이 클래스 메서드를 가림
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def write_status(self):
+        st = dict(self.status)
+        if st.get("t0"):
+            st["elapsed"] = round(time.time() - st["t0"], 1)
+        tmp = self.rd / "status.json.tmp"
+        tmp.write_text(json.dumps(st))
+        os.replace(tmp, self.rd / "status.json")
+
+    def _loop(self):
+        try:
+            import cv2
+        except ImportError:
+            cv2 = None
+        while self.on:
+            t0 = time.monotonic()
+            try:
+                self.write_status()
+                if cv2 is not None:
+                    for k, frame in list(self.latest.items()):
+                        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                                               [cv2.IMWRITE_JPEG_QUALITY, 60])
+                        if ok:
+                            tmp = self.rd / f"cam_{k}.jpg.tmp"
+                            tmp.write_bytes(buf.tobytes())
+                            os.replace(tmp, self.rd / f"cam_{k}.jpg")
+            except Exception:
+                pass
+            time.sleep(max(0.0, 1.0 / PREVIEW_FPS - (time.monotonic() - t0)))
+
+    def stop(self):
+        self.on = False
+        try:
+            self.write_status()
+        except Exception:
+            pass
+
+
+def worker_record(jid):
+    import logging
+    import signal as _sig
+    j = load_json(JOB_DIR / f"{jid}.json", {})
+    spec = j.get("spec") or {}
+    rd = run_dir(jid)
+    rd.mkdir(parents=True, exist_ok=True)
+    status = {"phase": "starting", "episode": None, "recorded": 0,
+              "num_episodes": int(spec.get("num_episodes", 0)), "t0": None, "phase_len": 0,
+              "elapsed": 0.0, "err": "", "repo_id": spec.get("repo_id", ""), "cams": []}
+    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
+
+    def on_key(k):
+        if k == "n":
+            events["exit_early"] = True
+        elif k == "r":
+            events["rerecord_episode"] = True
+            events["exit_early"] = True
+        elif k == "q":
+            events["stop_recording"] = True
+            events["exit_early"] = True
+
+    alive = {"on": True}
+
+    def poll_cmd():
+        f = rd / "cmd"
+        while alive["on"]:
+            try:
+                if f.exists():
+                    txt = f.read_text()
+                    f.unlink()
+                    for ch in txt:
+                        on_key(ch)
+                        print(f"[lrweb-worker] key {ch}", flush=True)
+            except OSError:
+                pass
+            time.sleep(0.05)
+
+    threading.Thread(target=poll_cmd, daemon=True).start()
+    _sig.signal(_sig.SIGINT, lambda *_: on_key("q"))     # Jobs 탭 '중지' = q 와 동일
+    _sig.signal(_sig.SIGTERM, lambda *_: on_key("q"))
+
+    def put(**kw):
+        status.update(kw)
+        try:
+            tmp = rd / "status.json.tmp"
+            tmp.write_text(json.dumps(status))
+            os.replace(tmp, rd / "status.json")
+        except OSError:
+            pass
+
+    dataset = robot = teleop = preview = None
+    rc = 0
+    try:
+        from lerobot.utils.utils import init_logging
+        init_logging()
+        from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
+        from lerobot.configs.dataset import DatasetRecordConfig
+        from lerobot.datasets import (LeRobotDataset, VideoEncodingManager,
+                                      aggregate_pipeline_dataset_features, create_initial_features)
+        from lerobot.processor import make_default_processors
+        from lerobot.scripts.lerobot_record import record_loop
+        from lerobot.utils.feature_utils import combine_feature_dicts
+
+        robot, teleop, subs = make_devices(spec)
+        for d in subs:
+            if not d.calibration:
+                raise RuntimeError(f"캘리브레이션 파일이 없습니다: {d.calibration_fpath} — Calib 탭에서 만드세요")
+
+        tap, rap, rop = make_default_processors()
+        features = combine_feature_dicts(
+            aggregate_pipeline_dataset_features(
+                pipeline=tap, initial_features=create_initial_features(action=robot.action_features),
+                use_videos=True),
+            aggregate_pipeline_dataset_features(
+                pipeline=rop, initial_features=create_initial_features(observation=robot.observation_features),
+                use_videos=True))
+        # 인코더/이미지라이터 기본값은 lerobot-record 와 동일하게 DatasetRecordConfig 에서 가져옵니다
+        dcfg = DatasetRecordConfig(repo_id=spec["repo_id"], single_task=spec["task"], root=spec["root"],
+                                   fps=int(spec["fps"]), episode_time_s=spec["episode_time_s"],
+                                   reset_time_s=spec["reset_time_s"], num_episodes=int(spec["num_episodes"]),
+                                   push_to_hub=False, streaming_encoding=bool(spec.get("streaming_encoding", False)))
+        ncam = len(robot.cameras)
+        iw_p = dcfg.num_image_writer_processes if ncam else 0
+        iw_t = dcfg.num_image_writer_threads_per_camera * ncam if ncam else 0
+        if spec.get("resume"):
+            dataset = LeRobotDataset.resume(
+                dcfg.repo_id, root=dcfg.root, batch_encoding_size=dcfg.video_encoding_batch_size,
+                rgb_encoder=dcfg.rgb_encoder, depth_encoder=dcfg.depth_encoder,
+                encoder_threads=dcfg.encoder_threads, streaming_encoding=dcfg.streaming_encoding,
+                encoder_queue_maxsize=dcfg.encoder_queue_maxsize,
+                image_writer_processes=iw_p, image_writer_threads=iw_t)
+            sanity_check_dataset_robot_compatibility(dataset, robot, dcfg.fps, features)
+        else:
+            dataset = LeRobotDataset.create(
+                dcfg.repo_id, dcfg.fps, root=dcfg.root, robot_type=robot.name, features=features,
+                use_videos=True, image_writer_processes=iw_p, image_writer_threads=iw_t,
+                batch_encoding_size=dcfg.video_encoding_batch_size,
+                rgb_encoder=dcfg.rgb_encoder, depth_encoder=dcfg.depth_encoder,
+                encoder_threads=dcfg.encoder_threads, streaming_encoding=dcfg.streaming_encoding,
+                encoder_queue_maxsize=dcfg.encoder_queue_maxsize)
+
+        put(phase="connecting")
+        robot.connect(calibrate=False)     # calibrate=True 면 input() → 파이프에서 EOFError
+        teleop.connect(calibrate=False)
+        for d in subs:
+            if not d.bus.is_calibrated:
+                d.bus.write_calibration(d.calibration)
+        # 미리보기 이름은 관측 키 기준 — 양팔이면 left_wrist / right_wrist / top 처럼 접두사가 붙습니다
+        # (robot.cameras 는 호환용이라 양팔에서 이름이 겹칩니다)
+        status["cams"] = [k for k, v in robot.observation_features.items() if isinstance(v, tuple)]
+        preview = _Preview(robot, rd, status)
+
+        fps, task = int(spec["fps"]), spec["task"]
+        ept, rst, N = spec["episode_time_s"], spec["reset_time_s"], int(spec["num_episodes"])
+        with VideoEncodingManager(dataset):
+            recorded = 0
+            while recorded < N and not events["stop_recording"]:
+                put(phase="record", episode=dataset.num_episodes, recorded=recorded,
+                    t0=time.time(), phase_len=ept)
+                logging.info(f"Recording episode {dataset.num_episodes}")
+                record_loop(robot=robot, events=events, fps=fps,
+                            teleop_action_processor=tap, robot_action_processor=rap,
+                            robot_observation_processor=rop, teleop=teleop, dataset=dataset,
+                            control_time_s=ept, single_task=task)
+                if not events["stop_recording"] and (recorded < N - 1 or events["rerecord_episode"]):
+                    put(phase="reset", t0=time.time(), phase_len=rst)
+                    logging.info("Reset the environment")
+                    record_loop(robot=robot, events=events, fps=fps,
+                                teleop_action_processor=tap, robot_action_processor=rap,
+                                robot_observation_processor=rop, teleop=teleop,
+                                control_time_s=rst, single_task=task)
+                if events["rerecord_episode"]:
+                    logging.info("Re-record episode")
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+                    continue
+                put(phase="saving", t0=None)
+                dataset.save_episode()
+                recorded += 1
+                put(recorded=recorded)
+    except Exception as e:
+        logging.exception("record worker failed")
+        put(phase="error", err=f"{type(e).__name__}: {e}")
+        rc = 1
+    finally:
+        alive["on"] = False
+        put(phase="finalizing", t0=None)
+        if dataset is not None:
+            try:
+                dataset.finalize()
+            except Exception as e:
+                logging.exception("finalize failed")
+                put(err=f"finalize: {e}")
+        for dev in (robot, teleop):
+            try:
+                if dev is not None and dev.is_connected:
+                    dev.disconnect()
+            except Exception:
+                pass
+        if preview is not None:
+            preview.stop()
+        put(phase="error" if rc else "done")
+    return rc
+
+
+def worker_main(kind, jid):
+    if not safe_name(jid):
+        print("bad jid", file=sys.stderr)
+        return 2
+    if kind == "record":
+        return worker_record(jid)
+    print(f"unknown worker kind: {kind}", file=sys.stderr)
+    return 2
+
+
+COLLECT_RUN_HTML = """
+<style>
+.rec{display:grid;grid-template-columns:1fr;gap:14px}
+.phase{font-family:var(--mono);font-size:26px;font-weight:600;letter-spacing:.04em}
+.phase.record{color:var(--bad)} .phase.reset{color:var(--warn)} .phase.saving{color:var(--accent)}
+.pbar{height:10px;background:var(--surface2);border-radius:5px;overflow:hidden;margin:8px 0 4px}
+.pbar i{display:block;height:100%;background:var(--accent);transition:width .2s linear}
+.pbar.record i{background:var(--bad)} .pbar.reset i{background:var(--warn)}
+.cams{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px}
+.cams .cw{position:relative;background:#000;border-radius:8px;overflow:hidden}
+.cams img{width:100%;display:block;aspect-ratio:4/3;object-fit:contain;background:#000}
+.cams .cl{position:absolute;top:6px;left:10px;font-family:var(--mono);font-size:11px;
+  letter-spacing:.1em;text-transform:uppercase;color:#cfd8e3;text-shadow:0 0 4px #000}
+.bigkeys{display:flex;gap:12px;flex-wrap:wrap}
+.bigkeys button{flex:1;min-width:140px;padding:18px 10px;font-size:17px}
+.statline{display:flex;gap:18px;flex-wrap:wrap;font-family:var(--mono);font-size:13px;color:var(--muted)}
+.statline b{color:var(--text)}
+</style>
+<div class=wrap>
+<p class=eyebrow>Recording</p><h2>수집 진행 중</h2>
+<div class=runbar><span class="badge b-run">recording</span>
+  <span class=mono id=jid></span>
+  <span class=mono id=repo style="color:var(--muted)"></span>
+  <button class=danger onclick="stopRec()" style="margin-left:auto">강제 중지</button></div>
+<div class=rec>
+  <div class=card>
+    <div class=phase id=phase>…</div>
+    <div class=pbar id=pbar><i id=pfill style="width:0%"></i></div>
+    <div class=statline>
+      <span>에피소드 <b id=ep>-</b> / <b id=nep>-</b></span>
+      <span>저장됨 <b id=rec>0</b></span>
+      <span>경과 <b id=el>0.0</b>s / <b id=plen>-</b>s</span>
+    </div>
+    <p id=err class="badge b-bad" style="display:none;margin-top:10px"></p>
+  </div>
+  <div class=cams id=cams></div>
+  <div class=bigkeys>
+    <button class=primary onclick="key('n')">n &nbsp;다음 (에피소드 조기 종료)</button>
+    <button onclick="key('r')">r &nbsp;재녹화</button>
+    <button class=danger onclick="key('q')">q &nbsp;종료·저장</button>
+  </div>
+  <p class=muted>record 중: 리더암을 움직이면 팔로워가 따라가고 프레임이 기록됩니다.
+  reset 중: 기록 없이 팔만 따라갑니다 — 물체를 제자리에 놓으세요. n 으로 각 단계를 조기 종료할 수 있습니다.</p>
+  <p class=eyebrow>Log</p><pre id=tail>...</pre>
+</div></div>
+<script>
+const $=id=>document.getElementById(id);
+$('jid').textContent=JID;
+let camsBuilt=false;
+async function key(k){ await fetch('/api/sendkey/'+JID+'/'+k,{method:'POST'}); }
+async function stopRec(){
+  if(!confirm('강제 중지할까요? (가능하면 q 종료·저장을 쓰세요)'))return;
+  await fetch('/api/kill/'+JID,{method:'POST'}); setTimeout(()=>location.reload(),1500);
+}
+function buildCams(names){
+  const box=$('cams'); box.innerHTML='';
+  names.forEach(n=>{
+    const d=document.createElement('div'); d.className='cw';
+    d.innerHTML='<span class=cl></span><img>';
+    d.querySelector('.cl').textContent=n;
+    d.querySelector('img').src='/stream/'+encodeURIComponent(n);
+    box.appendChild(d);
+  });
+  camsBuilt=names.length>0;
+}
+async function refresh(){
+  const d=await (await fetch('/api/record_status/'+JID)).json();
+  const s=d.status||{};
+  const ph=s.phase||'starting';
+  const label={starting:'준비 중…',connecting:'팔·카메라 연결 중…',record:'● RECORD',reset:'RESET — 환경 정리',
+               saving:'저장 중…',finalizing:'마무리 중…',done:'완료',error:'오류'}[ph]||ph;
+  $('phase').textContent=label; $('phase').className='phase '+ph;
+  $('pbar').className='pbar '+ph;
+  const pct = (s.phase_len&&s.elapsed!=null)? Math.min(100, s.elapsed/s.phase_len*100) : (ph==='record'||ph==='reset'?0:100);
+  $('pfill').style.width=pct+'%';
+  $('ep').textContent = s.episode==null?'-':s.episode;
+  $('nep').textContent = s.num_episodes==null?'-':s.num_episodes;
+  $('rec').textContent = s.recorded==null?'0':s.recorded;
+  $('el').textContent = s.elapsed==null?'0.0':Number(s.elapsed).toFixed(1);
+  $('plen').textContent = s.phase_len||'-';
+  $('repo').textContent = s.repo_id||'';
+  if(s.err){ $('err').style.display=''; $('err').textContent=s.err; } else { $('err').style.display='none'; }
+  if(!camsBuilt && s.cams && s.cams.length) buildCams(s.cams);
+  $('tail').textContent=d.tail||'';
+  if(!d.alive){ setTimeout(()=>location.reload(),1200); }
+}
+refresh(); setInterval(refresh,500);
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT')return;
+  if(['n','r','q'].includes(e.key)) key(e.key);
+});
+</script>"""
+
+
+
 # ----------------------------- 페이지: Jobs ----------------------------------
 @app.get("/jobs", response_class=HTMLResponse)
 def jobs_page():
@@ -3310,7 +3852,9 @@ def serve_video(ds: str, rest: str):
 
 
 if __name__ == "__main__":
-    print(f"data : {DATA_ROOT}\nouts : {OUT_ROOT}\njobs : {JOB_DIR}")
+    if len(sys.argv) >= 4 and sys.argv[1] == "--worker":
+        sys.exit(worker_main(sys.argv[2], sys.argv[3]))
+    print(f"data : {DATA_ROOT}\nouts : {OUT_ROOT}\njobs : {JOB_DIR}\nrun  : {RUN_DIR}")
     print(f"conf : {CONFIG_FILE}  (mode={CFG['mode']}, arms={SIDES}, cams={list(CAM_SPECS)})")
     if AUTH_TOKEN:
         print(f"open : http://<host>:{PORT}/?token={AUTH_TOKEN}   (token: {TOKEN_FILE})")
