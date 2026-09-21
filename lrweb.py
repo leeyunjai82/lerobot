@@ -954,9 +954,10 @@ def _read_sysfs(p):
         return ""
 
 
-def usb_info(dev):
-    """/dev/ttyACM0 → 그 뒤의 USB 장치 정보 (sysfs 를 부모 방향으로 거슬러 올라감)."""
-    node = Path("/sys/class/tty") / os.path.basename(dev) / "device"
+def usb_info(dev, cls="tty"):
+    """/dev/ttyACM0 (cls=tty) 또는 /dev/video0 (cls=video4linux) → 그 뒤의 USB 장치 정보.
+    sysfs 를 부모 방향으로 거슬러 올라가 idVendor 가 있는 노드를 찾습니다."""
+    node = Path("/sys/class") / cls / os.path.basename(dev) / "device"
     if not node.exists():
         return {}
     p = node.resolve()
@@ -1020,22 +1021,30 @@ def list_serial_ports():
 
 def list_video_devices():
     """카메라 후보. lerobot OpenCVCamera.find_cameras() 를 쓰되,
-    실패하면 /dev/video* 나열로 폴백합니다."""
+    실패하면 /dev/video* 나열로 폴백합니다.
+
+    같은 모델 카메라 2개(wrist ×2)는 USB 시리얼 번호가 없으면 /dev/v4l/by-id 이름이 겹쳐
+    어느 링크가 어느 카메라인지 부팅마다 바뀔 수 있습니다. 시리얼 포트와 같은 규칙으로
+    시리얼 번호가 있을 때만 by-id, 없으면 by-path(물리 USB 포트 고정) 를 씁니다."""
     by_id = _alias_map("/dev/v4l/by-id")
+    by_path = _alias_map("/dev/v4l/by-path")
+
+    def entry(dev, prof=None, name=""):
+        real = os.path.realpath(dev) if dev.startswith("/dev/") else dev
+        info = usb_info(dev, "video4linux") if dev.startswith("/dev/") else {}
+        prof = prof or {}
+        return {"dev": dev, "by_id": by_id.get(real, ""), "by_path": by_path.get(real, ""),
+                "usb": info, "width": prof.get("width"), "height": prof.get("height"),
+                "fps": prof.get("fps"), "name": name}
+
     found = []
     try:
         from lerobot.cameras.opencv import OpenCVCamera
         for c in OpenCVCamera.find_cameras():
-            dev = str(c.get("id"))
-            prof = c.get("default_stream_profile") or {}
-            found.append({"dev": dev, "by_id": by_id.get(os.path.realpath(dev), "")
-                          if dev.startswith("/dev/") else "",
-                          "width": prof.get("width"), "height": prof.get("height"),
-                          "fps": prof.get("fps"), "name": c.get("name", "")})
+            found.append(entry(str(c.get("id")), c.get("default_stream_profile"), c.get("name", "")))
     except Exception as e:
         for dev in sorted(glob.glob("/dev/video*")):
-            found.append({"dev": dev, "by_id": by_id.get(os.path.realpath(dev), ""),
-                          "width": None, "height": None, "fps": None, "name": f"(probe 실패: {e})"})
+            found.append(entry(dev, None, f"(probe 실패: {e})"))
     return found
 
 
@@ -2792,7 +2801,8 @@ SETUP_HTML = """
 <div class=card>
   <div class=toolbar>
     <button onclick="loadCams()">카메라 스캔</button>
-    <span class=muted>/dev/video* 를 전부 열어 봅니다 — Control/Collect 실행 중에는 막힙니다.</span>
+    <span class=muted>/dev/video* 를 전부 열어 봅니다 — Control/Collect 실행 중에는 막힙니다.
+      같은 모델 카메라 2개는 by-id 가 겹치므로 시리얼 번호가 없으면 by-path 로 지정합니다 — <b>카메라도 항상 같은 USB 구멍에</b>.</span>
   </div>
   <table id=camtbl></table>
   <div style="margin-top:16px">
@@ -3082,10 +3092,12 @@ function renderVCams(){
     t.innerHTML+='<tr><td colspan=5 class=muted>스캔된 카메라 없음</td></tr>'; return;
   }
   VCAMS.forEach(c=>{
-    const stable=c.by_id||c.dev;
+    const stable=stableOf(c);      /* 시리얼 번호 있으면 by-id, 없으면 by-path (포트와 같은 규칙) */
+    const sn=c.usb&&c.usb.serial;
     const tr=document.createElement('tr');
     const c1=document.createElement('td'); c1.className='mono';
-    c1.innerHTML=E(c.dev)+(stable!==c.dev?'<br><span class=tiny>'+E(stable)+'</span>':'');
+    c1.innerHTML=E(c.dev)+(stable!==c.dev?'<br><span class=tiny>'+E(stable)+'</span>':'')
+      +(c.usb&&c.usb.vid?'<br><span class=tiny>'+E(c.usb.vid)+':'+E(c.usb.pid)+(sn?' sn='+E(sn):' <b class=b-warn>sn 없음 → by-path</b>')+'</span>':'');
     const c2=document.createElement('td'); c2.className='mono';
     c2.textContent=(c.width||'?')+'x'+(c.height||'?')+' @'+Math.round(c.fps||0);
     const c3=document.createElement('td');
