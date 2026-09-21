@@ -1924,7 +1924,10 @@ def train_page():
       const b={{dataset:ds.value,name:document.getElementById('name').value,
                steps:document.getElementById('steps').value,batch:document.getElementById('batch').value}};
       const r=await fetch('/api/train',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
-      const d=await r.json(); if(d.error)alert(d.error); else location.reload();
+      const d=await r.json();
+      if(d.error){{alert(d.error);return;}}
+      if(b.name && d.name && d.name!==b.name) alert('출력 폴더가 이미 있어 '+d.name+' 로 저장합니다');
+      location.reload();
     }}
     async function stopJob(id){{
       if(!confirm('학습을 중지할까요? (한 번 더 누르면 강제종료)'))return;
@@ -1966,7 +1969,18 @@ async def api_train(req: Request):
     root = DATA_ROOT / ds
     if not root.exists():
         return JSONResponse({"error": "dataset not found"}, status_code=400)
+    # lerobot 는 output_dir 가 이미 있으면 FileExistsError 로 즉사합니다.
+    # 같은 데이터셋으로 두 번째 학습을 돌리는 건 흔한 일이라 이름을 자동으로 비켜 줍니다.
     out = OUT_ROOT / name
+    if out.exists():
+        for i in range(2, 1000):
+            cand = OUT_ROOT / f"{name}_{i}"
+            if not cand.exists():
+                out, name = cand, cand.name
+                break
+        else:
+            return JSONResponse({"error": f"{name}_2 ~ _999 가 모두 존재합니다 — 이름을 바꾸세요"},
+                                status_code=400)
     argv = ["python", "-m", "lerobot.scripts.lerobot_train",
             f"--dataset.repo_id=local/{ds}", f"--dataset.root={root}",
             "--policy.type=act", f"--output_dir={out}",
@@ -1976,7 +1990,7 @@ async def api_train(req: Request):
         jid = start_job("train", argv)
     except JobStartError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    return {"ok": True, "job": jid}
+    return {"ok": True, "job": jid, "name": name}
 
 
 _BIG_SUFFIX = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
@@ -2118,7 +2132,8 @@ async def api_rollout(req: Request):
                             status_code=400)
     try:
         argv = (["python", "-m", "lerobot.scripts.lerobot_rollout", f"--policy.path={ck}"] + robot_cli_args()
-                + ["--strategy.type=base", f"--duration={dur}", f"--task={task}"])
+                + ["--strategy.type=base", f"--duration={dur}", f"--task={task}",
+                   f"--fps={CFG['fps']}"])
     except (NotImplementedError, ValueError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     try:
