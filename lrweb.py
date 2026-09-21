@@ -2909,9 +2909,10 @@ function renderArms(){
       const row=document.createElement('div'); row.className='slot';
       row.innerHTML='<span class=role>'+role+'</span>';
       const ip=document.createElement('input'); ip.className='port';
-      ip.placeholder='/dev/serial/by-path/... (아래 표에서 지정하거나 직접 입력)';
+      ip.placeholder='비어 있음 — 아래 2번 표의 역할 드롭다운으로 지정하면 자동으로 채워집니다 (직접 입력도 가능)';
       ip.value=a[role+'_port']||'';
-      ip.onchange=()=>{ a[role+'_port']=ip.value.trim(); renderPorts(); dump(); dirty('포트 변경'); };
+      ip.style.borderColor = ip.value ? 'var(--ok)' : 'var(--line)';
+      ip.onchange=()=>{ a[role+'_port']=ip.value.trim(); paintRoles(); renderArms(); dump(); dirty('포트 변경'); };
       const lb=document.createElement('span'); lb.className='tiny';
       lb.textContent = CFG.mode==='bimanual' ? 'calib id (X_left / X_right)' : 'calib id';
       const id=document.createElement('input'); id.className='cid'; id.value=a[role+'_id']||'';
@@ -2940,24 +2941,25 @@ function assign(dev,val){
     const a=CFG.arms.find(x=>x.side===side);
     if(a) a[role+'_port']=stable;
   }
-  renderArms(); renderPorts(); dump(); dirty('포트 지정');
+  renderArms(); paintRoles(); dump(); dirty('포트 지정');
 }
 
-function renderPorts(state){
-  if(state) LASTWATCH=state;
-  const st=state||LASTWATCH;
+/* 표는 포트 목록·모드가 바뀔 때만 다시 만들고, 감시 중에는 값만 덮어씁니다.
+   매번 다시 그리면 열어 둔 <select> 가 닫혀서 역할을 고를 수 없습니다. */
+const ROWS={};          // dev -> {idCell, travelCell, sel}
+let PROBE={};           // dev -> probe 결과 HTML (다시 그려도 유지)
+
+function renderPorts(){
   const t=$('porttbl');
   t.innerHTML='<tr><th>device</th><th>USB</th><th class=num>모터 ID</th>'
              +'<th class=num>travel</th><th>역할</th><th></th></tr>';
+  Object.keys(ROWS).forEach(k=>delete ROWS[k]);
   if(!PORTS.length){
     t.innerHTML+='<tr><td colspan=6 class=muted>시리얼 장치가 없습니다 — '
                 +'USB 를 꽂고 다시 스캔하세요 (권한 문제면 dialout 그룹 확인)</td></tr>';
     return;
   }
   PORTS.forEach(p=>{
-    const w=st?st[p.dev]:null;
-    const spans=w&&w.span?Object.values(w.span):[];
-    const travel=spans.length?Math.max.apply(null,spans):null;
     const stable=stableOf(p);
     const sn=p.usb&&p.usb.serial;
     const usb=(p.usb&&p.usb.vid)
@@ -2969,11 +2971,9 @@ function renderPorts(state){
     const c1=document.createElement('td'); c1.className='mono';
     c1.innerHTML=E(p.dev)+(stable!==p.dev?'<br><span class="tiny">'+E(stable)+'</span>':'');
     const c2=document.createElement('td'); c2.innerHTML=usb;
-    const c3=document.createElement('td'); c3.className='num'; c3.id='m_'+p.dev;
-    c3.innerHTML=(w&&w.err)?'<span class=b-bad title="'+E(w.err)+'">err</span>':'-';
-    const c4=document.createElement('td'); c4.className='num';
-    c4.innerHTML=travel==null?'-':'<b>'+travel+'</b>';
-    if(travel!=null&&travel>60) c4.style.color='var(--ok)';
+    const c3=document.createElement('td'); c3.className='num';
+    c3.innerHTML=PROBE[p.dev]||'-';
+    const c4=document.createElement('td'); c4.className='num'; c4.innerHTML='-';
 
     const c5=document.createElement('td');
     const sel=document.createElement('select');
@@ -2995,38 +2995,65 @@ function renderPorts(state){
 
     [c1,c2,c3,c4,c5,c6].forEach(c=>tr.appendChild(c));
     t.appendChild(tr);
+    ROWS[p.dev]={idCell:c3, travelCell:c4, sel:sel};
+  });
+  paintWatch();
+}
+
+/* 감시 상태만 갱신 — DOM 구조는 건드리지 않음 */
+function paintWatch(){
+  const st=LASTWATCH;
+  PORTS.forEach(p=>{
+    const r=ROWS[p.dev]; if(!r) return;
+    const w=st?st[p.dev]:null;
+    const spans=(w&&w.span)?Object.values(w.span):[];
+    const travel=spans.length?Math.max.apply(null,spans):null;
+    r.travelCell.innerHTML=(travel==null)?'-':'<b>'+travel+'</b>';
+    r.travelCell.style.color=(travel!=null&&travel>60)?'var(--ok)':'';
+    if(w&&w.err) r.idCell.innerHTML='<span class=b-bad title="'+E(w.err)+'">err</span>';
+    else r.idCell.innerHTML=PROBE[p.dev]||'-';
   });
 }
+
+/* 역할 select 값만 갱신 — 다시 그리지 않음 */
+function paintRoles(){
+  PORTS.forEach(p=>{ const r=ROWS[p.dev]; if(r) r.sel.value=slotOf(p.dev); });
+}
+
 function btn(label,fn,cls){
   const b=document.createElement('button'); b.textContent=label;
   if(cls)b.className=cls; b.style.marginLeft='6px'; b.onclick=fn; return b;
 }
 
-async function loadPorts(){ PORTS=(await jget('/api/setup/ports')).ports; renderPorts(); fillMsPorts(); }
+async function loadPorts(){ PORTS=(await jget('/api/setup/ports')).ports; PROBE={}; renderPorts(); fillMsPorts(); }
 
 async function doProbe(dev,full){
-  const cell=$('m_'+dev); cell.textContent='...';
+  const r=ROWS[dev]; if(!r) return;
+  r.idCell.textContent='...';
   const d=await jpost('/api/setup/probe',{port:dev,full:full});
-  if(d.error){ cell.innerHTML='<span class=b-bad title="'+E(d.error)+'">실패</span>'; return; }
-  if(full){
+  let html;
+  if(d.error){
+    html='<span class=b-bad title="'+E(d.error)+'">실패</span>';
+  }else if(full){
     const parts=Object.keys(d.baudrates).map(b=>b+': ['+d.baudrates[b].join(',')+']');
-    cell.innerHTML=parts.length?parts.map(E).join('<br>'):'<span class=muted>없음</span>';
+    html=parts.length?parts.map(E).join('<br>'):'<span class=muted>없음</span>';
   }else{
-    cell.innerHTML=d.ids.length
+    html=d.ids.length
       ? '<span class="badge '+(d.ids.length===6?'b-ok':'b-warn')+'">'+d.ids.join(',')+'</span>'
       : '<span class=muted>응답 없음</span>';
   }
+  PROBE[dev]=html; r.idCell.innerHTML=html;
 }
 
 async function toggleWatch(){
   if(WATCHING){ await stopWatch(); return; }
   const d=await jpost('/api/setup/watch',{ports:PORTS.map(p=>p.dev)});
   if(d.error){ alert(d.error); return; }
-  WATCHING=true;
+  WATCHING=true; clearWatch();
   $('bwatch').textContent='감시 중지'; $('bwatch').className='danger';
   timer=setInterval(async()=>{
     const s=await jget('/api/setup/watch');
-    if(s.on) renderPorts(s.state);
+    if(s.on){ LASTWATCH=s.state; paintWatch(); }
   },400);
 }
 async function stopWatch(){
@@ -3034,6 +3061,8 @@ async function stopWatch(){
   $('bwatch').textContent='포트 감시 시작 (팔 판별)'; $('bwatch').className='primary';
   await jpost('/api/setup/watch/stop');
 }
+/* 감시 재시작 시 이전 travel 이 남지 않게 */
+function clearWatch(){ LASTWATCH=null; paintWatch(); }
 addEventListener('pagehide',()=>{ if(WATCHING) navigator.sendBeacon('/api/setup/watch/stop'); });
 
 /* ---------- 모터 ID 세팅 ---------- */
