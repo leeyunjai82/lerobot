@@ -78,6 +78,10 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
   리더 `.../teleoperators/so_leader/<leader_id>.json`. 양팔은 같은 디렉터리에 `_left` / `_right` 로
 - `max_relative_target` — lerobot 쪽 상대이동 캡(도). 켜면 `send_action` 마다
   `Present_Position` 을 한 번 더 읽어 제어 루프가 느려집니다. 기본 `null`
+- `arms[].view` — **Control 탭 3D 화면 전용 배치**. 제어·수집 데이터와는 무관합니다.
+  `x` 앞뒤(m, + 앞) / `y` 좌우(m, + 왼쪽) / `yaw_deg` 수직축 회전(°, + 좌회전).
+  실제 설치가 마주 보게 되어 있거나 각도가 틀어져 있으면 여기서 맞추세요.
+  기본값은 양팔이 좌우로 0.22 m 씩 벌어진 나란한 배치입니다
 - 양팔 모드: 수집은 `bi_so_follower` / `bi_so_leader` 로, 추론은 같은 타입의 CLI 인자로 돕니다.
   **calib id 는 `X_left` / `X_right` 형식**이어야 합니다 — lerobot `BiSOFollower` 가 per-arm
   캘리브레이션 파일을 `{id}_left.json` / `{id}_right.json` 으로 찾기 때문입니다 (Setup 탭이 검증)

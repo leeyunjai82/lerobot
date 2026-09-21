@@ -115,6 +115,7 @@ DEFAULT_CONFIG = {
             "leader_port": "",
             "leader_id": "leader",
             "cameras": {},
+            "view": {"x": 0.0, "y": 0.0, "yaw_deg": 0.0},
         }
     ],
     # 특정 팔에 속하지 않는 카메라 (양팔에서도 접두사 없이 유지됩니다)
@@ -154,6 +155,12 @@ def load_config():
         arm.setdefault("leader_port", "")
         arm.setdefault("follower_id", f"follower{suffix}")
         arm.setdefault("leader_id", f"leader{suffix}")
+        # 3D 뷰 전용 배치 (제어·데이터와 무관). 기본값: 양팔은 좌우로 벌림
+        dy = 0.0 if want == 1 else (0.22 if names[i] == "left" else -0.22)
+        v = arm.get("view") or {}
+        arm["view"] = {"x": float(v.get("x", 0.0)),      # 앞뒤 (m, + 앞)
+                       "y": float(v.get("y", dy)),       # 좌우 (m, + 왼쪽)
+                       "yaw_deg": float(v.get("yaw_deg", 0.0))}
     cfg.setdefault("cameras", {})
     return cfg
 
@@ -2116,6 +2123,10 @@ def control_page():
         for n in CAM_SPECS)
     if not CAM_SPECS:
         cam_panels = ""
+    # f-string 표현식 안에서는 {{ 가 이스케이프가 아니라 실제 중괄호라 집합이 됩니다.
+    # dict 리터럴은 f-string 밖에서 만들어야 합니다.
+    views_js = js({sd: (a.get("view") or {"x": 0.0, "y": 0.0, "yaw_deg": 0.0})
+                   for sd, a in ARM_CFGS.items()})
     arm_panels = "".join(
         f'<div class=armbox data-side="{esc(s)}">'
         f'{"<div class=armhead>" + esc(s) + "</div>" if BIMANUAL else ""}'
@@ -2181,6 +2192,7 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
 <script type="module">
 const JOINTS = {js(CTL_JOINTS)};
 const SIDES  = {js(SIDES)};
+const VIEWS  = {views_js};
 const CAMS   = {js(list(CAM_SPECS))};
 let ws=null, torque=false, follow=false;
 const robots={{}};                       // side -> URDF root
@@ -2278,12 +2290,14 @@ function showViewMsg(t){{
   const URDFLoader=(await import('urdf-loader')).default;
   const view=document.getElementById('view');
   const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0a0d10);
-  const cam=new THREE.PerspectiveCamera(50,1,0.01,10); cam.position.set(0.4,0.35,0.4);
+  const cam=new THREE.PerspectiveCamera(50,1,0.01,10);
+  const zoom=SIDES.length>1?1.7:1.0;
+  cam.position.set(0.4*zoom,0.35*zoom,0.4*zoom);
   const ren=new THREE.WebGLRenderer({{antialias:true}}); view.appendChild(ren.domElement);
   const ctl=new OrbitControls(cam,ren.domElement); ctl.target.set(0,0.12,0);
   scene.add(new THREE.HemisphereLight(0xffffff,0x223344,1.1));
   const dl=new THREE.DirectionalLight(0xffffff,1.2); dl.position.set(1,2,1); scene.add(dl);
-  scene.add(new THREE.GridHelper(1,20,0x28303a,0x1b222a));
+  scene.add(new THREE.GridHelper(SIDES.length>1?1.6:1, SIDES.length>1?32:20, 0x28303a,0x1b222a));
   function resize(){{const w=view.clientWidth,h=view.clientHeight;ren.setSize(w,h);cam.aspect=w/h;cam.updateProjectionMatrix();}}
   new ResizeObserver(resize).observe(view); resize();
   const picker=document.getElementById('armcolor');
@@ -2307,8 +2321,11 @@ function showViewMsg(t){{
     loader.packages='/urdf';           // package://xxx/ 형태도 /urdf/로 해석
     loader.load('/urdf/so101.urdf',
       r=>{{
-        r.rotation.x=-Math.PI/2;
-        r.position.x=(i-(SIDES.length-1)/2)*0.45;
+        // URDF 는 Z-up / X-forward. -90° 눕히면 URDF X → three X(앞), URDF Y → three -Z(왼쪽).
+        // Euler 'XYZ' 는 R = Rx·Ry·Rz 라 z 성분이 먼저 적용됨 → URDF 기준 yaw 가 됩니다.
+        const v=VIEWS[side]||{{x:0,y:0,yaw_deg:0}};
+        r.rotation.set(-Math.PI/2, 0, v.yaw_deg*Math.PI/180);
+        r.position.set(v.x, 0, -v.y);        // 앞뒤=X, 좌우=−Z
         robots[side]=r; scene.add(r); applyColor(picker.value);
       }},
       undefined,
@@ -2634,6 +2651,11 @@ def validate_config(cfg):
             if real in seen_ports:
                 return f"같은 포트를 두 곳에 지정했습니다: {port} ({seen_ports[real]} 와 중복)"
             seen_ports[real] = f"{side}/{role}"
+        v = arm.get("view") or {}
+        for k, lim in (("x", 2.0), ("y", 2.0), ("yaw_deg", 360.0)):
+            val = v.get(k, 0)
+            if not isinstance(val, (int, float)) or isinstance(val, bool) or abs(float(val)) > lim:
+                return f"{side} 3D 배치 {k} 값이 범위를 벗어났습니다 (±{lim:g})"
         # 양팔에서는 팔 카메라 이름에 side 접두사가 붙으므로 팔끼리 같은 이름(wrist)이 허용됩니다
         arm_cam_names = set()
         for name, spec in (arm.get("cameras") or {}).items():
@@ -2982,6 +3004,22 @@ function renderArms(){
       row.appendChild(ip); row.appendChild(lb); row.appendChild(id);
       d.appendChild(row);
     });
+    /* 3D 뷰 전용 배치 — 제어·수집 데이터와 무관합니다 */
+    a.view = a.view || {x:0, y:0, yaw_deg:0};
+    const vr=document.createElement('div'); vr.className='slot';
+    vr.innerHTML='<span class=role>3D 배치</span>';
+    [['x','앞뒤(m, + 앞)'],['y','좌우(m, + 왼쪽)'],['yaw_deg','회전(°, + 좌회전)']].forEach(f=>{
+      const k=f[0];
+      const lb=document.createElement('span'); lb.className='tiny'; lb.textContent=f[1];
+      const inp=document.createElement('input'); inp.size=6; inp.value=a.view[k];
+      inp.style.width='80px'; inp.style.fontFamily='var(--mono)';
+      inp.onchange=()=>{ a.view[k]=parseFloat(inp.value)||0; dump(); dirty('3D 배치 변경'); };
+      vr.appendChild(lb); vr.appendChild(inp);
+    });
+    const note=document.createElement('span'); note.className='tiny';
+    note.textContent='3D 화면 표시용 — 제어·데이터에는 영향 없음';
+    vr.appendChild(note);
+    d.appendChild(vr);
     box.appendChild(d);
   });
 }
