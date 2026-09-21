@@ -2778,10 +2778,13 @@ SETUP_HTML = """
   <table id=porttbl></table>
   <p class=muted style="margin-top:10px">
     travel = 감시 시작 이후 엔코더가 움직인 최대 폭(tick, 4096 = 1바퀴).
-    probe 는 1 Mbps 기본 보드레이트만 봅니다 — 응답이 없으면 <b>전체 스캔</b>으로 보드레이트를 찾으세요.<br>
-    지정에는 가능한 한 <span class=mono>/dev/serial/by-path</span> 를 씁니다.
-    보드에 USB 시리얼 번호가 없으면(<b>sn 없음</b>) 같은 모델 2개가 by-id 로 구분이 안 되기 때문입니다.
-    by-path 는 꽂은 USB 물리 포트에 고정되므로, <b>팔을 항상 같은 USB 구멍에 꽂아야</b> 합니다.
+    probe 는 1 Mbps 기본 보드레이트만 봅니다 — 응답이 없으면 <b>전체 스캔</b>으로 보드레이트를 찾으세요.
+    <b>1,2,3,4,5,6</b> 이 다 뜨면 모터 ID 세팅은 건너뛰어도 됩니다.<br>
+    지정 경로는 <b>보드에 USB 시리얼 번호가 있으면</b>(sn 표시) <span class=mono>/dev/serial/by-id</span> —
+    보드 자체를 따라가므로 <b>어느 USB 구멍에 꽂아도</b> 됩니다. 대신 보드를 다른 팔로 옮겨 달면 설정이 어긋나니
+    보드에 sn 뒷자리를 적어 붙여 두세요.<br>
+    <b>sn 이 없으면</b> 같은 모델끼리 by-id 가 겹치므로 <span class=mono>/dev/serial/by-path</span> 를 씁니다 —
+    꽂은 USB 물리 포트에 고정되니 이 경우엔 <b>항상 같은 USB 구멍에</b> 꽂아야 합니다.
   </p>
 </div>
 
@@ -2802,7 +2805,7 @@ SETUP_HTML = """
   <div class=toolbar>
     <button onclick="loadCams()">카메라 스캔</button>
     <span class=muted>/dev/video* 를 전부 열어 봅니다 — Control/Collect 실행 중에는 막힙니다.
-      같은 모델 카메라 2개는 by-id 가 겹치므로 시리얼 번호가 없으면 by-path 로 지정합니다 — <b>카메라도 항상 같은 USB 구멍에</b>.</span>
+      카메라도 같은 규칙입니다 — 시리얼 번호가 있으면 by-id, 없으면(같은 모델 2개가 겹침) by-path 라 그때는 같은 USB 구멍에 꽂아야 합니다.</span>
   </div>
   <table id=camtbl></table>
   <div style="margin-top:16px">
