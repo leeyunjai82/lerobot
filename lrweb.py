@@ -86,6 +86,11 @@ PORT = 8080
 CTL_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 CONTROL_HZ = 20
 FEEDBACK_HZ = 10
+TRACK_WARN_DEG = 6.0      # 명령과 실측이 이만큼 벌어지면 '안 따라옴' 경고
+GOAL_REFRESH_S = 1.0      # 데드밴드 안이어도 이 주기로 목표를 다시 씀 (놓친 명령 복구)
+TEMP_READ_S = 1.0         # 서보 온도 읽기 주기
+TEMP_WARN_C = 55          # 이 이상이면 경고
+TEMP_HOT_C = 65           # 이 이상이면 위험 (STS3215 기본 셧다운 70°C)
 MAX_STEP_DEG = 2.5        # 슬라이더 제어 시 스텝당 최대 이동
 FOLLOW_STEP_DEG = 6.0     # 리더 팔로우 시 스텝당 최대 이동 (반응성↑)
 CTL_STREAM_FPS = 15
@@ -687,6 +692,10 @@ class ArmCtl:
         self.limits = {}
         self.err = ""
         self.follow = False
+        self.track = {}    # 명령(cmd) 대비 실측 오차 — 서보가 실제로 따라오는지
+        self.temp = {}     # 서보 온도(°C)
+        self._last_goal = {}
+        self._last_temp = 0.0
         self.lock = threading.Lock()   # 시리얼은 스레드 안전하지 않음 — 루프/명령 직렬화
         self.leader = None
         self.running = False
@@ -729,6 +738,10 @@ class ArmCtl:
         self.actual = self.read()
         self.target = dict(self.actual)
         self.cmd = dict(self.actual)
+        self.track = dict.fromkeys(CTL_JOINTS, 0.0)
+        self.temp = {}
+        self._last_goal = {}
+        self._last_temp = 0.0
 
     def _build_limits(self):
         bus = self.robot.bus
@@ -796,6 +809,18 @@ class ArmCtl:
                     if t0 - last_fb > 1.0 / FEEDBACK_HZ:
                         self.actual = self.read()
                         last_fb = t0
+                        # 서보가 명령을 실제로 따라오는지. 벌어져 있으면 막혔거나
+                        # 과부하 보호로 토크가 빠진 것입니다 (조용히 틀린 데이터를 쌓는 걸 막음)
+                        self.track = {n: round(self.actual.get(n, 0.0)
+                                               - self.cmd.get(n, self.actual.get(n, 0.0)), 1)
+                                      for n in CTL_JOINTS}
+                    if t0 - self._last_temp > TEMP_READ_S:
+                        self._last_temp = t0
+                        try:
+                            self.temp = {k: int(v) for k, v in self.robot.bus.sync_read(
+                                "Present_Temperature", normalize=False).items()}
+                        except Exception:
+                            pass
                 self.err = ""
             except Exception as e:
                 self.err = str(e)
@@ -822,20 +847,28 @@ class ArmCtl:
         if not (self.robot and self.torque):
             return
         goal = {}
+        now = time.monotonic()
         cap = FOLLOW_STEP_DEG if self.follow else MAX_STEP_DEG
         for n in CTL_JOINTS:
             cur = self.cmd.get(n, self.actual.get(n, 0.0))
             lo, hi = self.limits[n]
             tgt = max(lo, min(hi, self.target.get(n, cur)))
             diff = tgt - cur
-            if abs(diff) < 0.2:          # 데드밴드: 도달로 간주, 쓰기 중단
+            if abs(diff) < 0.2:          # 데드밴드: 도달로 간주
                 self.cmd[n] = tgt
+                # 도달했다고 쓰기를 영영 멈추면, 서보가 그 명령을 놓쳤을 때
+                # (막힘·통신 유실·보호 동작) 영원히 어긋난 채로 남습니다.
+                # 주기적으로 같은 목표를 다시 써서 복구 기회를 줍니다.
+                if now - self._last_goal.get(n, 0.0) > GOAL_REFRESH_S:
+                    goal[n] = tgt
                 continue
             nxt = cur + max(-cap, min(cap, diff))
             self.cmd[n] = nxt
             goal[n] = nxt
         if goal:
             self.robot.send_action({f"{k}.pos": v for k, v in goal.items()})
+            for n in goal:
+                self._last_goal[n] = now
 
 
 class LeaderCtl:
@@ -2141,6 +2174,9 @@ color:var(--dim);margin:14px 0 8px;border-bottom:1px solid var(--line);padding-b
 .jrow{{margin-bottom:16px}}
 .jhead{{display:flex;justify-content:space-between;font-family:var(--mono);font-size:12px;margin-bottom:4px}}
 .jhead .n{{color:var(--text)}} .jhead .v{{color:var(--accent)}} .jhead .a{{color:var(--dim)}}
+.jhead .a.stuck{{color:var(--bad);font-weight:600}}
+.jrow.stuck .n{{color:var(--bad)}}
+#warnbox p{{margin:0 0 8px}}
 input[type=range]{{width:100%;accent-color:var(--accent)}}
 #right{{display:flex;flex-direction:column;min-height:0}}
 .cams{{display:none;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1px;
@@ -2171,8 +2207,11 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
       <input type=color id=armcolor value="#e07a3f" title="로봇 색상"
              style="width:34px;height:30px;padding:2px;border-radius:7px;border:1px solid var(--line);background:var(--bg);cursor:pointer">
     </div>
+    <div id=warnbox></div>
     {arm_panels}
-    <p class=muted>토크 OFF: 손으로 움직이면 값·3D가 따라옵니다.<br>
+    <p class=muted>실측값 옆에 <b>오차</b>가 빨갛게 뜨면 그 관절이 명령을 못 따라가는 것입니다
+    (막힘·과부하 보호). 서보 온도도 1초마다 확인합니다.<br>
+    토크 OFF: 손으로 움직이면 값·3D가 따라옵니다.<br>
     토크 ON: 슬라이더가 목표 (스텝당 최대 {MAX_STEP_DEG}° 제한).<br>
     리더 팔로우: 리더 암을 손으로 움직이면 팔로워가 실시간 미러링 (슬라이더 잠금).<br>
     이 탭을 떠나면 자동으로 토크 해제 + 연결 해제됩니다.</p>
@@ -2249,11 +2288,26 @@ function openWS(){{
       btrq.disabled=follow;
       bflw.textContent=follow?'리더 팔로우 OFF':'리더 팔로우 ON';
       bflw.classList.toggle('primary',follow);
+      let warn='';
       SIDES.forEach(side=>{{
         const a=d.arms[side]; if(!a||!sliders[side])return;
+        const stuck=a.stuck||[], hot=a.hot||[];
+        const tag=SIDES.length>1?(side+' '):'';
+        if(stuck.length) warn+='<p class="badge b-bad">'+tag+'명령을 못 따라가는 관절: '+stuck.join(', ')
+          +' — 막혔거나 서보 과부하 보호로 토크가 빠졌을 수 있습니다. '
+          +'<b>E-STOP 후 원인을 확인하세요</b> (계속 두면 스톨 상태로 과열).</p>';
+        if(hot.length) warn+='<p class="badge '+(a.maxtemp>=65?'b-bad':'b-warn')+'">'+tag
+          +'서보 온도 '+a.maxtemp+'°C: '+hot.join(', ')+(a.maxtemp>=65?' — 즉시 토크를 끄세요':'')+'</p>';
         JOINTS.forEach(j=>{{
           if(valEls[side][j])valEls[side][j].textContent=(a.target[j]??0).toFixed(1);
-          if(actEls[side][j])actEls[side][j].textContent='('+(a.actual[j]??0).toFixed(1)+')';
+          if(actEls[side][j]){{
+            const bad=stuck.indexOf(j)>=0;
+            actEls[side][j].textContent='('+(a.actual[j]??0).toFixed(1)
+              +(bad?', 오차 '+(a.track[j]>0?'+':'')+a.track[j]:'')+')';
+            actEls[side][j].classList.toggle('stuck',bad);
+            const row=actEls[side][j].closest('.jrow');
+            if(row) row.classList.toggle('stuck',bad);
+          }}
           const s=sliders[side][j]; if(!s)return;
           s.disabled=follow;
           if(follow){{
@@ -2265,6 +2319,7 @@ function openWS(){{
         }});
         updateRobot(side,a.actual);
       }});
+      document.getElementById('warnbox').innerHTML=warn;
       if(d.err){{cst.textContent='bus error';cst.classList.add('b-bad');}}
     }}
   }};
@@ -2359,8 +2414,15 @@ def api_ctlstate():
 
 
 def _arms_state():
-    return {s: {"actual": a.actual, "target": a.target, "limits": a.limits}
-            for s, a in ARMS.items()}
+    out = {}
+    for s, a in ARMS.items():
+        hot = [n for n, t in a.temp.items() if t >= TEMP_WARN_C]
+        stuck = ([n for n, e in a.track.items() if abs(e) > TRACK_WARN_DEG]
+                 if a.torque else [])
+        out[s] = {"actual": a.actual, "target": a.target, "limits": a.limits,
+                  "track": a.track, "temp": a.temp, "hot": hot, "stuck": stuck,
+                  "maxtemp": max(a.temp.values()) if a.temp else None}
+    return out
 
 
 @app.websocket("/ws/control")
