@@ -96,6 +96,7 @@ MAX_STEP_DEG = 2.5        # 슬라이더 제어 시 스텝당 최대 이동
 FOLLOW_STEP_DEG = 6.0     # 리더 팔로우 시 스텝당 최대 이동 (반응성↑)
 CTL_STREAM_FPS = 15
 PREVIEW_FPS = 10          # record worker 가 미리보기 JPEG 을 갱신하는 주기
+READY_CHUNK_S = 2.0       # 수집 대기 중 record_loop 을 끊어 도는 단위 (이 틈에 온도를 읽습니다)
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 # record worker ↔ 웹 사이의 상태/미리보기/명령 파일. 초당 수십 회 쓰므로 tmpfs 를 우선합니다.
 RUN_DIR = Path("/dev/shm/lrweb") if Path("/dev/shm").is_dir() else PROJ / "lrweb_run"
@@ -1918,15 +1919,16 @@ def collect_page():
         <input id=name placeholder="pick_place_v2" size=22></label>
       <label class=f id=f_resume style="display:none">이어서 수집할 데이터셋
         <select id=resume_ds>{resume_opts}</select></label>
-      <label class=f>에피소드 수 <input id=neps value=50 size=5></label>
+      <label class=f>목표 에피소드 수 <input id=neps value=50 size=5></label>
       <label class=f>에피소드 최대(초) <input id=ept value=30 size=5></label>
-      <label class=f>리셋 최대(초) <input id=rst value=15 size=5></label>
       <label class=f style="flex:1;min-width:260px">태스크 설명
         <input id=task value="{esc(CFG['default_task'])}"></label>
       <button class=primary onclick="startRec()">수집 시작</button>
     </div>
-    <p class=muted>시작 즉시 에피소드 0 녹화가 시작됩니다 — 물체·리더암을 먼저 준비하세요.
-    시작 후 이 페이지에서 n(다음) / r(재녹화) / q(종료) 버튼 또는 키보드로 조작하고, 카메라 미리보기가 같이 뜹니다.<br>
+    <p class=muted><b>자동으로 녹화되지 않습니다.</b> 시작하면 <b>대기</b> 상태로 들어가고,
+    그 화면에서 <b>녹화 시작</b>을 눌러야 그때부터 기록됩니다. 한 에피소드를 끝낼 때마다 다시 대기로 돌아옵니다.<br>
+    목표 에피소드 수는 진행률 표시용입니다 — 도달해도 멈추지 않으니 <b>수집 끝내기</b>로 마치세요.
+    에피소드 최대(초)가 지나면 자동으로 저장 단계로 넘어갑니다.<br>
     카메라: <span class=mono>{esc(", ".join(CAM_SPECS) or "없음 — Setup 탭에서 등록")}</span></p>
     </div></div>
     <script>
@@ -1941,7 +1943,6 @@ def collect_page():
         resume_ds:document.getElementById('resume_ds')?.value||'',
         num_episodes:document.getElementById('neps').value,
         episode_time_s:document.getElementById('ept').value,
-        reset_time_s:document.getElementById('rst').value,
         task:document.getElementById('task').value}};
       const r=await fetch('/api/record',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
       const d=await r.json(); if(d.error)alert(d.error); else location.reload();
@@ -1958,7 +1959,6 @@ async def api_record(req: Request):
     task = (b.get("task") or CFG["default_task"]).strip()
     neps = _clamp_int(b.get("num_episodes"), 50, 1, 100000)
     ept = _clamp_int(b.get("episode_time_s"), 30, 1, 3600)
-    rst = _clamp_int(b.get("reset_time_s"), 15, 0, 3600)
     try:
         _need_ports("follower")
         _need_ports("leader")
@@ -1996,7 +1996,7 @@ async def api_record(req: Request):
         resume = False
     spec = {"mode": CFG["mode"], "arms": json.loads(json.dumps(CFG["arms"])),
             "cameras": json.loads(json.dumps(CFG["cameras"])), "fps": int(CFG["fps"]),
-            "task": task, "num_episodes": neps, "episode_time_s": ept, "reset_time_s": rst,
+            "task": task, "num_episodes": neps, "episode_time_s": ept,
             "repo_id": f"local/{name}", "root": str(DATA_ROOT / name), "resume": resume,
             "streaming_encoding": bool(CFG.get("streaming_encoding", False))}
     try:
@@ -2018,7 +2018,7 @@ def api_record_status(jid: str):
 
 @app.post("/api/sendkey/{jid}/{key}")
 def api_sendkey(jid: str, key: str):
-    if key not in ("n", "r", "q"):
+    if key not in ("s", "n", "r", "q"):
         return JSONResponse({"error": "허용되지 않은 키"}, status_code=400)
     ok = send_cmd(jid, key)
     return {"ok": ok} if ok else JSONResponse({"error": "키 전달 실패"}, status_code=400)
@@ -4235,11 +4235,17 @@ def worker_record(jid):
     rd.mkdir(parents=True, exist_ok=True)
     status = {"phase": "starting", "episode": None, "recorded": 0,
               "num_episodes": int(spec.get("num_episodes", 0)), "t0": None, "phase_len": 0,
-              "elapsed": 0.0, "err": "", "repo_id": spec.get("repo_id", ""), "cams": []}
+              "elapsed": 0.0, "err": "", "repo_id": spec.get("repo_id", ""), "cams": [],
+              "temp": {}, "maxtemp": None, "last": ""}
     events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
+    ui = {"start": False}        # 대기 상태에서 '녹화 시작' 을 눌렀는지
 
     def on_key(k):
-        if k == "n":
+        # exit_early 는 record_loop 안에서 소비되므로, 어느 단계에 있든 현재 루프를 깨웁니다.
+        if k == "s":
+            ui["start"] = True
+            events["exit_early"] = True
+        elif k == "n":
             events["exit_early"] = True
         elif k == "r":
             events["rerecord_episode"] = True
@@ -4306,7 +4312,7 @@ def worker_record(jid):
         # 인코더/이미지라이터 기본값은 lerobot-record 와 동일하게 DatasetRecordConfig 에서 가져옵니다
         dcfg = DatasetRecordConfig(repo_id=spec["repo_id"], single_task=spec["task"], root=spec["root"],
                                    fps=int(spec["fps"]), episode_time_s=spec["episode_time_s"],
-                                   reset_time_s=spec["reset_time_s"], num_episodes=int(spec["num_episodes"]),
+                                   num_episodes=int(spec["num_episodes"]),
                                    push_to_hub=False, streaming_encoding=bool(spec.get("streaming_encoding", False)))
         ncam = len(robot.cameras)
         iw_p = dcfg.num_image_writer_processes if ncam else 0
@@ -4340,33 +4346,69 @@ def worker_record(jid):
         preview = _Preview(robot, rd, status)
 
         fps, task = int(spec["fps"]), spec["task"]
-        ept, rst, N = spec["episode_time_s"], spec["reset_time_s"], int(spec["num_episodes"])
+        ept = spec["episode_time_s"]
+
+        # 팔로워 버스 — 대기 중에만 온도를 읽습니다. Feetech 는 반이중 버스라
+        # 녹화 루프와 동시에 읽으면 패킷이 섞입니다. 반드시 record_loop 바깥에서.
+        if hasattr(robot, "left_arm"):
+            fbuses = [("left", robot.left_arm.bus), ("right", robot.right_arm.bus)]
+        else:
+            fbuses = [("", robot.bus)]
+
+        def read_temps():
+            out = {}
+            for pfx, bus in fbuses:
+                try:
+                    for k, v in bus.sync_read("Present_Temperature", normalize=False).items():
+                        out[f"{pfx}_{k}" if pfx else k] = int(v)
+                except Exception:
+                    pass
+            if out:
+                status["temp"] = out
+                status["maxtemp"] = max(out.values())
+
+        def idle(last=""):
+            """대기(READY). 기록하지 않고 리더 팔로우만 유지합니다.
+            dataset=None 이면 record_loop 은 add_frame 을 건너뜁니다."""
+            ui["start"] = False
+            put(phase="ready", t0=None, phase_len=0, episode=dataset.num_episodes, last=last)
+            while not ui["start"] and not events["stop_recording"]:
+                record_loop(robot=robot, events=events, fps=fps,
+                            teleop_action_processor=tap, robot_action_processor=rap,
+                            robot_observation_processor=rop, teleop=teleop,
+                            control_time_s=READY_CHUNK_S, single_task=task)
+                read_temps()
+                put()
+            events["exit_early"] = False
+            ui["start"] = False
+
         with VideoEncodingManager(dataset):
             recorded = 0
-            while recorded < N and not events["stop_recording"]:
+            last = ""
+            while not events["stop_recording"]:
+                idle(last)                       # 사람이 '녹화 시작' 을 누를 때까지 기다립니다
+                if events["stop_recording"]:
+                    break
                 put(phase="record", episode=dataset.num_episodes, recorded=recorded,
-                    t0=time.time(), phase_len=ept)
+                    t0=time.time(), phase_len=ept, last="")
                 logging.info(f"Recording episode {dataset.num_episodes}")
                 record_loop(robot=robot, events=events, fps=fps,
                             teleop_action_processor=tap, robot_action_processor=rap,
                             robot_observation_processor=rop, teleop=teleop, dataset=dataset,
                             control_time_s=ept, single_task=task)
-                if not events["stop_recording"] and (recorded < N - 1 or events["rerecord_episode"]):
-                    put(phase="reset", t0=time.time(), phase_len=rst)
-                    logging.info("Reset the environment")
-                    record_loop(robot=robot, events=events, fps=fps,
-                                teleop_action_processor=tap, robot_action_processor=rap,
-                                robot_observation_processor=rop, teleop=teleop,
-                                control_time_s=rst, single_task=task)
-                if events["rerecord_episode"]:
-                    logging.info("Re-record episode")
+                # 녹화 중 '수집 끝내기' → 진행 중이던 에피소드는 버립니다.
+                # 살리고 싶으면 '저장하고 다음' 을 먼저 누르면 됩니다.
+                if events["rerecord_episode"] or events["stop_recording"]:
+                    logging.info("Discard episode")
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    last = "버림"
                     continue
                 put(phase="saving", t0=None)
                 dataset.save_episode()
                 recorded += 1
+                last = f"episode {dataset.num_episodes - 1} 저장"
                 put(recorded=recorded)
     except Exception as e:
         logging.exception("record worker failed")
@@ -4407,7 +4449,7 @@ COLLECT_RUN_HTML = """
 <style>
 .rec{display:grid;grid-template-columns:1fr;gap:14px}
 .phase{font-family:var(--mono);font-size:26px;font-weight:600;letter-spacing:.04em}
-.phase.record{color:var(--bad)} .phase.reset{color:var(--warn)} .phase.saving{color:var(--accent)}
+.phase.record{color:var(--bad)} .phase.ready{color:var(--warn)} .phase.saving{color:var(--accent)}
 .pbar{height:10px;background:var(--surface2);border-radius:5px;overflow:hidden;margin:8px 0 4px}
 .pbar i{display:block;height:100%;background:var(--accent);transition:width .2s linear}
 .pbar.record i{background:var(--bad)} .pbar.reset i{background:var(--warn)}
@@ -4417,35 +4459,45 @@ COLLECT_RUN_HTML = """
 .cams .cl{position:absolute;top:6px;left:10px;font-family:var(--mono);font-size:11px;
   letter-spacing:.1em;text-transform:uppercase;color:#cfd8e3;text-shadow:0 0 4px #000}
 .bigkeys{display:flex;gap:12px;flex-wrap:wrap}
-.bigkeys button{flex:1;min-width:140px;padding:18px 10px;font-size:17px}
+.bigkeys button{flex:1;min-width:150px;padding:18px 10px;font-size:17px}
+.bigkeys button.go{flex:2;background:var(--accent-dim);border-color:var(--accent);color:#dceafe}
+.tchip{font-family:var(--mono);font-size:12px;padding:2px 7px;border-radius:5px;
+  background:var(--surface2);border:1px solid var(--line)}
+.tchip.warn{color:var(--warn);border-color:var(--warn)}
+.tchip.hot{color:var(--bad);border-color:var(--bad)}
 .statline{display:flex;gap:18px;flex-wrap:wrap;font-family:var(--mono);font-size:13px;color:var(--muted)}
 .statline b{color:var(--text)}
 </style>
 <div class=wrap>
 <p class=eyebrow>Recording</p><h2>수집 진행 중</h2>
-<div class=runbar><span class="badge b-run">recording</span>
+<div class=runbar><span class="badge b-run" id=rbadge>session</span>
   <span class=mono id=jid></span>
   <span class=mono id=repo style="color:var(--muted)"></span>
-  <button class=danger onclick="stopRec()" style="margin-left:auto">강제 중지</button></div>
+  <button class=danger onclick="stopRec()" style="margin-left:auto"
+          title="워커 프로세스를 죽입니다. 정상 종료는 아래 '수집 끝내기'">강제 종료</button></div>
 <div class=rec>
   <div class=card>
     <div class=phase id=phase>…</div>
     <div class=pbar id=pbar><i id=pfill style="width:0%"></i></div>
     <div class=statline>
-      <span>에피소드 <b id=ep>-</b> / <b id=nep>-</b></span>
-      <span>저장됨 <b id=rec>0</b></span>
+      <span>다음 에피소드 <b id=ep>-</b></span>
+      <span>저장됨 <b id=rec>0</b> / 목표 <b id=nep>-</b></span>
       <span>경과 <b id=el>0.0</b>s / <b id=plen>-</b>s</span>
+      <span id=lastbox style="display:none">직전 <b id=last></b></span>
     </div>
+    <div class=statline id=temps style="margin-top:6px"></div>
     <p id=err class="badge b-bad" style="display:none;margin-top:10px"></p>
   </div>
   <div class=cams id=cams></div>
-  <div class=bigkeys>
-    <button class=primary onclick="key('n')">n &nbsp;다음 (에피소드 조기 종료)</button>
-    <button onclick="key('r')">r &nbsp;재녹화</button>
-    <button class=danger onclick="key('q')">q &nbsp;종료·저장</button>
+  <div class=bigkeys id=keys_ready style="display:none">
+    <button class=go onclick="key('s')">&#9679;&nbsp; 녹화 시작 <span class=muted>(s)</span></button>
+    <button class=danger onclick="endRec()">&#9632;&nbsp; 수집 끝내기</button>
   </div>
-  <p class=muted>record 중: 리더암을 움직이면 팔로워가 따라가고 프레임이 기록됩니다.
-  reset 중: 기록 없이 팔만 따라갑니다 — 물체를 제자리에 놓으세요. n 으로 각 단계를 조기 종료할 수 있습니다.</p>
+  <div class=bigkeys id=keys_rec style="display:none">
+    <button class=go onclick="key('n')">&#10003;&nbsp; 저장하고 다음 <span class=muted>(n)</span></button>
+    <button onclick="key('r')">&#10007;&nbsp; 버리고 다시 <span class=muted>(r)</span></button>
+  </div>
+  <p class=muted id=hint></p>
   <p class=eyebrow>Log</p><pre id=tail>...</pre>
 </div></div>
 <script>
@@ -4453,8 +4505,12 @@ const $=id=>document.getElementById(id);
 $('jid').textContent=JID;
 let camsBuilt=false;
 async function key(k){ await fetch('/api/sendkey/'+JID+'/'+k,{method:'POST'}); }
+async function endRec(){
+  if(!confirm('수집을 끝낼까요? 지금까지 저장된 에피소드는 그대로 남습니다.'))return;
+  await key('q');
+}
 async function stopRec(){
-  if(!confirm('강제 중지할까요? (가능하면 q 종료·저장을 쓰세요)'))return;
+  if(!confirm('워커 프로세스를 강제 종료할까요?\n정상 종료는 대기 상태에서 \u0027수집 끝내기\u0027 입니다.'))return;
   await fetch('/api/kill/'+JID,{method:'POST'}); setTimeout(()=>location.reload(),1500);
 }
 function buildCams(names){
@@ -4472,11 +4528,11 @@ async function refresh(){
   const d=await (await fetch('/api/record_status/'+JID)).json();
   const s=d.status||{};
   const ph=s.phase||'starting';
-  const label={starting:'준비 중…',connecting:'팔·카메라 연결 중…',record:'● RECORD',reset:'RESET — 환경 정리',
-               saving:'저장 중…',finalizing:'마무리 중…',done:'완료',error:'오류'}[ph]||ph;
+  const label={starting:'준비 중…',connecting:'팔·카메라 연결 중…',ready:'대기 — 녹화 시작을 누르세요',
+               record:'● RECORD',saving:'저장 중…',finalizing:'마무리 중…',done:'완료',error:'오류'}[ph]||ph;
   $('phase').textContent=label; $('phase').className='phase '+ph;
   $('pbar').className='pbar '+ph;
-  const pct = (s.phase_len&&s.elapsed!=null)? Math.min(100, s.elapsed/s.phase_len*100) : (ph==='record'||ph==='reset'?0:100);
+  const pct = (s.phase_len&&s.elapsed!=null)? Math.min(100, s.elapsed/s.phase_len*100) : (ph==='record'?0:100);
   $('pfill').style.width=pct+'%';
   $('ep').textContent = s.episode==null?'-':s.episode;
   $('nep').textContent = s.num_episodes==null?'-':s.num_episodes;
@@ -4484,6 +4540,25 @@ async function refresh(){
   $('el').textContent = s.elapsed==null?'0.0':Number(s.elapsed).toFixed(1);
   $('plen').textContent = s.phase_len||'-';
   $('repo').textContent = s.repo_id||'';
+  $('rbadge').textContent = ph==='record' ? 'recording' : ph;
+  $('rbadge').className = 'badge '+(ph==='record'?'b-bad':ph==='ready'?'b-warn':'b-run');
+  $('keys_ready').style.display = ph==='ready' ? '' : 'none';
+  $('keys_rec').style.display   = ph==='record' ? '' : 'none';
+  $('hint').textContent = ph==='ready'
+    ? '기록하지 않습니다. 팔은 리더를 계속 따라가니 물체와 자세를 제자리에 놓고, 준비되면 녹화 시작을 누르세요.'
+    : ph==='record'
+    ? '기록 중입니다. 에피소드 최대(초)가 지나면 자동으로 저장됩니다.'
+    : '';
+  if(s.last){ $('lastbox').style.display=''; $('last').textContent=s.last; }
+  else { $('lastbox').style.display='none'; }
+  const tb=$('temps'), t=s.temp||{};
+  const names=Object.keys(t);
+  tb.innerHTML = names.length
+    ? '<span>모터 온도</span>'+names.map(n=>{
+        const v=t[n], c = v>=65?'hot':v>=55?'warn':'';
+        return '<span class="tchip '+c+'">'+n+' '+v+'&deg;</span>';
+      }).join('')
+    : '';
   if(s.err){ $('err').style.display=''; $('err').textContent=s.err; } else { $('err').style.display='none'; }
   if(!camsBuilt && s.cams && s.cams.length) buildCams(s.cams);
   $('tail').textContent=d.tail||'';
@@ -4492,7 +4567,7 @@ async function refresh(){
 refresh(); setInterval(refresh,500);
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT')return;
-  if(['n','r','q'].includes(e.key)) key(e.key);
+  if(['s','n','r'].includes(e.key)) key(e.key);
 });
 </script>"""
 
