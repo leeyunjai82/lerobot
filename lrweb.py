@@ -655,20 +655,24 @@ def record_status(jid):
     return load_json(run_dir(jid) / "status.json", {})
 
 
-def kill_job(jid):
+def kill_job(jid, force=False):
+    """force=False: 1 번째 SIGINT(정상 종료 요청), 2 번째부터 SIGKILL.
+    force=True : 곧바로 SIGKILL. 프로세스 그룹 전체에 보냅니다
+    (start_job 이 os.setsid 로 새 세션을 열어 두므로 lrweb 자신은 안 맞습니다)."""
     if not safe_name(jid):
-        return
+        return False
     jf = JOB_DIR / f"{jid}.json"
     j = load_json(jf, {})
     if not j.get("pid"):
-        return
-    sig = signal.SIGKILL if j.get("kill_requested") else signal.SIGINT
+        return False
+    sig = signal.SIGKILL if (force or j.get("kill_requested")) else signal.SIGINT
     try:
         os.killpg(os.getpgid(j["pid"]), sig)
     except OSError:
-        pass
+        return False
     j["kill_requested"] = True
     save_json(jf, j)
+    return True
 
 
 def delete_job(jid):
@@ -4510,8 +4514,18 @@ async function endRec(){
   await key('q');
 }
 async function stopRec(){
-  if(!confirm('워커 프로세스를 강제 종료할까요?\n정상 종료는 대기 상태에서 \u0027수집 끝내기\u0027 입니다.'))return;
-  await fetch('/api/kill/'+JID,{method:'POST'}); setTimeout(()=>location.reload(),1500);
+  const L=[
+   '\uc6cc\ucee4\ub97c SIGKILL \ub85c \uc989\uc2dc \uc8fd\uc785\ub2c8\ub2e4.','',
+   '\u2022 \ub179\ud654 \uc911\uc774\ub358 \uc5d0\ud53c\uc18c\ub4dc\uc640 \uc544\uc9c1 \uc778\ucf54\ub529\ub418\uc9c0 \uc54a\uc740 \uc601\uc0c1\uc774 \uc0ac\ub77c\uc9d1\ub2c8\ub2e4.',
+   '\u2022 \uba54\ud0c0\uac00 \ub9c8\ubb34\ub9ac\ub418\uc9c0 \uc54a\uc544 \ub370\uc774\ud130\uc14b\uc774 \uc548 \uc5f4\ub9b4 \uc218 \uc788\uc2b5\ub2c8\ub2e4.',
+   '\u2022 \ud314 \ud1a0\ud06c\uac00 \ucf1c\uc9c4 \ucc44 \ub0a8\uc2b5\ub2c8\ub2e4 \u2014 Control \ud0ed\uc5d0\uc11c \ud1a0\ud06c OFF \ud558\uac70\ub098 \uc804\uc6d0\uc744 \ub0b4\ub9ac\uc138\uc694.','',
+   '\uc751\ub2f5 \uc5c6\ub294 \uc6cc\ucee4\ub97c \ub04a\uc744 \ub54c\ub9cc \uc4f0\uc138\uc694.',
+   '\uc815\uc0c1 \uc885\ub8cc\ub294 \ub300\uae30 \uc0c1\ud0dc\uc758 [\uc218\uc9d1 \ub05d\ub0b4\uae30] \uc785\ub2c8\ub2e4.','',
+   '\uadf8\ub798\ub3c4 \uac15\uc81c \uc885\ub8cc\ud560\uae4c\uc694?'];
+  if(!confirm(L.join('\n')))return;
+  const d = await (await fetch('/api/kill/'+JID+'?force=1',{method:'POST'})).json();
+  if(!d.ok) alert('\uc885\ub8cc \uc2e4\ud328 \u2014 \uc774\ubbf8 \uc8fd\uc5c8\uac70\ub098 pid \ub97c \ubabb \ucc3e\uc558\uc2b5\ub2c8\ub2e4');
+  setTimeout(()=>location.reload(),1500);
 }
 function buildCams(names){
   const box=$('cams'); box.innerHTML='';
@@ -4618,9 +4632,9 @@ def job_log(jid: str):
 
 
 @app.post("/api/kill/{jid}")
-def api_kill(jid: str):
-    kill_job(jid)
-    return {"ok": True}
+def api_kill(jid: str, force: int = 0):
+    ok = kill_job(jid, force=bool(force))
+    return {"ok": ok, "signal": "SIGKILL" if force else "SIGINT"}
 
 
 @app.post("/api/deljob/{jid}")
