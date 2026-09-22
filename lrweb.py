@@ -1927,7 +1927,7 @@ def collect_page():
       <label class=f>에피소드 최대(초) <input id=ept value=30 size=5></label>
       <label class=f style="flex:1;min-width:260px">태스크 설명
         <input id=task value="{esc(CFG['default_task'])}"></label>
-      <button class=primary onclick="startRec()">수집 시작</button>
+      <button class=primary id=bstart onclick="startRec(this)">수집 시작</button>
     </div>
     <p class=muted><b>자동으로 녹화되지 않습니다.</b> 시작하면 <b>대기</b> 상태로 들어가고,
     그 화면에서 <b>녹화 시작</b>을 눌러야 그때부터 기록됩니다. 한 에피소드를 끝낼 때마다 다시 대기로 돌아옵니다.<br>
@@ -1941,7 +1941,13 @@ def collect_page():
       document.getElementById('f_new').style.display = m==='new'?'':'none';
       document.getElementById('f_resume').style.display = m==='resume'?'':'none';
     }}
-    async function startRec(){{
+    async function startRec(el){{
+      // 포트를 실제로 열어 점검하므로 몇 초 걸립니다 — 안 잠그면 먹통으로 보입니다.
+      if(el){{ el.disabled=true; el.textContent='포트 점검 중…'; }}
+      try{{ await doStart(); }}
+      finally{{ if(el){{ el.disabled=false; el.textContent='수집 시작'; }} }}
+    }}
+    async function doStart(){{
       const b={{mode:document.getElementById('mode').value,
         name:document.getElementById('name').value,
         resume_ds:document.getElementById('resume_ds')?.value||'',
@@ -1952,6 +1958,28 @@ def collect_page():
       const d=await r.json(); if(d.error)alert(d.error); else location.reload();
     }}
     </script>"""
+
+
+def _preflight_ports():
+    """설정된 팔로워/리더 포트를 실제로 열어 모터 응답을 확인합니다.
+    블로킹이므로 호출 쪽에서 스레드로 돌릴 것."""
+    bad = []
+    for side, arm in ARM_CFGS.items():
+        for role in ("follower", "leader"):
+            port = arm.get(f"{role}_port") or ""
+            tag = f"{side}/{role}" if BIMANUAL else role
+            if not Path(port).exists():
+                bad.append(f"{tag}: {port or '(미지정)'} 가 없습니다 — USB 를 다시 꽂고 Setup 탭에서 재지정")
+                continue
+            try:
+                ids = probe_port(port).get("ids") or []
+            except Exception as e:
+                bad.append(f"{tag}: {port} 를 열 수 없습니다 ({type(e).__name__}: {e}) — "
+                           f"다른 프로그램이 잡고 있거나 dialout 권한 문제")
+                continue
+            if not ids:
+                bad.append(f"{tag}: {port} 에서 모터 응답이 없습니다 — 전원과 케이블을 확인하세요")
+    return bad
 
 
 @app.post("/api/record")
@@ -1978,6 +2006,13 @@ async def api_record(req: Request):
                             status_code=400)
     if not CAM_SPECS:
         return JSONResponse({"error": "카메라가 등록되지 않았습니다 — Setup 탭에서 추가하세요"}, status_code=400)
+    # 워커를 띄우기 전에 포트를 먼저 열어 봅니다. 여기서 안 걸러내면 워커가
+    # connect 단계에서 막히고, 화면에는 "준비 중…" 만 남습니다.
+    # probe_port 는 시리얼을 실제로 여는 블로킹 호출이라 반드시 스레드로 —
+    # async 핸들러에서 그냥 부르면 이벤트 루프가 멈춰 웹 전체가 먹통이 됩니다.
+    bad = await asyncio.to_thread(_preflight_ports)
+    if bad:
+        return JSONResponse({"error": "포트 점검 실패\n\n" + "\n".join(bad)}, status_code=400)
     if b.get("mode") == "resume":
         ds = (b.get("resume_ds") or "").strip()
         if not safe_name(ds):
@@ -2377,7 +2412,8 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
 <div class=cmain>
   <div class=cpanel>
     <div class=toolbar>
-      <span id=cst class=badge>connecting…</span>
+      <span id=cst class=badge>연결 중…</span>
+      <button id=breconn class=primary onclick="reconnect()" style="display:none">다시 연결</button>
       <button id=btrq onclick="toggleTorque()" disabled>토크 ON</button>
       <button id=bflw onclick="toggleFollow()" disabled>리더 팔로우 ON</button>
       <button class=estop onclick="estop()">E-STOP</button>
@@ -2391,7 +2427,10 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
     토크 OFF: 손으로 움직이면 값·3D가 따라옵니다.<br>
     토크 ON: 슬라이더가 목표 (스텝당 최대 {MAX_STEP_DEG}° 제한).<br>
     리더 팔로우: 리더 암을 손으로 움직이면 팔로워가 실시간 미러링 (슬라이더 잠금).<br>
-    이 탭을 떠나면 자동으로 토크 해제 + 연결 해제됩니다.</p>
+    이 탭에 들어오면 <b>자동으로 연결</b>합니다 — 따로 누를 버튼이 없습니다.
+    떠나면 자동으로 토크 해제 + 연결 해제됩니다.<br>
+    <b>한 번에 한 탭만</b> 팔을 잡을 수 있습니다. 다른 창에 Control 이 열려 있으면 그 창을 먼저 닫으세요.
+    Collect / Rollout / Calib / 포트 감시가 돌고 있어도 연결되지 않습니다.</p>
   </div>
   <div id=right>
     <div class=cams id=cams>{cam_panels}</div>
@@ -2414,7 +2453,9 @@ let ws=null, torque=false, follow=false;
 const robots={{}};                       // side -> URDF root
 const sliders={{}}, valEls={{}}, actEls={{}};   // side -> joint -> el
 const cst=document.getElementById('cst'), btrq=document.getElementById('btrq');
-const bflw=document.getElementById('bflw');
+const bflw=document.getElementById('bflw'), breconn=document.getElementById('breconn');
+let wsErr='';                     // 서버가 보낸 진짜 사유. onclose 가 덮어쓰지 못하게 보관합니다.
+function setStatus(t,cls){{ cst.textContent=t; cst.className='badge '+(cls||''); }}
 
 function buildSliders(side, lims, actual){{
   const box=document.getElementById('sl_'+side); box.innerHTML='';
@@ -2442,14 +2483,18 @@ window.toggleTorque=()=>{{ if(ws&&ws.readyState===1) ws.send(JSON.stringify({{ty
 window.toggleFollow=()=>{{ if(ws&&ws.readyState===1) ws.send(JSON.stringify({{type:'follow',on:!follow}})); }};
 window.estop=()=>{{ if(ws&&ws.readyState===1) ws.send(JSON.stringify({{type:'estop'}})); }};
 
+window.reconnect=()=>{{ try{{ws&&ws.close();}}catch(e){{}} openWS(); }};
+
 function openWS(){{
+  wsErr=''; setStatus('연결 중…',''); breconn.style.display='none';
   ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/control');
+  ws.onerror=()=>{{ if(!wsErr) wsErr='서버에 닿지 못했습니다 — lrweb 가 떠 있는지 확인하세요'; }};
   ws.onmessage=e=>{{
     const d=JSON.parse(e.data);
     if(d.type==='init'){{
-      if(d.error){{ cst.textContent=d.error; cst.classList.add('b-bad'); return; }}
+      if(d.error){{ wsErr=d.error; setStatus(d.error,'b-bad'); return; }}
       SIDES.forEach(s=>buildSliders(s, d.arms[s].limits, d.arms[s].actual));
-      cst.textContent='connected'; cst.classList.add('b-ok');
+      setStatus('연결됨','b-ok');
       btrq.disabled=false; bflw.disabled=false;
       if(d.cams&&d.cams.length){{
         document.getElementById('cams').style.display='grid';
@@ -2507,8 +2552,12 @@ function openWS(){{
       if(d.err){{cst.textContent='bus error';cst.classList.add('b-bad');}}
     }}
   }};
-  ws.onclose=()=>{{ cst.textContent='disconnected'; cst.classList.remove('b-ok');
-                   btrq.disabled=true; bflw.disabled=true; }};
+  // 서버는 오류를 보낸 직후 소켓을 닫습니다. 사유를 지우지 말 것 —
+  // 여기서 덮어쓰면 화면엔 'disconnected' 만 남아 원인을 알 수 없습니다.
+  ws.onclose=()=>{{
+    setStatus(wsErr||'연결 끊김 — 다시 연결을 누르세요','b-bad');
+    btrq.disabled=true; bflw.disabled=true; breconn.style.display='';
+  }};
 }}
 addEventListener('pagehide',()=>{{ try{{ws&&ws.close();}}catch(e){{}} }});
 openWS();
@@ -3110,8 +3159,8 @@ SETUP_HTML = """
 <p class=eyebrow>2 · USB 시리얼 포트</p>
 <div class=card>
   <div class=toolbar>
-    <button onclick="loadPorts()">다시 스캔</button>
-    <button id=bwatch class=primary onclick="toggleWatch()">포트 감시 시작 (팔 판별)</button>
+    <button onclick="withBusy(this,loadPorts)">다시 스캔</button>
+    <button id=bwatch class=primary onclick="withBusy(this,toggleWatch)">포트 감시 시작 (팔 판별)</button>
     <span class=muted>감시를 켜고 팔 하나를 손으로 움직이면 그 포트의 travel 이 올라갑니다.
       전기적으로는 leader/follower 를 구분할 수 없어서, 이게 확실한 판별 방법입니다.</span>
     <p class="badge b-warn" style="margin:8px 0 0">감시는 모든 포트의 토크를 끕니다 —
@@ -3137,7 +3186,7 @@ SETUP_HTML = """
   (여러 개가 같은 ID 1 로 붙어 있으면 응답이 충돌합니다).</p>
   <div class=toolbar>
     <select id=msport></select>
-    <button id=msstart class=primary onclick="msStart()">모터 ID 세팅 시작</button>
+    <button id=msstart class=primary onclick="withBusy(this,msStart)">모터 ID 세팅 시작</button>
   </div>
   <div id=msbox></div>
 </div>
@@ -3145,7 +3194,7 @@ SETUP_HTML = """
 <p class=eyebrow>3 · 카메라</p>
 <div class=card>
   <div class=toolbar>
-    <button onclick="loadCams()">카메라 스캔</button>
+    <button onclick="withBusy(this,loadCams)">카메라 스캔</button>
     <span class=muted>/dev/video* 를 전부 열어 한 장씩 찍습니다 — <b>어느 장치가 어느 카메라인지 화면으로 확인</b>하세요.
       카메라 수에 따라 몇 초 걸리고, Control/Collect 실행 중에는 막힙니다.
       카메라도 같은 규칙입니다 — 시리얼 번호가 있으면 by-id, 없으면(같은 모델 2개가 겹침) by-path 라 그때는 같은 USB 구멍에 꽂아야 합니다.</span>
@@ -3379,9 +3428,25 @@ function paintRoles(){
   PORTS.forEach(p=>{ const r=ROWS[p.dev]; if(r) r.sel.value=slotOf(p.dev); });
 }
 
+/* 클릭 즉시 잠그고 라벨을 바꿉니다 — 스캔·probe 는 몇 초 걸려서
+   피드백이 없으면 "눌러도 아무 일 없다" 로 보입니다. */
+async function withBusy(el, fn){
+  if(el){ el.disabled=true; el.dataset.t=el.textContent; el.textContent='처리 중…'; }
+  try{ return await fn(); }
+  catch(e){ alert('실패: '+(e&&e.message||e)); }
+  finally{
+    // 콜백이 라벨을 바꿨으면(예: 감시 시작 → 감시 중지) 그대로 둡니다.
+    if(el && el.isConnected){
+      el.disabled=false;
+      if(el.dataset.t && el.textContent==='처리 중…') el.textContent=el.dataset.t;
+    }
+  }
+}
 function btn(label,fn,cls){
   const b=document.createElement('button'); b.textContent=label;
-  if(cls)b.className=cls; b.style.marginLeft='6px'; b.onclick=fn; return b;
+  if(cls)b.className=cls; b.style.marginLeft='6px';
+  b.onclick=()=>withBusy(b, ()=>Promise.resolve(fn()));
+  return b;
 }
 function noimg(text){
   const d=document.createElement('div'); d.className='camthumb noimg'; d.textContent=text; return d;
@@ -4088,7 +4153,11 @@ async function withBusy(el, fn){
   if(el){ el.disabled=true; el.dataset.t=el.textContent; el.textContent='처리 중…'; }
   try{ return await fn(); }
   finally{
-    if(el && el.isConnected){ el.disabled=false; if(el.dataset.t) el.textContent=el.dataset.t; }
+    // 콜백이 라벨을 바꿨으면(예: 감시 시작 → 감시 중지) 그대로 둡니다.
+    if(el && el.isConnected){
+      el.disabled=false;
+      if(el.dataset.t && el.textContent==='처리 중…') el.textContent=el.dataset.t;
+    }
   }
 }
 async function start(side,role,el){
@@ -4274,10 +4343,6 @@ def worker_record(jid):
                 pass
             time.sleep(0.05)
 
-    threading.Thread(target=poll_cmd, daemon=True).start()
-    _sig.signal(_sig.SIGINT, lambda *_: on_key("q"))     # Jobs 탭 '중지' = q 와 동일
-    _sig.signal(_sig.SIGTERM, lambda *_: on_key("q"))
-
     def put(**kw):
         status.update(kw)
         try:
@@ -4287,9 +4352,19 @@ def worker_record(jid):
         except OSError:
             pass
 
+    # 준비 단계가 길어도 화면이 멈춰 보이지 않도록, 첫 줄부터 status.json 을 씁니다.
+    # (예전에는 dataset 을 만든 뒤에야 첫 put 이 나가서, 그 전에 걸리면 화면이 빈 채로 굳었습니다)
+    put(phase="starting", t0=time.time())
+
+    threading.Thread(target=poll_cmd, daemon=True).start()
+    _sig.signal(_sig.SIGINT, lambda *_: on_key("q"))     # Jobs 탭 '중지' = q 와 동일
+    _sig.signal(_sig.SIGTERM, lambda *_: on_key("q"))
+
     dataset = robot = teleop = preview = None
     rc = 0
     try:
+        # torch 까지 끌려와서 첫 실행은 수십 초 걸립니다 — 단계를 화면에 알려 줍니다.
+        put(phase="importing")
         from lerobot.utils.utils import init_logging
         init_logging()
         from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
@@ -4300,6 +4375,7 @@ def worker_record(jid):
         from lerobot.scripts.lerobot_record import record_loop
         from lerobot.utils.feature_utils import combine_feature_dicts
 
+        put(phase="devices")
         robot, teleop, subs = make_devices(spec)
         for d in subs:
             if not d.calibration:
@@ -4318,6 +4394,7 @@ def worker_record(jid):
                                    fps=int(spec["fps"]), episode_time_s=spec["episode_time_s"],
                                    num_episodes=int(spec["num_episodes"]),
                                    push_to_hub=False, streaming_encoding=bool(spec.get("streaming_encoding", False)))
+        put(phase="dataset")
         ncam = len(robot.cameras)
         iw_p = dcfg.num_image_writer_processes if ncam else 0
         iw_t = dcfg.num_image_writer_threads_per_camera * ncam if ncam else 0
@@ -4338,7 +4415,7 @@ def worker_record(jid):
                 encoder_threads=dcfg.encoder_threads, streaming_encoding=dcfg.streaming_encoding,
                 encoder_queue_maxsize=dcfg.encoder_queue_maxsize)
 
-        put(phase="connecting")
+        put(phase="connecting")            # 시리얼 + 카메라 오픈. 카메라가 말썽이면 여기서 오래 걸립니다
         robot.connect(calibrate=False)     # calibrate=True 면 input() → 파이프에서 EOFError
         teleop.connect(calibrate=False)
         for d in subs:
@@ -4542,11 +4619,15 @@ async function refresh(){
   const d=await (await fetch('/api/record_status/'+JID)).json();
   const s=d.status||{};
   const ph=s.phase||'starting';
-  const label={starting:'준비 중…',connecting:'팔·카메라 연결 중…',ready:'대기 — 녹화 시작을 누르세요',
+  const label={starting:'준비 중…',importing:'lerobot 불러오는 중…',devices:'팔 객체 만드는 중…',
+               dataset:'데이터셋 여는 중…',connecting:'팔·카메라 연결 중…',
+               ready:'대기 — 녹화 시작을 누르세요',
                record:'● RECORD',saving:'저장 중…',finalizing:'마무리 중…',done:'완료',error:'오류'}[ph]||ph;
+  const PREP={starting:1,importing:1,devices:1,dataset:1,connecting:1};
   $('phase').textContent=label; $('phase').className='phase '+ph;
   $('pbar').className='pbar '+ph;
-  const pct = (s.phase_len&&s.elapsed!=null)? Math.min(100, s.elapsed/s.phase_len*100) : (ph==='record'?0:100);
+  const pct = (s.phase_len&&s.elapsed!=null)? Math.min(100, s.elapsed/s.phase_len*100)
+            : PREP[ph] ? 0 : (ph==='record'?0:100);
   $('pfill').style.width=pct+'%';
   $('ep').textContent = s.episode==null?'-':s.episode;
   $('nep').textContent = s.num_episodes==null?'-':s.num_episodes;
@@ -4558,11 +4639,22 @@ async function refresh(){
   $('rbadge').className = 'badge '+(ph==='record'?'b-bad':ph==='ready'?'b-warn':'b-run');
   $('keys_ready').style.display = ph==='ready' ? '' : 'none';
   $('keys_rec').style.display   = ph==='record' ? '' : 'none';
-  $('hint').textContent = ph==='ready'
-    ? '기록하지 않습니다. 팔은 리더를 계속 따라가니 물체와 자세를 제자리에 놓고, 준비되면 녹화 시작을 누르세요.'
-    : ph==='record'
-    ? '기록 중입니다. 에피소드 최대(초)가 지나면 자동으로 저장됩니다.'
-    : '';
+  if(PREP[ph]){
+    const el = s.elapsed||0;
+    $('hint').innerHTML = (ph==='importing'
+        ? '첫 실행은 torch 까지 끌어오느라 <b>수십 초</b> 걸립니다. 멈춘 게 아닙니다.<br>'
+        : ph==='connecting'
+        ? '시리얼 포트와 카메라를 엽니다. 여기서 오래 걸리면 <b>카메라가 다른 프로그램에 잡혀 있거나</b> 포트 경로가 바뀐 것입니다.<br>'
+        : '')
+      + '경과 ' + el.toFixed(0) + '초'
+      + (el > 90 ? ' — 아래 로그를 보세요. 안 풀리면 오른쪽 위 <b>강제 종료</b>.' : '');
+  } else {
+    $('hint').textContent = ph==='ready'
+      ? '기록하지 않습니다. 팔은 리더를 계속 따라가니 물체와 자세를 제자리에 놓고, 준비되면 녹화 시작을 누르세요.'
+      : ph==='record'
+      ? '기록 중입니다. 에피소드 최대(초)가 지나면 자동으로 저장됩니다.'
+      : '';
+  }
   if(s.last){ $('lastbox').style.display=''; $('last').textContent=s.last; }
   else { $('lastbox').style.display='none'; }
   const tb=$('temps'), t=s.temp||{};
