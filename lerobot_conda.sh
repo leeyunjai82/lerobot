@@ -13,8 +13,8 @@
 #     tail -f lerobot_conda.log
 #
 #  끝나면:
-#     source ~/project/lerobot/activate.sh
-#     cd ~/project/lerobot && nohup python lrweb.py > lrweb.log 2>&1 &
+#     source ~/project/lerobot/activate.sh      # conda 활성화 + ~/project/lerobot 로 이동
+#     nohup python lrweb.py > lrweb.log 2>&1 &
 #     → http://<ip>:8080/setup 에서 포트·카메라 지정, /calib 에서 캘리브레이션
 #
 #  핵심 주의사항 (Thor):
@@ -195,7 +195,7 @@ cat > "${WORKDIR}/activate.sh" <<EOF
 source "$(h "${CONDA_DIR}")/etc/profile.d/conda.sh"
 conda activate ${ENV_NAME}
 export HF_HOME="$(h "${DATA_DIR}")/hf"
-cd "$(h "${LEROBOT_SRC}")"
+cd "$(h "${WORKDIR}")"
 EOF
 chmod +x "${WORKDIR}/activate.sh"
 
@@ -209,8 +209,8 @@ cat <<EOF
   활성화    : source ${WORKDIR}/activate.sh
 
   --- lrweb 실행 ---
-  source ${WORKDIR}/activate.sh
-  cd ${WORKDIR} && nohup python lrweb.py > lrweb.log 2>&1 &
+  source ${WORKDIR}/activate.sh      # conda 활성화 + ${WORKDIR} 로 이동
+  nohup python lrweb.py > lrweb.log 2>&1 &
   → http://<ip>:8080
 
   --- 웹에서 순서대로 ---

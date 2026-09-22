@@ -10,7 +10,7 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 | 파일 | 설명 |
 |---|---|
 | `lrweb.py` | 통합 웹툴 — Datasets / Collect / Training / Rollout / Control (port 8080) |
-| `activate.sh` | conda env 활성화 + `HF_HOME` 설정 |
+| `activate.sh` | conda env 활성화 + `HF_HOME` 설정 + `~/project/lerobot` 로 이동 (`lerobot_conda.sh` 가 생성) |
 | `urdf/` | SO-101 URDF/STL (Control 탭 3D 뷰용) |
 | `lerobot_conda.sh` | 새 기기 셋업 (conda env, PyTorch, lerobot 핀 커밋, 의존성) |
 | `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
@@ -272,10 +272,11 @@ LRWEB_AUTH=on        python lrweb.py   # lrweb_token.txt 에 자동 생성
 ## 실행
 
 ```bash
-source activate.sh
-pip install fastapi uvicorn
+source activate.sh          # conda 활성화 + ~/project/lerobot 로 이동
 nohup python lrweb.py > lrweb.log 2>&1 &
 ```
+
+(`fastapi`/`uvicorn` 은 `lerobot_conda.sh` 가 이미 설치합니다)
 
 ## 로드맵
 
