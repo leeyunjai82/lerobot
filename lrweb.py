@@ -168,6 +168,12 @@ def load_config():
         arm["view"] = {"x": float(v.get("x", 0.0)),      # 앞뒤 (m, + 앞)
                        "y": float(v.get("y", dy)),       # 좌우 (m, + 왼쪽)
                        "yaw_deg": float(v.get("yaw_deg", 0.0))}
+    # 양팔인데 두 배치가 같으면 3D 에서 정확히 포개져 팔 하나로 보입니다.
+    # (예전 Setup 이 양팔 전환 시 둘 다 y=0 으로 저장했습니다) 좌우로 벌려 줍니다.
+    if want == 2:
+        vl, vr = cfg["arms"][0]["view"], cfg["arms"][1]["view"]
+        if (vl["x"], vl["y"], vl["yaw_deg"]) == (vr["x"], vr["y"], vr["yaw_deg"]):
+            vl["y"], vr["y"] = 0.22, -0.22
     cfg.setdefault("cameras", {})
     return cfg
 
@@ -3304,8 +3310,10 @@ function setMode(m){
     a.side='left';
     if(a.follower_id==='follower') a.follower_id='follower_left';
     if(a.leader_id==='leader')     a.leader_id='leader_left';
+    a.view={x:0, y:0.22, yaw_deg:0};        // 3D 배치: 왼팔은 왼쪽으로
     CFG.arms=[a,{side:'right',follower_port:'',follower_id:'follower_right',
-                 leader_port:'',leader_id:'leader_right',cameras:{}}];
+                 leader_port:'',leader_id:'leader_right',cameras:{},
+                 view:{x:0, y:-0.22, yaw_deg:0}}];
   }else{
     if(CFG.arms.length>1 && !confirm('오른팔 설정(포트·카메라)을 지웁니다. 계속할까요?')) return;
     const a=CFG.arms[0];
@@ -3346,7 +3354,7 @@ function renderArms(){
       d.appendChild(row);
     });
     /* 3D 뷰 전용 배치 — 제어·수집 데이터와 무관합니다 */
-    a.view = a.view || {x:0, y:0, yaw_deg:0};
+    a.view = a.view || {x:0, y:(a.side==='left'?0.22:a.side==='right'?-0.22:0), yaw_deg:0};
     const vr=document.createElement('div'); vr.className='slot';
     vr.innerHTML='<span class=role>3D 배치</span>';
     [['x','앞뒤(m, + 앞)'],['y','좌우(m, + 왼쪽)'],['yaw_deg','회전(°, + 좌회전)']].forEach(f=>{
