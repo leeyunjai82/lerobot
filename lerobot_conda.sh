@@ -187,12 +187,15 @@ PY
 
 # ------------------------------------------------------------ 6. 활성화 헬퍼
 log "6. activate.sh"
+# 경로를 $HOME 기준으로 남깁니다 — 절대경로를 박으면 기기마다 파일이 달라져
+# git 에서 매번 diff 가 뜨고, 다른 기기에서는 경로가 틀립니다.
+h() { printf '%s' "${1/#${HOME}/\$HOME}"; }
 cat > "${WORKDIR}/activate.sh" <<EOF
 #!/usr/bin/env bash
-source ${CONDA_DIR}/etc/profile.d/conda.sh
+source "$(h "${CONDA_DIR}")/etc/profile.d/conda.sh"
 conda activate ${ENV_NAME}
-export HF_HOME=${DATA_DIR}/hf
-cd ${LEROBOT_SRC}
+export HF_HOME="$(h "${DATA_DIR}")/hf"
+cd "$(h "${LEROBOT_SRC}")"
 EOF
 chmod +x "${WORKDIR}/activate.sh"
 

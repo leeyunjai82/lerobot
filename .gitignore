@@ -14,7 +14,6 @@ outputs/
 lrweb_jobs/
 lrweb_run/
 lrweb_marks.json
-activate.sh
 *.log
 *.pid
 
