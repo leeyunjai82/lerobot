@@ -4632,7 +4632,7 @@ async function stopRec(){
    '\uc751\ub2f5 \uc5c6\ub294 \uc6cc\ucee4\ub97c \ub04a\uc744 \ub54c\ub9cc \uc4f0\uc138\uc694.',
    '\uc815\uc0c1 \uc885\ub8cc\ub294 \ub300\uae30 \uc0c1\ud0dc\uc758 [\uc218\uc9d1 \ub05d\ub0b4\uae30] \uc785\ub2c8\ub2e4.','',
    '\uadf8\ub798\ub3c4 \uac15\uc81c \uc885\ub8cc\ud560\uae4c\uc694?'];
-  if(!confirm(L.join('\n')))return;
+  if(!confirm(L.join('\\n')))return;
   const d = await (await fetch('/api/kill/'+JID+'?force=1',{method:'POST'})).json();
   if(!d.ok) alert('\uc885\ub8cc \uc2e4\ud328 \u2014 \uc774\ubbf8 \uc8fd\uc5c8\uac70\ub098 pid \ub97c \ubabb \ucc3e\uc558\uc2b5\ub2c8\ub2e4');
   setTimeout(()=>location.reload(),1500);
@@ -4648,8 +4648,10 @@ function buildCams(names){
   });
   camsBuilt=names.length>0;
 }
-async function refresh(){
-  const d=await (await fetch('/api/record_status/'+JID)).json();
+/* 예전에는 여기서 예외가 나면 화면이 초기값('…', '...')에 그대로 굳었습니다.
+   무엇이 막혔는지 화면에 적고 다음 주기에 다시 시도합니다. */
+let failN=0, polling=false;
+function paint(d){
   const s=d.status||{};
   const ph=s.phase||'starting';
   const label={starting:'준비 중…',importing:'lerobot 불러오는 중…',devices:'팔 객체 만드는 중…',
@@ -4702,6 +4704,36 @@ async function refresh(){
   if(!camsBuilt && s.cams && s.cams.length) buildCams(s.cams);
   $('tail').textContent=d.tail||'';
   if(!d.alive){ setTimeout(()=>location.reload(),1200); }
+}
+async function refresh(){
+  if(polling) return;                 /* 느려도 요청이 쌓이지 않게 */
+  polling=true;
+  let d;
+  try{
+    const ac=new AbortController();
+    const to=setTimeout(()=>ac.abort(), 5000);
+    const r=await fetch('/api/record_status/'+JID,{signal:ac.signal,cache:'no-store'});
+    clearTimeout(to);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    d=await r.json();
+  }catch(e){
+    failN++;
+    $('phase').textContent='서버 응답 없음';
+    $('phase').className='phase error';
+    $('err').style.display='';
+    $('err').textContent='lrweb 서버가 응답하지 않습니다 ('+failN+'회) — '
+      +(e.name==='AbortError'?'5초 초과':String(e&&e.message||e))
+      +'. 터미널에서 lrweb.log 를 확인하세요.';
+    polling=false; return;
+  }
+  failN=0;
+  try{ paint(d); }
+  catch(e){
+    $('err').style.display='';
+    $('err').textContent='화면 갱신 오류: '+(e&&e.message||e);
+    console.error(e);
+  }
+  finally{ polling=false; }
 }
 refresh(); setInterval(refresh,500);
 document.addEventListener('keydown',e=>{

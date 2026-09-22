@@ -62,6 +62,22 @@ def main():
                 else:
                     print(f"  {path:9s} script#{i}  {len(js):6d} chars  OK")
                 seen[path] = seen.get(path, 0) + 1
+        # 진행 중 작업이 있을 때만 그려지는 블록은 페이지 요청으로는 안 나옵니다.
+        # 모듈 문자열을 직접 검사합니다 — COLLECT_RUN_HTML 이 깨진 채 나간 적이 있습니다.
+        for name in ("COLLECT_RUN_HTML",):
+            blk = getattr(lrweb, name, "")
+            for i, js in enumerate(re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", blk, re.S)):
+                js = js.strip()
+                if not js:
+                    continue
+                chk.write_text("const JID='x';\n" + js)
+                r = subprocess.run([node, "--check", str(chk)], capture_output=True, text=True)
+                if r.returncode:
+                    bad += 1
+                    print(f"  {name} script#{i}: SYNTAX ERROR\n{r.stderr}")
+                else:
+                    print(f"  {name:9s} script#{i}  {len(js):6d} chars  OK")
+                seen[name] = seen.get(name, 0) + 2
     # 페이지마다 최소 2개(공통 + 페이지 스크립트) 는 나와야 합니다.
     # 하나뿐이면 조기 반환 페이지를 검사한 것이라 정작 볼 코드를 못 봤다는 뜻입니다.
     thin = [pg for pg, n in seen.items() if n < 2]
