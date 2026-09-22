@@ -40,6 +40,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from pathlib import Path
@@ -373,17 +374,45 @@ def icon_png(size):
     return data
 
 
+def dir_size(root: Path):
+    """폴더의 총 바이트와 파일 수. 심볼릭 링크는 따라가지 않습니다 (중복 계산 방지)."""
+    total = count = 0
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            f = Path(dirpath) / name
+            if f.is_symlink():
+                continue
+            try:
+                total += f.stat().st_size
+                count += 1
+            except OSError:
+                pass
+    return total, count
+
+
+def human_bytes(n):
+    v = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if v < 1024 or unit == "GB":
+            return f"{int(v)} {unit}" if unit == "B" else f"{v:.1f} {unit}"
+        v /= 1024
+    return f"{v:.1f} GB"
+
+
 def list_datasets():
     out = []
     if DATA_ROOT.exists():
         for d in sorted(DATA_ROOT.iterdir()):
             if (d / "meta/info.json").exists():
                 info = load_json(d / "meta/info.json", {})
+                nbytes, nfiles = dir_size(d)
                 out.append({"name": d.name,
                             "episodes": info.get("total_episodes", "?"),
                             "frames": info.get("total_frames", "?"),
                             "fps": info.get("fps", "?"),
-                            "robot_type": info.get("robot_type", "")})
+                            "robot_type": info.get("robot_type", ""),
+                            "version": info.get("codebase_version", "?"),
+                            "bytes": nbytes, "files": nfiles})
     return out
 
 
@@ -1438,6 +1467,10 @@ button.primary{background:var(--accent-dim);border-color:var(--accent);color:#dc
 button.danger{color:var(--bad);border-color:rgba(201,96,96,.5)}
 button.danger:hover{border-color:var(--bad);background:rgba(201,96,96,.08)}
 button.big{font-size:15px;padding:12px 22px;font-family:var(--mono)}
+a.btnlink{display:inline-block;font-family:var(--sans);font-size:13px;font-weight:500;
+  background:var(--surface2);color:var(--text);border:1px solid var(--line);
+  border-radius:7px;padding:7px 14px;text-decoration:none;transition:border-color .12s}
+a.btnlink:hover{border-color:var(--accent);color:var(--text)}
 input,select{font-family:var(--sans);font-size:13.5px;background:var(--bg);
   color:var(--text);border:1px solid var(--line);border-radius:7px;padding:7px 10px}
 input:focus,select:focus{outline:none;border-color:var(--accent)}
@@ -1583,21 +1616,31 @@ def index():
     def _row(d):
         mismatch = ' <span class="badge b-warn">모드 불일치</span>' \
             if d["robot_type"] and d["robot_type"] != robot_name() else ""
+        ver = d["version"]
+        verbadge = (f'<span class=badge>{esc(ver)}</span>' if ver == "v3.0"
+                    else f'<span class="badge b-warn">{esc(ver)}</span>')
         return (f'<tr><td><a href="/ds/{esc(d["name"])}" class=mono>{esc(d["name"])}</a></td>'
                 f'<td class=num>{esc(d["episodes"])}</td><td class=num>{esc(d["frames"])}</td>'
                 f'<td class=num>{esc(d["fps"])}</td>'
                 f'<td class=mono style="color:var(--muted)">{esc(d["robot_type"])}{mismatch}</td>'
-                f'<td style="text-align:right">'
+                f'<td>{verbadge}</td>'
+                f'<td class=num style="color:var(--muted)">{esc(human_bytes(d["bytes"]))}</td>'
+                f'<td style="text-align:right;white-space:nowrap">'
+                f'<a class=btnlink href="/api/download/{esc(d["name"])}" '
+                f'title="폴더를 그대로 tar 로 내려받습니다 ({d["files"]}개 파일)">다운로드</a> '
                 f'<button class=danger onclick="delDs({jsattr(d["name"])})">삭제</button></td></tr>')
     rows = "".join(_row(d) for d in list_datasets())
     empty = ('' if rows else
-             '<tr><td colspan=6 class=muted>데이터셋이 없습니다 — Collect 탭에서 수집을 시작하세요</td></tr>')
+             '<tr><td colspan=8 class=muted>데이터셋이 없습니다 — Collect 탭에서 수집을 시작하세요</td></tr>')
     return f"""{CSS}{nav_html('ds')}<div class=wrap>
     <p class=eyebrow>Local datasets</p><h2>Datasets</h2>
     <div class=card><table>
     <tr><th>name</th><th class=num>episodes</th><th class=num>frames</th><th class=num>fps</th>
-    <th>robot</th><th></th></tr>
+    <th>robot</th><th>format</th><th class=num>size</th><th></th></tr>
     {rows}{empty}</table></div>
+    <p class=muted>다운로드는 <b>LeRobotDataset v3.0</b> 폴더를 그대로 tar 로 감싼 것입니다 (압축 없음).
+    받은 뒤 <span class=mono>tar xf 이름_v3.0.tar</span> 로 풀면 바로
+    <span class=mono>LeRobotDataset(repo_id, root=풀린폴더)</span> 로 열립니다.</p>
     <p class=muted>삭제는 폴더를 통째로 지웁니다 (복구 불가). 데이터셋 이름을 입력해야 실행됩니다.</p></div>
     <script>
     async function delDs(name){{
@@ -1627,6 +1670,102 @@ def api_delete_dataset(ds: str):
     m.pop(ds, None)
     save_marks(m)
     return {"ok": True}
+
+
+# ----------------------------- 데이터셋 내려받기 ------------------------------
+# lrweb 이 수집한 데이터셋은 이미 LeRobotDataset v3.0 레이아웃입니다
+# (meta/info.json 의 codebase_version 이 v3.0). 변환할 게 없으므로 폴더를
+# 그대로 tar 로 감싸 스트리밍합니다. mp4 / parquet 는 이미 압축된 포맷이라
+# gzip 을 걸면 CPU 만 먹고 크기는 거의 안 줄어듭니다.
+_TAR_CHUNK = 1 << 20          # 1 MiB 씩 읽어 흘립니다 (파일 전체를 메모리에 올리지 않음)
+_TAR_RECORD = 10240           # tar 표준 레코드 크기
+
+
+def _tar_files(root: Path):
+    """root 아래 일반 파일만, 경로 정렬해서 (실제경로, tar 내부경로) 로 돌려줍니다."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        for name in sorted(filenames):
+            f = Path(dirpath) / name
+            if f.is_symlink() or not f.is_file():
+                continue
+            yield f, f.relative_to(root).as_posix()
+
+
+def _tar_stream(root: Path, arc_root: str):
+    """tarfile 객체 대신 블록을 직접 만들어 흘립니다.
+    tarfile.addfile 은 파일을 통째로 버퍼에 복사해서, 수 GB 짜리 영상이 들어간
+    데이터셋에서는 메모리를 그만큼 먹습니다."""
+    total = 0
+    for path, rel in _tar_files(root):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        ti = tarfile.TarInfo(f"{arc_root}/{rel}")
+        ti.size = st.st_size
+        ti.mtime = int(st.st_mtime)
+        ti.mode = 0o644
+        ti.type = tarfile.REGTYPE
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        # PAX 포맷이면 100 자를 넘는 경로도 tobuf 가 확장 헤더까지 만들어 줍니다.
+        head = ti.tobuf(tarfile.PAX_FORMAT)
+        total += len(head)
+        yield head
+        written = 0
+        try:
+            with path.open("rb") as fh:
+                while written < ti.size:
+                    b = fh.read(min(_TAR_CHUNK, ti.size - written))
+                    if not b:
+                        break
+                    written += len(b)
+                    total += len(b)
+                    yield b
+        except OSError:
+            pass
+        if written < ti.size:
+            # 스트리밍 도중 파일이 잘렸습니다. 헤더에 적은 크기만큼은 채워야
+            # tar 구조가 깨지지 않습니다.
+            pad = b"\0" * (ti.size - written)
+            total += len(pad)
+            yield pad
+        pad = -ti.size % 512
+        if pad:
+            total += pad
+            yield b"\0" * pad
+    tail = b"\0" * 1024
+    total += len(tail)
+    yield tail
+    pad = -total % _TAR_RECORD
+    if pad:
+        yield b"\0" * pad
+
+
+@app.get("/api/download/{ds}")
+def api_download_dataset(ds: str):
+    if not safe_name(ds):
+        return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
+    root = (DATA_ROOT / ds).resolve()
+    if not str(root).startswith(str(DATA_ROOT.resolve())) or not root.is_dir():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    info = load_json(root / "meta/info.json", {})
+    if not info:
+        return JSONResponse({"error": "meta/info.json 이 없습니다 — 데이터셋 폴더가 아님"}, status_code=400)
+    # 수집 중인 데이터셋은 tar 를 뜨는 동안 파일이 계속 자라 무결성이 깨집니다.
+    rec = busy_with(("record",))
+    if rec and ds in rec.get("cmd", ""):
+        return JSONResponse({"error": f"{rec['id']} 가 이 데이터셋에 수집 중 — 끝난 뒤 받으세요"},
+                            status_code=409)
+    ver = str(info.get("codebase_version", "unknown")).replace("/", "_")
+    fname = f"{ds}_{ver}.tar"
+    return StreamingResponse(
+        _tar_stream(root, ds),
+        media_type="application/x-tar",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"',
+                 "X-Dataset-Version": ver,
+                 "Cache-Control": "no-store"})
 
 
 @app.get("/ds/{ds}", response_class=HTMLResponse)
@@ -2238,7 +2377,7 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
       <button id=btrq onclick="toggleTorque()" disabled>토크 ON</button>
       <button id=bflw onclick="toggleFollow()" disabled>리더 팔로우 ON</button>
       <button class=estop onclick="estop()">E-STOP</button>
-      <input type=color id=armcolor value="#e07a3f" title="로봇 색상"
+      <input type=color id=armcolor value="#ffffff" title="로봇 색상"
              style="width:34px;height:30px;padding:2px;border-radius:7px;border:1px solid var(--line);background:var(--bg);cursor:pointer">
     </div>
     <div id=warnbox></div>
@@ -2397,7 +2536,7 @@ function showViewMsg(t){{
   function resize(){{const w=view.clientWidth,h=view.clientHeight;ren.setSize(w,h);cam.aspect=w/h;cam.updateProjectionMatrix();}}
   new ResizeObserver(resize).observe(view); resize();
   const picker=document.getElementById('armcolor');
-  picker.value=localStorage.getItem('armColor')||'#e07a3f';
+  picker.value=localStorage.getItem('armColor2')||'#ffffff';
   function applyColor(hex){{
     Object.values(robots).forEach(r=>r.traverse(o=>{{
       if(o.isMesh){{
@@ -2408,7 +2547,7 @@ function showViewMsg(t){{
         o.material.color.set(hex);
       }}
     }}));
-    localStorage.setItem('armColor',hex);
+    localStorage.setItem('armColor2',hex);
   }}
   picker.addEventListener('input',()=>applyColor(picker.value));
   SIDES.forEach((side,i)=>{{
