@@ -975,6 +975,7 @@ class CamStreamer:
         self.on = False
         self.frames = {}     # name -> jpeg bytes
         self.cams = {}
+        self.errors = {}     # name -> 열기 실패 사유 (UI 에 그대로 띄웁니다)
         self.thread = None
 
     def open(self):
@@ -984,6 +985,7 @@ class CamStreamer:
         except ImportError:
             return False
         self.cams = {}
+        self.errors = {}
         for name, spec in CAM_SPECS.items():
             idx = spec["index_or_path"]
             idx = idx if isinstance(idx, int) else Path(str(idx))
@@ -996,6 +998,7 @@ class CamStreamer:
                 cam.connect()
                 self.cams[name] = cam
             except Exception as e:
+                self.errors[name] = f"{type(e).__name__}: {e}"
                 print(f"[lrweb] 카메라 '{name}' 열기 실패: {e}")
         if not self.cams:
             return False
@@ -2496,13 +2499,28 @@ function openWS(){{
       SIDES.forEach(s=>buildSliders(s, d.arms[s].limits, d.arms[s].actual));
       setStatus('연결됨','b-ok');
       btrq.disabled=false; bflw.disabled=false;
-      if(d.cams&&d.cams.length){{
+      const errs=d.cam_errors||{{}};
+      if((d.cams&&d.cams.length)||Object.keys(errs).length){{
         document.getElementById('cams').style.display='grid';
-        d.cams.forEach(n=>{{
-          const img=document.getElementById('cam_'+n);
-          if(img) img.src='/stream/'+encodeURIComponent(n);
-        }});
       }}
+      (d.cams||[]).forEach(n=>{{
+        const img=document.getElementById('cam_'+n);
+        if(img) img.src='/stream/'+encodeURIComponent(n);
+      }});
+      // 못 연 카메라는 검은 화면으로 두지 말고 이유를 적습니다.
+      // Setup 에서는 한 대씩 열어 보니 되고 여기서는 안 되는 경우가 많은데,
+      // 대개 USB 대역폭이 모자라거나 두 항목이 같은 장치를 가리킨 것입니다.
+      Object.keys(errs).forEach(n=>{{
+        const img=document.getElementById('cam_'+n);
+        if(!img) return;
+        const box=img.parentElement;
+        img.remove();
+        const d2=document.createElement('div');
+        d2.style.cssText='padding:26px 12px;color:#e08a8a;font-family:var(--mono);'
+          +'font-size:11px;line-height:1.7;text-align:center';
+        d2.textContent='열기 실패 — '+errs[n];
+        box.appendChild(d2);
+      }});
     }}
     if(d.type==='state'){{
       torque=d.torque; follow=!!d.follow;
@@ -2592,19 +2610,33 @@ function showViewMsg(t){{
   picker.value=localStorage.getItem('armColor2')||'#ffffff';
   function applyColor(hex){{
     Object.values(robots).forEach(r=>r.traverse(o=>{{
-      if(o.isMesh){{
-        if(!o.userData.recolored){{
-          o.material=new THREE.MeshStandardMaterial({{metalness:0.15,roughness:0.55}});
-          o.userData.recolored=true;
-        }}
+      if(!o.isMesh) return;
+      if(!o.userData.recolored){{
+        // URDF 가 이미 본체(3d_printed)와 서보(sts3215)를 material 이름으로
+        // 나눠 놨습니다. 교체하면 이름이 사라지니 먼저 적어 둡니다.
+        o.userData.urdfMat = (o.material && o.material.name) || '';
+        o.material=new THREE.MeshStandardMaterial({{metalness:0.15,roughness:0.55}});
+        o.userData.recolored=true;
+      }}
+      if(o.userData.urdfMat==='sts3215'){{
+        // 서보는 URDF 색(0.1,0.1,0.1)을 그대로 둡니다 — 다 같은 색이면 형태가 안 보입니다.
+        o.material.color.set('#1a1a1a');
+        o.material.roughness=0.35;
+      }} else {{
         o.material.color.set(hex);
       }}
     }}));
     localStorage.setItem('armColor2',hex);
   }}
   picker.addEventListener('input',()=>applyColor(picker.value));
+  // URDFLoader.load 의 콜백은 parse 직후에 불립니다 — STL 은 아직 로딩 중입니다.
+  // 그래서 여기서 칠하면 빈 트리를 칠하는 꼴이고, 나중에 도착한 메시가
+  // URDF 자체 material(3d_printed = 노랑)을 그대로 들고 옵니다.
+  // LoadingManager 가 비는 시점에 다시 칠해야 합니다.
+  const mgr=new THREE.LoadingManager();
+  mgr.onLoad=()=>applyColor(picker.value);
   SIDES.forEach((side,i)=>{{
-    const loader=new URDFLoader();
+    const loader=new URDFLoader(mgr);
     loader.workingPath='/urdf/';
     loader.packages='/urdf';           // package://xxx/ 형태도 /urdf/로 해석
     loader.load('/urdf/so101.urdf',
@@ -2703,6 +2735,7 @@ async def ws_control(sock: WebSocket):
         await sock.send_text(json.dumps({
             "type": "init", "arms": _arms_state(),
             "cams": list(CAMS.cams),      # 실제로 열린 카메라만
+            "cam_errors": dict(CAMS.errors),
         }))
 
         synced = False   # 토크 토글 직후 슬라이더 동기화 신호 1회
