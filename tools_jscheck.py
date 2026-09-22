@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """lrweb 의 모든 페이지에서 인라인 <script> 를 뽑아 node --check 로 파싱 검증.
 
-Python 문자열 안에 JS 를 넣다 보니 따옴표 escape 가 한 번 더 벗겨져
-페이지 스크립트가 통째로 죽는 사고가 있었습니다. 그 회귀를 막습니다.
+Python 문자열 안에 JS 가 들어 있어 따옴표·역슬래시 escape 가 한 번 더 벗겨질 수 있습니다.
+파이썬이 평가한 뒤의 JS 를 검사하므로 그런 문제를 그대로 잡습니다.
 
     python tools_jscheck.py            # node 를 PATH 에서 찾음
     NODE=/opt/node22/bin/node python tools_jscheck.py
@@ -63,7 +63,7 @@ def main():
                     print(f"  {path:9s} script#{i}  {len(js):6d} chars  OK")
                 seen[path] = seen.get(path, 0) + 1
         # 진행 중 작업이 있을 때만 그려지는 블록은 페이지 요청으로는 안 나옵니다.
-        # 모듈 문자열을 직접 검사합니다 — COLLECT_RUN_HTML 이 깨진 채 나간 적이 있습니다.
+        # 모듈 문자열을 직접 검사합니다.
         for name in ("COLLECT_RUN_HTML",):
             blk = getattr(lrweb, name, "")
             for i, js in enumerate(re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", blk, re.S)):

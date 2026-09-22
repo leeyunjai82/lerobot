@@ -1,33 +1,20 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  lrweb.py v11 — LeRobot 통합 웹 툴 (단일 파일 FastAPI)
+#  lrweb.py — LeRobot SO-101 통합 웹 툴 (단일 파일 FastAPI)
 #
-#  v11 (4~6단계)
-#   - Control: 팔별 제어 스레드 (양팔에서 왕복 지연이 직렬로 안 쌓임)
-#   - Collect: lerobot-record CLI + PTY 제거 → 이 파일을 --worker 로 띄워 record_loop() 직접 호출.
-#              상태/미리보기/명령이 전부 파일(RUN_DIR) → 수집 중 카메라 미리보기, lrweb 재시작에도 세션 유지
-#   - 양팔: bi_so_follower / bi_so_leader (설정 mode=bimanual). 데이터셋·체크포인트 모드 호환성 검사
+#  Datasets / Collect / Training / Rollout / Control / Calib / Setup / Jobs 를
+#  명령어 없이 웹에서 처리합니다. 한팔(so_follower) · 양팔(bi_so_follower) 지원.
 #
-#  v10 (1단계: 버그 픽스 + lerobot 객체 전환 + 설정 파일)
-#   - Control 탭이 lerobot.robots.SOFollower / lerobot.teleoperators.SOLeader 사용
-#     (기존에는 FeetechMotorsBus 직접 제어 → configure() 누락으로 gripper 보호값 미설정)
-#   - 관절 한계 계산을 lerobot MotorsBus._normalize(DEGREES)와 동일하게 수정
-#       mid=(range_min+range_max)/2, 분모 = resolution-1 (4095)
-#       (기존 2048 / 4096 기준 → 캘리브레이션 범위가 비대칭이면 전 범위가 어긋남)
-#   - 카메라도 lerobot.cameras.OpenCVCamera 사용 (해상도/fps를 record와 동일하게 강제)
-#   - 모든 외부 프로세스를 argv 리스트 + shell=False 로 실행 (셸 인젝션 제거)
-#   - HTML 이스케이프 전면 적용
-#   - 토큰 인증 (LRWEB_AUTH=off 로 해제 가능)
-#   - 하위 프로세스에서 DISPLAY/WAYLAND_DISPLAY 제거
-#       → lerobot이 pynput 전역 리스너 대신 터미널 리스너를 쓰도록 강제
-#         (그래야 PTY 로 넣는 n/r/q 가 먹습니다)
-#   - 설정을 lrweb_config.json 으로 분리 (arms 리스트 = 양팔 확장 대비 스키마)
+#  - 팔·카메라는 lerobot 객체(SOFollower / SOLeader / OpenCVCamera)로 다룹니다.
+#  - 수집은 이 파일을 --worker 로 띄워 lerobot record_loop() 를 직접 부릅니다.
+#    상태·미리보기·명령은 전부 파일(RUN_DIR)이라 lrweb 를 재시작해도 세션이 유지됩니다.
+#  - 외부 프로세스는 argv 리스트 + shell=False 로만 실행합니다.
+#  - 설정은 lrweb_config.json (Setup 탭에서 채움). 자세한 것은 README.
 #
 #  실행 (lerobot conda env 안에서)
 #   source ~/project/lerobot/activate.sh
-#   pip install fastapi uvicorn
-#   nohup python ~/project/lerobot/lrweb.py > ~/project/lerobot/lrweb.log 2>&1 &
-#   → 로그에 찍히는 http://<host>:8080/?token=... 로 최초 1회 접속
+#   nohup python lrweb.py > lrweb.log 2>&1 &
+#   → http://<host>:8080  (기본 인증 없음. LRWEB_TOKEN / LRWEB_AUTH=on 으로 켤 수 있음)
 # ============================================================================
 import asyncio
 import glob
@@ -168,8 +155,7 @@ def load_config():
         arm["view"] = {"x": float(v.get("x", 0.0)),      # 앞뒤 (m, + 앞)
                        "y": float(v.get("y", dy)),       # 좌우 (m, + 왼쪽)
                        "yaw_deg": float(v.get("yaw_deg", 0.0))}
-    # 양팔인데 두 배치가 같으면 3D 에서 정확히 포개져 팔 하나로 보입니다.
-    # (예전 Setup 이 양팔 전환 시 둘 다 y=0 으로 저장했습니다) 좌우로 벌려 줍니다.
+    # 양팔인데 두 배치가 같으면 3D 에서 정확히 포개져 팔 하나로 보입니다. 좌우로 벌려 줍니다.
     if want == 2:
         vl, vr = cfg["arms"][0]["view"], cfg["arms"][1]["view"]
         if (vl["x"], vl["y"], vl["yaw_deg"]) == (vr["x"], vr["y"], vr["yaw_deg"]):
@@ -213,7 +199,7 @@ OUT_ROOT.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="lrweb")
 
 # ----------------------------- 인증 (기본 꺼짐) -------------------------------
-# 기본은 인증 없음 — 예전처럼 http://<host>:8080 으로 바로 들어갑니다.
+# 기본은 인증 없음 — http://<host>:8080 으로 바로 들어갑니다.
 # 켜려면 둘 중 하나:
 #   LRWEB_TOKEN=원하는값 python lrweb.py     (토큰 직접 지정)
 #   LRWEB_AUTH=on        python lrweb.py     (lrweb_token.txt 에 자동 생성)
@@ -885,10 +871,10 @@ class ArmCtl:
     def set_torque(self, on: bool):
         with self.lock:
             if on:
-                # 서보의 Goal_Position 은 지난 세션 값이 그대로 남아 있습니다.
-                # 그 상태로 토크만 켜면 서보가 **예전 목표로 전속 돌진**합니다.
+                # 서보의 Goal_Position 은 이전 세션 값이 RAM 에 그대로 남아 있습니다.
+                # 그 상태로 토크만 켜면 서보가 그 목표로 전속 이동합니다.
                 # 기계적 스톱에 부딪히면 과부하 보호가 걸려 토크가 빠지고,
-                # 그 뒤로는 어떤 명령도 안 먹습니다 (실기에서 right/wrist_flex 가 이 경우였습니다).
+                # 그 뒤로는 어떤 명령도 받지 않습니다 (전원 재투입 전까지).
                 # 그래서 반드시 '현재 위치를 목표로 먼저 쓰고' 토크를 켭니다.
                 self.actual = self.read()
                 self.target = dict(self.actual)
@@ -4394,7 +4380,6 @@ def worker_record(jid):
             pass
 
     # 준비 단계가 길어도 화면이 멈춰 보이지 않도록, 첫 줄부터 status.json 을 씁니다.
-    # (예전에는 dataset 을 만든 뒤에야 첫 put 이 나가서, 그 전에 걸리면 화면이 빈 채로 굳었습니다)
     put(phase="starting", t0=time.time())
 
     threading.Thread(target=poll_cmd, daemon=True).start()
@@ -4656,8 +4641,7 @@ function buildCams(names){
   });
   camsBuilt=names.length>0;
 }
-/* 예전에는 여기서 예외가 나면 화면이 초기값('…', '...')에 그대로 굳었습니다.
-   무엇이 막혔는지 화면에 적고 다음 주기에 다시 시도합니다. */
+/* 폴링이 실패하면 조용히 죽지 않고 무엇이 막혔는지 화면에 적고 다음 주기에 다시 시도합니다. */
 let failN=0, polling=false;
 function paint(d){
   const s=d.status||{};

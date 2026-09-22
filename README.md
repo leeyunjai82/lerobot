@@ -3,7 +3,7 @@
 HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로봇팔
 수집·학습·추론 파이프라인용 웹 툴. (본 repo는 HF lerobot 자체가 아니며, 운용 도구 모음입니다)
 
-목표는 **명령어 없이 웹에서 다 되게** 하는 것입니다. 진행 상황은 아래 [로드맵](#로드맵) 참고.
+목표는 **명령어 없이 웹에서 다 되게** 하는 것입니다.
 
 ## 구성
 
@@ -100,12 +100,11 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 
 Setup 탭은 시리얼 번호가 있으면 `by-id`, 없으면 `by-path` 를 자동으로 고릅니다. 카메라도 같은 규칙입니다.
 
-**실측 (Seeed SO-ARM101 Pro Assembled Kit, 2026-09)**: 동봉된 Servo Driver Board 는
-`1a86:55d3` (WCH CH343/CH9102 계열) 이고 **보드마다 고유 시리얼 번호가 있습니다**
-(`sn=5B90102742` 등). 따라서 `by-id` 가 잡히고 **USB 구멍을 가릴 필요가 없습니다.**
-대신 경로가 보드를 따라가므로, 보드에 sn 뒷자리를 적어 붙여 두고 다른 팔로 옮겨 달지 마세요.
-같은 키트의 모터는 **ID 1~6 이 이미 들어 있어** 모터 ID 세팅 단계를 건너뛸 수 있었습니다
-(probe 에서 `1,2,3,4,5,6` 확인).
+**Seeed SO-ARM101 Pro Assembled Kit**: 동봉된 Servo Driver Board 는 `1a86:55d3`
+(WCH CH343/CH9102 계열) 이고 **보드마다 고유 시리얼 번호가 있습니다.** 따라서 `by-id` 가 잡히고
+USB 구멍을 가릴 필요가 없습니다. 대신 경로가 보드를 따라가므로, 보드에 sn 뒷자리를 적어 붙여 두고
+다른 팔로 옮겨 달지 마세요. 같은 키트의 모터는 **ID 1~6 이 이미 들어 있어** 모터 ID 세팅 단계를
+건너뛸 수 있습니다 (probe 에서 `1,2,3,4,5,6` 이 뜨면 됩니다).
 
 **leader / follower 판별**: Setup 탭에서 *포트 감시* 를 켜면 모든 후보 포트를 토크 OFF 로 열고
 엔코더를 읽습니다. 팔 하나를 손으로 움직이면 그 포트의 `travel` 값이 올라갑니다 → 그 줄의 역할 선택.
@@ -138,7 +137,7 @@ lerobot CLI 는 먼저 "관절을 가동범위 중앙에 놓고 Enter" 를 요�
 `3 / 4064` 처럼 잡혀 span 이 357° 같은 불가능한 값이 되고, 그대로 저장하면 서보의
 `Min/Max_Position_Limit` 보호가 무력화되어 슬라이더가 기계 스톱 너머를 명령하게 됩니다.
 
-게다가 **중앙을 찾으려면 어차피 한 번 쓸어봐야** 합니다. 그래서 순서를 뒤집었습니다:
+게다가 **중앙을 찾으려면 어차피 한 번 쓸어봐야** 합니다. 그래서 순서가 반대입니다:
 
 1. `reset_calibration()` 으로 `Homing_Offset=0` — 읽는 값이 곧 원시 엔코더값
 2. 쓸면서 연속 표본의 차이로 **언랩** (±2048 넘는 점프를 ∓4096 보정) → 진짜 min/max
@@ -159,14 +158,12 @@ lerobot CLI 는 먼저 "관절을 가동범위 중앙에 놓고 Enter" 를 요�
 
 ## 토크를 켜기 전에 현재 위치를 먼저 쓴다
 
-STS3215 의 `Goal_Position` 은 RAM 에 **지난 세션 값이 그대로 남아** 있습니다.
-그 상태로 `Torque_Enable=1` 만 쓰면 서보가 **예전 목표로 전속 돌진**합니다.
+STS3215 의 `Goal_Position` 은 RAM 에 **이전 세션 값이 그대로 남아** 있습니다.
+그 상태로 `Torque_Enable=1` 만 쓰면 서보가 그 목표로 전속 이동합니다.
 기계적 스톱에 부딪히면 과부하 보호가 걸려 서보가 스스로 토크를 빼고, 그 뒤로는
-어떤 `Goal_Position` 도 받지 않습니다 (전원 재투입 전까지).
-
-실기에서 "토크 ON 하자마자 오른팔 손목이 −108° 로 접힌 채 아무 명령도 안 먹는" 증상이
-정확히 이것이었습니다. 온도가 안 올라간 것도 단서였습니다 — 버티는 중이면 전류를 먹어
-뜨거워지는데, 보호로 토크가 빠졌으니 차가웠던 것입니다.
+어떤 `Goal_Position` 도 받지 않습니다 (전원 재투입 전까지). 증상은 "토크 ON 직후 관절 하나가
+끝까지 접힌 채 아무 명령도 안 먹고, 온도는 오르지 않음" 입니다 — 버티는 중이면 뜨거워지지만
+보호로 토크가 빠지면 차갑습니다.
 
 그래서 `set_torque(True)` 는 반드시 이 순서로 합니다:
 
@@ -196,10 +193,10 @@ Control 탭의 명령 적분기는 목표에 도달하면(데드밴드 0.2°) �
 
 ## 수집 worker — 왜 CLI 를 안 쓰나
 
-`lerobot-record` 는 터미널 키보드(n/r/q)로 조작합니다. 예전엔 PTY 로 키를 밀어넣었는데,
-X11 세션이면 lerobot 이 pynput 전역 리스너를 골라 PTY 입력이 조용히 버려지는 문제가 있었습니다.
+`lerobot-record` 는 터미널 키보드(n/r/q)로 조작합니다. PTY 로 키를 밀어넣는 방식은
+X11 세션에서 lerobot 이 pynput 전역 리스너를 골라 PTY 입력을 조용히 버립니다.
 
-지금은 `python lrweb.py --worker record <jid>` 로 **이 파일 자체를 worker 로 띄워** lerobot 의
+그래서 `python lrweb.py --worker record <jid>` 로 **이 파일 자체를 worker 로 띄워** lerobot 의
 `record_loop()` 를 직접 부릅니다. 웹 버튼이 `events` 딕트(`exit_early` / `rerecord_episode` /
 `stop_recording`)를 그대로 건드립니다. 데이터셋 생성·`VideoEncodingManager`·`save_episode()` 흐름은
 `lerobot_record.record()` 와 동일하고, 인코더/이미지라이터 기본값도 `DatasetRecordConfig` 에서 가져옵니다.
@@ -229,18 +226,18 @@ worker ↔ 웹은 전부 파일입니다 (`/dev/shm/lrweb/<jid>/`, 없으면 `~/
       └──────────[r 버리고 다시]──▶ 폐기 ────┘
 ```
 
-원래 CLI(`lerobot-record`)는 연결이 끝나면 곧바로 episode 0 을 찍고, `reset_time_s` 가 지나면
-자동으로 다음 에피소드로 넘어갑니다. 사람이 계속 시계에 쫓깁니다. lrweb 은 그 사이에
-**대기** 상태를 넣었습니다 — `record_loop(dataset=None, ...)` 이 정확히 "기록하지 않고 리더 팔로우만
-하는" 루프라서 새로 만들 게 없습니다. 녹화는 오직 `s` 를 눌렀을 때만 시작합니다.
+CLI(`lerobot-record`)는 연결이 끝나면 곧바로 episode 0 을 찍고, `reset_time_s` 가 지나면
+자동으로 다음 에피소드로 넘어갑니다. lrweb 은 그 사이에 **대기** 상태를 둡니다 —
+`record_loop(dataset=None, ...)` 이 "기록하지 않고 리더 팔로우만 하는" 루프입니다.
+녹화는 오직 `s` 를 눌렀을 때만 시작합니다.
 
 - 목표 에피소드 수는 **진행률 표시용**입니다. 도달해도 멈추지 않으니 `q` 로 마칩니다.
 - `episode_time_s` 는 **최대 길이**입니다. 다 되면 자동 저장, `n` 을 먼저 누르면 그때 끝.
-- `reset_time_s` 설정은 없앴습니다. 대기 상태가 그 역할입니다.
+- `reset_time_s` 설정은 없습니다. 대기 상태가 그 역할입니다.
 - 녹화 도중 `q` 를 누르면 **그 에피소드는 버려집니다.** 살리려면 `n` 을 먼저 누르세요.
-- **에피소드 도중 일시정지는 일부러 안 만들었습니다.** v3.0 데이터셋은 fps 등간격 타임스탬프를
+- **에피소드 도중 일시정지는 지원하지 않습니다.** v3.0 데이터셋은 fps 등간격 타임스탬프를
   전제로 하고 `record_loop` 은 매 틱 `add_frame()` 을 부릅니다. 멈췄다 이어 붙이면 그 에피소드의
-  시간축이 거짓이 되고, ACT 는 그걸 그대로 믿습니다. 멈추고 싶으면 `r` 로 버리는 게 맞습니다.
+  시간축이 거짓이 되고, ACT 는 그걸 그대로 믿습니다. 멈추려면 `r` 로 버리세요.
 
 대기 중에는 `READY_CHUNK_S`(2초)마다 `record_loop` 을 끊고 그 틈에 팔로워 온도를 읽어
 화면에 띄웁니다. Feetech 는 반이중 버스라 녹화 루프와 **동시에** 읽으면 패킷이 섞입니다 —
@@ -277,37 +274,6 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 ```
 
 (`fastapi`/`uvicorn` 은 `lerobot_conda.sh` 가 이미 설치합니다)
-
-## 로드맵
-
-| 단계 | 내용 | 상태 |
-|---|---|---|
-| 1 | 버그 픽스 + lerobot 객체(`SOFollower`/`SOLeader`) 전환 + 설정 파일 | ✅ |
-| 2 | Setup 탭 — USB 포트 스캔·probe·leader/follower 판별·카메라·모드 전환을 웹에서 | ✅ |
-| 3 | Calibration 탭 — 웹에서 캘리브레이션 (`lerobot-calibrate` 불필요) | ✅ |
-| 4 | Control 탭 팔별 스레드 분리 | ✅ |
-| 5 | record worker 프로세스 — PTY 제거, `record_loop()` 직접 호출, 수집 중 카메라 미리보기 | ✅ |
-| 6 | 양팔 (`bi_so_follower` / `bi_so_leader`) | ✅ |
-
-### 1단계에서 고친 것
-
-- **관절 한계 계산이 lerobot 정규화와 달랐음.** `(raw-2048)/4096*360` 을 쓰고 있었는데
-  lerobot `MotorsBus._normalize(DEGREES)` 는 `(raw-mid)*360/(resolution-1)`,
-  `mid=(range_min+range_max)/2` 입니다. 캘리브레이션 범위가 2048 중심이 아니면
-  (보통 아닙니다) 슬라이더 전 범위가 어긋납니다 — 예: range 1000~3500 이면 17.8° 편차
-- **`configure()` 누락.** `FeetechMotorsBus` 를 직접 열면 `Operating_Mode`, `P_Coefficient`,
-  그리고 gripper 의 `Max_Torque_Limit` / `Protection_Current` / `Overload_Torque` 가
-  전부 안 잡힙니다 (그리퍼가 풀 토크로 물고 버팀). `SOFollower` 를 쓰면 `connect()` 가 처리
-- **셸 인젝션.** `/api/delete/{ds}` 가 검증 없는 이름을 `shell=True` 명령 문자열에
-  넣고 있었습니다. 모든 외부 프로세스를 argv 리스트 + `shell=False` 로 전환
-- **HTML 이스케이프.** 데이터셋 이름이 HTML·JS 에 그대로 들어가고 있었습니다
-  (옵션으로 토큰 인증도 추가 — 기본은 꺼짐)
-- **PTY 키가 조용히 무시되는 경우.** lerobot `init_keyboard_listener()` 는 X11 세션이면
-  pynput 전역 리스너를 씁니다. 그러면 PTY 로 넣는 n/r/q 가 아무 데도 안 갑니다.
-  자식 프로세스 환경에서 `DISPLAY`/`WAYLAND_DISPLAY` 를 제거해 터미널 리스너로 고정
-- **카메라 해상도.** raw `cv2.VideoCapture` 라 기본 해상도로 열렸습니다.
-  `OpenCVCamera` 로 바꿔 record 설정과 동일한 해상도/fps 강제
-- train 로그 step 파싱이 `1M` 같은 접미사에서 탈락하던 것, PTY/로그 fd 누수
 
 ## License
 
