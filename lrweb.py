@@ -265,7 +265,44 @@ async def auth_middleware(request: Request, call_next):
     return HTMLResponse(LOGIN_PAGE, status_code=401)
 
 
+def _same_origin(headers):
+    """다른 사이트의 웹페이지가 브라우저를 통해 몰래 보내는 요청(CSRF) 차단용.
+    인증과 별개이며 사용자에게는 보이지 않습니다. curl 처럼 Origin 이 없는 요청은 통과합니다."""
+    if headers.get("sec-fetch-site") == "cross-site":
+        return False
+    origin = headers.get("origin")
+    if not origin or origin == "null":
+        return True
+    from urllib.parse import urlsplit
+    host = (headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
+    return (urlsplit(origin).hostname or "") == host
+
+
+# 팔(시리얼)·GPU 를 잡는 '시작' 요청들은 한 번에 하나씩 처리합니다.
+# 검사(exclusive_busy)와 시작 사이에 await 가 있어서, 두 번 누르면 둘 다 검사를 통과해
+# 같은 포트를 두 번 여는 경쟁이 생기기 때문입니다.
+_START_PATHS = {"/api/record", "/api/rollout", "/api/train", "/api/setup/probe", "/api/setup/watch",
+                "/api/setup/motors/start", "/api/setup/armcheck/start", "/api/wizard/assign",
+                "/api/wizard/verify/start", "/api/wizard/import_calib", "/api/wizard/mode",
+                "/api/setup/config", "/api/calib/start", "/api/envs/activate", "/api/envs/save_as",
+                "/api/envs/rename", "/api/envs/delete"}
+_START_GATE = asyncio.Lock()
+
+
+@app.middleware("http")
+async def guard_middleware(request: Request, call_next):
+    if request.method == "POST":
+        if not _same_origin(request.headers):
+            return JSONResponse({"error": "다른 사이트에서 온 요청은 받지 않습니다"}, status_code=403)
+        if request.url.path in _START_PATHS:
+            async with _START_GATE:
+                return await call_next(request)
+    return await call_next(request)
+
+
 def ws_authed(sock: WebSocket):
+    if not _same_origin(sock.headers):
+        return False
     return AUTH_TOKEN is None or token_ok(sock.cookies.get(COOKIE))
 
 
@@ -286,7 +323,8 @@ def jsattr(v):
 
 
 def safe_name(s):
-    return bool(s) and NAME_RE.fullmatch(s) is not None
+    # '.' / '..' 은 정규식은 통과하지만 경로로 쓰면 상위 폴더가 됩니다
+    return bool(s) and NAME_RE.fullmatch(s) is not None and s.strip(".") != ""
 
 
 def load_json(p, default):
@@ -296,8 +334,20 @@ def load_json(p, default):
         return default
 
 
+def _atomic_write(p, text):
+    """임시 파일에 쓰고 os.replace — 쓰는 도중에 다른 스레드가 읽어도 빈/반쪽 파일을 보지 않습니다.
+    (반쪽 파일을 읽으면 load_json 이 기본값을 돌려주고, 그걸 다시 저장하면 전부 지워집니다)"""
+    p = Path(p)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, p)
+
+
 def save_json(p, obj):
-    Path(p).write_text(json.dumps(obj, indent=1, ensure_ascii=False))
+    _atomic_write(p, json.dumps(obj, indent=1, ensure_ascii=False))
+
+
+META_LOCK = threading.Lock()     # 마크처럼 스레드풀에서 동시에 읽고-고치고-쓰는 파일용
 
 
 def load_marks():
@@ -344,7 +394,7 @@ def _write_active_config(cfg):
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
     merged.update(cfg)
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
+    _atomic_write(CONFIG_FILE, json.dumps(merged, indent=2, ensure_ascii=False))
     _rebind(load_config())
 
 
@@ -685,13 +735,25 @@ def robot_name():
     return "bi_so_follower" if BIMANUAL else "so_follower"
 
 
+_SINGLE_TYPES = {"so_follower", "so101_follower", "so100_follower"}
+_BI_TYPES = {"bi_so_follower", "bi_so101_follower", "bi_so100_follower"}
+
+
+def robot_type_ok(rt):
+    """데이터셋/체크포인트의 robot_type 이 지금 모드와 맞는지. 비어 있으면(모름) 통과.
+    예전 lerobot 은 so101_follower 로 기록했으므로 같은 계열로 봅니다."""
+    if not rt:
+        return True
+    return rt in (_BI_TYPES if BIMANUAL else _SINGLE_TYPES)
+
+
 def bimanual_base_id(role, arm_cfgs=None):
     """양팔에서 lerobot BiSO* 는 per-arm 캘리브레이션 id 를 '{id}_left' / '{id}_right' 로 만듭니다.
     설정의 follower_id 가 'X_left' / 'X_right' 면 BiSOFollowerConfig(id='X') 가 됩니다."""
     arm_cfgs = arm_cfgs or ARM_CFGS
     left = arm_cfgs["left"][f"{role}_id"]
     right = arm_cfgs["right"][f"{role}_id"]
-    if not (left.endswith("_left") and right.endswith("_right") and left[:-5] == right[:-6]):
+    if not (left.endswith("_left") and right.endswith("_right") and left[:-5] == right[:-6] and left[:-5]):
         raise ValueError(f"양팔 {role} id 는 같은 이름에 _left / _right 를 붙여야 합니다 "
                          f"(예: {role}_left / {role}_right) — 현재 {left} / {right}")
     return left[:-5]
@@ -705,25 +767,42 @@ def _need_ports(role):
                 f"지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
 
 
+def mrt_value(v):
+    """max_relative_target 설정값 → float 또는 None.
+    ensure_safe_goal_position 은 float 만 받습니다 (int 면 TypeError) — 반드시 캐스팅."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        return float(v)
+    return None
+
+
 def robot_cli_args():
     """lerobot CLI(rollout) 용 --robot.* 인자. 한팔: so101_follower / 양팔: bi_so_follower"""
     _need_ports("follower")
+    # Control·Collect 와 같은 안전 제한을 롤아웃에도 겁니다 (정책 출력이 튀면 한 스텝 이동량을 자름)
+    mrt = mrt_value(CFG.get("max_relative_target"))
     if BIMANUAL:
         L, R = ARM_CFGS["left"], ARM_CFGS["right"]
-        return ["--robot.type=bi_so_follower",
+        args = ["--robot.type=bi_so_follower",
                 f"--robot.id={bimanual_base_id('follower')}",
                 f"--robot.left_arm_config.port={L['follower_port']}",
                 f"--robot.left_arm_config.cameras={_cam_cli(L['cameras'])}",
                 f"--robot.right_arm_config.port={R['follower_port']}",
                 f"--robot.right_arm_config.cameras={_cam_cli(R['cameras'])}",
                 f"--robot.cameras={_cam_cli(CFG['cameras'])}"]
+        if mrt is not None:
+            args += [f"--robot.left_arm_config.max_relative_target={mrt}",
+                     f"--robot.right_arm_config.max_relative_target={mrt}"]
+        return args
     arm = ARM_CFGS[SIDES[0]]
     cams = dict(arm["cameras"])
     cams.update(CFG["cameras"])
-    return ["--robot.type=so101_follower",
+    args = ["--robot.type=so101_follower",
             f"--robot.port={arm['follower_port']}",
             f"--robot.id={arm['follower_id']}",
             f"--robot.cameras={_cam_cli(cams)}"]
+    if mrt is not None:
+        args.append(f"--robot.max_relative_target={mrt}")
+    return args
 
 
 def teleop_cli_args():
@@ -765,14 +844,55 @@ def pid_alive(pid):
     return True
 
 
+def _proc_start(pid):
+    """/proc/<pid>/stat 의 starttime(22번째 필드). PID 가 재사용됐는지 가리는 데 씁니다."""
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except Exception:
+        return None
+
+
+def job_alive(j):
+    """pid 가 살아 있고, 그 pid 가 이 작업을 시작할 때의 프로세스와 같은지까지 확인합니다.
+    (끝난 작업의 pid 를 다른 프로세스가 물려받으면 '실행 중' 으로 보이고 중지 버튼이 남의 프로세스를 죽입니다)"""
+    pid = j.get("pid")
+    if not pid_alive(pid):
+        return False
+    st = j.get("pid_start")
+    return st is None or _proc_start(pid) == st
+
+
 def jobs_index():
     idx = []
     for jf in sorted(JOB_DIR.glob("*.json"), reverse=True):
         j = load_json(jf, {})
         if j:
-            j["alive"] = pid_alive(j.get("pid"))
+            j["alive"] = job_alive(j)
             idx.append(j)
     return idx
+
+
+def job_uses_dataset(j, ds):
+    """작업이 데이터셋 ds 를 쓰는지 — 녹화는 spec, 학습/편집은 CLI 인자로 정확히 비교합니다.
+    (예전처럼 cmd 문자열에 이름이 들어 있는지로 보면 녹화 작업은 못 잡고, abc 가 abc_2 에도 걸립니다)"""
+    root = os.path.realpath(DATA_ROOT / ds)
+    spec = j.get("spec") or {}
+    if spec.get("repo_id") == f"local/{ds}" or (spec.get("root") and os.path.realpath(spec["root"]) == root):
+        return True
+    args = j.get("argv") or (j.get("cmd") or "").split()
+    for i, a in enumerate(args):
+        k, sep, v = a.partition("=")
+        if not sep and i + 1 < len(args):        # '--root X' 형태
+            v = args[i + 1]
+        if k in ("--dataset.repo_id", "--repo_id") and v == f"local/{ds}":
+            return True
+        if k in ("--dataset.root", "--root", "--new_root") and v and os.path.realpath(v) == root:
+            return True
+    return False
+
+
+def dataset_busy(ds):
+    return next((j for j in jobs_index() if j["alive"] and job_uses_dataset(j, ds)), None)
 
 
 def child_env():
@@ -793,27 +913,40 @@ def run_dir(jid):
     return RUN_DIR / jid
 
 
+def _within(p, root):
+    """p(이미 resolve 된 경로)가 root 안에 있는지. 문자열 접두사 비교는 outputs2 같은 형제 폴더도 통과시킵니다."""
+    try:
+        return Path(p).resolve().is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def start_job(kind, argv, cwd=None, spec=None):
     """argv 는 반드시 리스트 — shell=False 이므로 셸 인젝션이 불가능합니다.
     spec 은 worker 가 읽을 작업 명세(dict) — job json 에 같이 저장됩니다."""
     if shutil.which(argv[0]) is None:
         raise JobStartError(f"실행 파일을 찾을 수 없습니다: {argv[0]} — lerobot conda env 안에서 lrweb 를 띄웠는지 확인")
     jid = f"{kind}_{time.strftime('%m%d_%H%M%S')}"
+    n = 2
+    while (JOB_DIR / f"{jid}.json").exists():     # 같은 초에 두 개 → 로그·pid 덮어쓰기 방지
+        jid = f"{kind}_{time.strftime('%m%d_%H%M%S')}_{n}"
+        n += 1
     log = JOB_DIR / f"{jid}.log"
     # worker 가 자기 job json 을 읽으므로 프로세스보다 먼저 써야 합니다
-    save_json(JOB_DIR / f"{jid}.json",
-              {"id": jid, "kind": kind, "cmd": " ".join(str(a) for a in argv), "pid": None,
-               "log": str(log), "started": time.strftime("%F %T"), "spec": spec})
     argv = [str(a).replace("{jid}", jid) for a in argv]
+    save_json(JOB_DIR / f"{jid}.json",
+              {"id": jid, "kind": kind, "cmd": " ".join(argv), "argv": argv, "pid": None,
+               "log": str(log), "started": time.strftime("%F %T"), "spec": spec})
     lf = open(log, "w")
     try:
         p = subprocess.Popen(argv, cwd=cwd or str(HOME), stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT,
-                             env=child_env(), preexec_fn=os.setsid)
+                             env=child_env(), start_new_session=True)
     finally:
         lf.close()      # 자식이 dup 를 들고 있으므로 부모 쪽은 닫습니다 (fd 누수 방지)
     j = load_json(JOB_DIR / f"{jid}.json", {})
     j["pid"] = p.pid
+    j["pid_start"] = _proc_start(p.pid)
     j["cmd"] = " ".join(argv)
     save_json(JOB_DIR / f"{jid}.json", j)
     return jid
@@ -847,7 +980,7 @@ def kill_job(jid, force=False):
         return False
     jf = JOB_DIR / f"{jid}.json"
     j = load_json(jf, {})
-    if not j.get("pid"):
+    if not j.get("pid") or not job_alive(j):
         return False
     sig = signal.SIGKILL if (force or j.get("kill_requested")) else signal.SIGINT
     try:
@@ -863,7 +996,7 @@ def delete_job(jid):
     if not safe_name(jid):
         return False
     j = load_json(JOB_DIR / f"{jid}.json", {})
-    if j and pid_alive(j.get("pid")):
+    if j and job_alive(j):
         return False
     for suffix in (".json", ".log"):
         try:
@@ -884,6 +1017,94 @@ def log_tail(jid, nbytes=4000):
             return f.read().decode(errors="ignore")[-3200:]
     except Exception:
         return ""
+
+
+# ----------------------------- 팔 연결 · 해제 공용 -----------------------------
+def _write_nothrow(bus, motor, reg, value, tries=3):
+    """레지스터 쓰기 — 서보가 에러 비트(과부하 보호 등)를 돌려줘도 예외를 내지 않습니다.
+    lerobot bus.write 는 에러 비트만 있어도 RuntimeError 라, 과부하로 멈춘 모터 하나 때문에
+    나머지 모터의 토크 해제까지 건너뛰게 됩니다. 반환: 통신 성공 여부."""
+    from lerobot.motors.motors_bus import get_address
+    m = bus.motors[motor]
+    addr, n = get_address(bus.model_ctrl_table, m.model, reg)
+    for _ in range(tries):
+        try:
+            comm, _err = bus._write(addr, n, m.id, value, raise_on_error=False)
+        except Exception:
+            continue
+        if bus._is_comm_success(comm):
+            return True
+    return False
+
+
+def torque_off_all(bus):
+    """모든 모터 Torque_Enable=0 (+ Lock=0). 한 모터가 실패해도 끝까지 갑니다. 반환: 실패한 모터 목록."""
+    try:
+        bus.port_handler.clearPort()
+        bus.port_handler.is_using = False
+    except Exception:
+        pass
+    failed = []
+    for motor in bus.motors:
+        if not _write_nothrow(bus, motor, "Torque_Enable", 0):
+            failed.append(motor)
+        _write_nothrow(bus, motor, "Lock", 0, tries=1)
+    return failed
+
+
+def close_arm(dev, disable_torque=True):
+    """SOFollower/SOLeader 하나를 최대한 닫습니다. 연결 도중 실패해 is_connected 가 False 여도
+    (카메라 하나 실패 등) 열린 포트·카메라를 모두 정리합니다. 예외를 내지 않습니다."""
+    bus = getattr(dev, "bus", None)
+    try:
+        if bus is not None and bus.is_connected:
+            if disable_torque:
+                torque_off_all(bus)
+            bus.port_handler.closePort()
+    except Exception:
+        pass
+    for cam in (getattr(dev, "cameras", None) or {}).values():
+        try:
+            if cam.is_connected:
+                cam.disconnect()
+        except Exception:
+            pass
+
+
+def connect_follower(dev):
+    """SOFollower.connect(calibrate=False) 와 같은 일을 하되 순서를 안전하게 바꿉니다.
+
+    lerobot 원본은 configure() 를 'with bus.torque_disabled()' 안에서 돌리고, 빠져나올 때
+    토크를 다시 켭니다 (+ Lock=1). 그러면 ① RAM 에 남은 이전 Goal_Position 으로 팔이 튀고
+    ② 그 뒤에 쓰는 캘리브레이션(Homing_Offset)이 토크가 켜진 채로 들어가 기준점이 움직입니다.
+    여기서는 토크를 끈 상태에서 캘리브레이션을 먼저 쓰고, Goal_Position=현재 위치로 맞춘 뒤 configure 합니다.
+    끝나면 lerobot 과 똑같이 토크가 켜진 상태입니다. 실패하면 포트·카메라를 닫고 예외를 다시 던집니다."""
+    bus = dev.bus
+    try:
+        # lerobot bus.connect 는 핸드셰이크(모터 확인) 실패 때 포트를 연 채로 예외를 냅니다 — 여기서 같이 닫습니다
+        bus.connect()
+        torque_off_all(bus)
+        if dev.calibration and not bus.is_calibrated:
+            bus.write_calibration(dev.calibration)
+        pos = bus.sync_read("Present_Position", normalize=False)
+        bus.sync_write("Goal_Position", pos, normalize=False)
+        for cam in dev.cameras.values():
+            cam.connect()
+        dev.configure()
+    except Exception:
+        close_arm(dev)
+        raise
+
+
+def connect_leader(dev):
+    """SOLeader.connect(calibrate=False) + 캘리브레이션 파일을 보드에 씀. 리더는 configure 가 토크를 끕니다."""
+    try:
+        dev.connect(calibrate=False)
+        if dev.calibration and not dev.bus.is_calibrated:
+            dev.bus.write_calibration(dev.calibration)
+    except Exception:
+        close_arm(dev, disable_torque=False)
+        raise
 
 
 # ----------------------------- 수동 제어 (Control 탭) -------------------------
@@ -935,9 +1156,7 @@ class ArmCtl:
         from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
         if not self.cfg.get("follower_port"):
             raise RuntimeError("팔로워 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
-        # ensure_safe_goal_position 은 float 만 받습니다 (int 면 TypeError) — 반드시 캐스팅
-        mrt = CFG.get("max_relative_target")
-        mrt = float(mrt) if isinstance(mrt, (int, float)) and not isinstance(mrt, bool) else None
+        mrt = mrt_value(CFG.get("max_relative_target"))
         cfg = SOFollowerRobotConfig(
             id=self.cfg["follower_id"],
             port=self.cfg["follower_port"],
@@ -949,13 +1168,21 @@ class ArmCtl:
         if not robot.calibration:
             raise RuntimeError(
                 f"캘리브레이션 파일이 없습니다: {robot.calibration_fpath} — Calib 탭에서 만드세요")
-        robot.connect(calibrate=False)      # calibrate=True 면 input() 에서 서버가 멈춥니다
-        if not robot.bus.is_calibrated:
-            # 파일과 모터 EEPROM 이 어긋난 경우 — lerobot calibrate() 의 '파일 사용' 분기와 동일
-            robot.bus.write_calibration(robot.calibration)
-        self.robot = robot
-        self._build_limits()
-        self.actual = self.read()
+        # 캘리브레이션 파일을 보드에 쓰고(어긋난 경우) configure 까지 — 토크가 켜진 채로 끝납니다
+        connect_follower(robot)
+        try:
+            # Control 은 '토크 꺼짐' 으로 시작합니다 (화면 표시와 실제를 일치시킴).
+            # 켤 때는 set_torque 가 현재 위치를 목표로 쓰고 켭니다.
+            failed = torque_off_all(robot.bus)
+            if failed:
+                raise RuntimeError(f"토크 해제 실패: {', '.join(failed)} — 전원·케이블 확인")
+            self.robot = robot
+            self._build_limits()
+            self.actual = self.read()
+        except Exception:
+            self.robot = None
+            close_arm(robot)
+            raise
         self.target = dict(self.actual)
         self.cmd = dict(self.actual)
         self.track = dict.fromkeys(CTL_JOINTS, 0.0)
@@ -988,10 +1215,7 @@ class ArmCtl:
         self.stop_loop()
         with self.lock:
             if self.robot is not None:
-                try:
-                    self.robot.disconnect()     # disable_torque_on_disconnect=True 가 기본
-                except Exception:
-                    pass
+                close_arm(self.robot)           # 토크 해제(모터별로 끝까지) + 포트 닫기
             self.robot = None
             self.torque = False
             self.follow = False
@@ -1072,10 +1296,19 @@ class ArmCtl:
                 self.target = dict(self.actual)
                 self.cmd = dict(self.actual)
                 self.robot.send_action({f"{k}.pos": v for k, v in self.actual.items()})
-                self.robot.bus.enable_torque()
+                try:
+                    self.robot.bus.enable_torque()
+                except Exception as e:
+                    # 한 모터(과부하 보호 등)에서 멈추면 앞쪽 모터만 켜진 채로 남습니다 — 전부 다시 끕니다
+                    torque_off_all(self.robot.bus)
+                    self.torque = False
+                    raise RuntimeError(f"토크 켜기 실패 — 전부 다시 껐습니다: {e}") from e
                 self._last_goal = {}
             else:
-                self.robot.bus.disable_torque()
+                failed = torque_off_all(self.robot.bus)
+                self.torque = False
+                if failed:
+                    raise RuntimeError(f"토크 해제 실패: {', '.join(failed)}")
             self.torque = on
 
     def step(self):
@@ -1130,9 +1363,7 @@ class LeaderCtl:
         if not tele.calibration:
             raise RuntimeError(
                 f"리더 캘리브레이션 파일이 없습니다: {tele.calibration_fpath} — Calib 탭에서 만드세요")
-        tele.connect(calibrate=False)
-        if not tele.bus.is_calibrated:
-            tele.bus.write_calibration(tele.calibration)
+        connect_leader(tele)
         self.tele = tele
 
     def read(self):
@@ -1144,10 +1375,9 @@ class LeaderCtl:
     def disconnect(self):
         with self.lock:
             if self.tele is not None:
-                try:
-                    self.tele.disconnect()
-                except Exception:
-                    pass
+                # 리더는 토크가 원래 꺼져 있습니다. 토크 해제 재시도(전원 없으면 수 초)를 건너뛰어
+                # E-STOP 이 리더 때문에 늦어지지 않게 합니다.
+                close_arm(self.tele, disable_torque=False)
             self.tele = None
 
 
@@ -1168,6 +1398,7 @@ class CamStreamer:
             from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
         except ImportError:
             return False
+        self.close()          # 이전 스트림 스레드가 카메라를 다 놓을 때까지 기다립니다
         self.cams = {}
         self.errors = {}
         for name, spec in CAM_SPECS.items():
@@ -1187,15 +1418,16 @@ class CamStreamer:
         if not self.cams:
             return False
         self.on = True
-        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread = threading.Thread(target=self._loop, args=(self.cams,), daemon=True)
         self.thread.start()
         return True
 
-    def _loop(self):
+    def _loop(self, cams):
+        # cams 는 이 스레드 몫의 로컬 참조 — 새 open() 이 만든 카메라를 옛 스레드가 지우지 않게
         import cv2
-        while self.on:
+        while self.on and self.cams is cams:
             t0 = time.monotonic()
-            for name, cam in self.cams.items():
+            for name, cam in cams.items():
                 try:
                     frame = cam.read_latest(max_age_ms=1000)
                 except Exception:
@@ -1204,16 +1436,20 @@ class CamStreamer:
                 if ok:
                     self.frames[name] = buf.tobytes()
             time.sleep(max(0.0, 1.0 / CTL_STREAM_FPS - (time.monotonic() - t0)))
-        for cam in self.cams.values():
+        for cam in cams.values():
             try:
                 cam.disconnect()
             except Exception:
                 pass
-        self.cams = {}
-        self.frames = {}
+        if self.cams is cams:
+            self.cams = {}
+            self.frames = {}
 
     def close(self):
         self.on = False
+        t, self.thread = self.thread, None
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=3)
 
 
 CAMS = CamStreamer()
@@ -1608,9 +1844,17 @@ class ArmCheckSession:
 
     def _remember(self):
         d = self.rep.as_dict()
-        self.history[self.port] = {"verdict": d["verdict"], "code": d["code"], "power": d["power"],
-                                   "role": self.role, "when": time.strftime("%H:%M"),
-                                   "missing": [j for j, m in d["motors"].items() if m.get("model") is None]}
+        self.history[self.port] = {
+            "verdict": d["verdict"], "code": d["code"], "power": d["power"],
+            "role": self.role, "when": time.strftime("%H:%M"),
+            "missing": [j for j, m in d["motors"].items() if m.get("model") is None],
+            # 3D 에서 모터 색으로 보여 줄 관절별 판정
+            "levels": {j: ("MISSING" if m.get("model") is None else m.get("level"))
+                       for j, m in d["motors"].items()},
+            # 모터 EEPROM 에 남아 있는 캘리브레이션 (lerobot write_calibration 이 쓰는 3개 레지스터)
+            "eeprom": {j: {"homing_offset": m.get("homing"), "range_min": m.get("min_lim"),
+                           "range_max": m.get("max_lim")}
+                       for j, m in d["motors"].items() if m.get("model") is not None}}
 
     def _sample(self):
         import tools_armcheck as AC
@@ -1787,7 +2031,7 @@ def busy_with(kinds):
 
 def robot_busy():
     """팔(시리얼)을 쓰는 작업: record/rollout + Control 탭 수동 제어 + Setup 포트 감시"""
-    if any_arm_connected():
+    if any_arm_connected() or CTL_OWNER is not None:
         return {"id": "manual-control", "kind": "control", "alive": True}
     if WATCH.on:
         return {"id": "port-watch (Setup 탭)", "kind": "setup", "alive": True}
@@ -1808,7 +2052,7 @@ def gpu_or_loop_busy():
 
 
 def exclusive_busy():
-    if any_arm_connected():
+    if any_arm_connected() or CTL_OWNER is not None:     # 연결 중(약 1초)도 점유로 봅니다
         return {"id": "manual-control (Control 탭)", "kind": "control", "alive": True}
     if WATCH.on:
         return {"id": "port-watch (Setup 탭)", "kind": "setup", "alive": True}
@@ -2114,7 +2358,7 @@ async def api_project_save(req: Request):
     if not old and b.get("activate"):
         d["active"] = name
     save_projects(d)
-    return projects_view()
+    return await asyncio.to_thread(projects_view)
 
 
 @app.post("/api/projects/activate")
@@ -2126,7 +2370,7 @@ async def api_project_activate(req: Request):
         return JSONResponse({"error": f"프로젝트 없음: {name}"}, status_code=400)
     d["active"] = name
     save_projects(d)
-    return projects_view()
+    return await asyncio.to_thread(projects_view)
 
 
 @app.post("/api/projects/delete")
@@ -2140,7 +2384,7 @@ async def api_project_delete(req: Request):
     if d["active"] == name:
         d["active"] = ""
     save_projects(d)
-    return projects_view()
+    return await asyncio.to_thread(projects_view)
 
 
 @app.post("/api/projects/assign")
@@ -2154,7 +2398,7 @@ async def api_project_assign(req: Request):
         assign_to_project(kind, item, (b.get("project") or "").strip())
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    return projects_view()
+    return await asyncio.to_thread(projects_view)
 
 
 @app.get("/projects", response_class=HTMLResponse)
@@ -2176,7 +2420,7 @@ def index(all: int = 0):
     def _row(d):
         n = d["name"]
         mismatch = ' <span class="badge b-warn">모드 불일치</span>' \
-            if d["robot_type"] and d["robot_type"] != robot_name() else ""
+            if not robot_type_ok(d["robot_type"]) else ""
         ver = d["version"]
         verbadge = (f'<span class=badge>{esc(ver)}</span>' if ver == "v3.0"
                     else f'<span class="badge b-warn">{esc(ver)}</span>')
@@ -2254,13 +2498,13 @@ def api_delete_dataset(ds: str):
     if not safe_name(ds):
         return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
     p = (DATA_ROOT / ds).resolve()
-    if not str(p).startswith(str(DATA_ROOT.resolve())) or not p.exists():
+    if not _within(p, DATA_ROOT) or not p.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
     if not (p / "meta/info.json").exists():
         return JSONResponse({"error": "데이터셋 폴더가 아님"}, status_code=400)
-    for j in jobs_index():
-        if j["alive"] and ds in j.get("cmd", ""):
-            return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 데이터셋을 사용 중"}, status_code=400)
+    j = dataset_busy(ds)
+    if j:
+        return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 데이터셋을 사용 중"}, status_code=400)
     shutil.rmtree(p)
     m = load_marks()
     m.pop(ds, None)
@@ -2348,15 +2592,15 @@ def api_download_dataset(ds: str):
     if not safe_name(ds):
         return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
     root = (DATA_ROOT / ds).resolve()
-    if not str(root).startswith(str(DATA_ROOT.resolve())) or not root.is_dir():
+    if not _within(root, DATA_ROOT) or not root.is_dir():
         return JSONResponse({"error": "not found"}, status_code=404)
     info = load_json(root / "meta/info.json", {})
     if not info:
         return JSONResponse({"error": "meta/info.json 이 없습니다 — 데이터셋 폴더가 아님"}, status_code=400)
     # 수집 중인 데이터셋은 tar 를 뜨는 동안 파일이 계속 자라 무결성이 깨집니다.
-    rec = busy_with(("record",))
-    if rec and ds in rec.get("cmd", ""):
-        return JSONResponse({"error": f"{rec['id']} 가 이 데이터셋에 수집 중 — 끝난 뒤 받으세요"},
+    rec = dataset_busy(ds)
+    if rec and rec.get("kind") in ("record", "delete"):
+        return JSONResponse({"error": f"{rec['id']} 가 이 데이터셋을 쓰는 중 — 끝난 뒤 받으세요"},
                             status_code=409)
     ver = str(info.get("codebase_version", "unknown")).replace("/", "_")
     fname = f"{ds}_{ver}.tar"
@@ -2459,9 +2703,9 @@ async def api_rename_dataset(ds: str, req: Request):
         return JSONResponse({"error": "데이터셋 없음"}, status_code=404)
     if dst.exists():
         return JSONResponse({"error": f"이미 있는 이름: {new}"}, status_code=400)
-    for j in jobs_index():
-        if j["alive"] and str(src) in j.get("cmd", "") + json.dumps(j.get("spec") or {}):
-            return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 데이터셋을 사용 중"}, status_code=400)
+    j = dataset_busy(ds)
+    if j:
+        return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 데이터셋을 사용 중"}, status_code=400)
     await asyncio.to_thread(shutil.move, str(src), str(dst))
     m = load_marks()
     if ds in m:
@@ -2500,11 +2744,12 @@ def episode_page(ds: str, ep: int):
 def api_mark(ds: str, ep: int):
     if not safe_name(ds):
         return JSONResponse({"error": "잘못된 데이터셋 이름"}, status_code=400)
-    m = load_marks()
-    lst = set(m.get(ds, []))
-    lst.symmetric_difference_update({ep})
-    m[ds] = sorted(lst)
-    save_marks(m)
+    with META_LOCK:
+        m = load_marks()
+        lst = set(m.get(ds, []))
+        lst.symmetric_difference_update({ep})
+        m[ds] = sorted(lst)
+        save_marks(m)
     return {"ok": True, "marks": m[ds]}
 
 
@@ -2518,9 +2763,20 @@ def api_delete(ds: str):
     root = DATA_ROOT / ds
     if not root.exists():
         return JSONResponse({"error": "데이터셋 없음"}, status_code=400)
+    j = dataset_busy(ds)
+    if j:
+        return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 데이터셋을 사용 중"}, status_code=400)
+    # --new_root 를 같은 폴더로 줘야 '제자리 편집' 이 됩니다. 안 주면 HF_HOME 설정에 따라
+    # ~/.cache 쪽에 결과가 생기고 원본은 그대로 남습니다. 제자리 편집이면 lerobot 이 원본을
+    # <ds>_old 로 옮겨 백업합니다 (이미 있으면 lerobot 이 지우고 새로 만듦).
+    old = DATA_ROOT / f"{ds}_old"
+    if old.exists() and f"{ds}_old" in load_dsmeta():
+        return JSONResponse({"error": f"{ds}_old 라는 데이터셋이 따로 있습니다 — lerobot 이 백업하면서 지워버리므로 "
+                                      f"먼저 이름을 바꾸세요"}, status_code=400)
     argv = ["lerobot-edit-dataset",
             "--repo_id", f"local/{ds}",
             "--root", str(root),
+            "--new_root", str(root),
             "--operation.type", "delete_episodes",
             "--operation.episode_indices", str(sorted(marks))]
     try:
@@ -2546,8 +2802,8 @@ def collect_page(resume: str = ""):
     mine = set(pr["datasets"]) if pr else set()
     dsets = sorted(list_datasets(), key=lambda d: (d["name"] not in mine, d["name"]))
     resume_opts = "".join(
-        f'<option value="{esc(d["name"])}" {"" if d["robot_type"] in ("", robot_name()) else "disabled"}>'
-        f'{esc(d["name"])} ({esc(d["episodes"])}ep{"" if d["robot_type"] in ("", robot_name()) else " · " + esc(d["robot_type"]) + " — 모드 불일치"})'
+        f'<option value="{esc(d["name"])}" {"" if robot_type_ok(d["robot_type"]) else "disabled"}>'
+        f'{esc(d["name"])} ({esc(d["episodes"])}ep{"" if robot_type_ok(d["robot_type"]) else " · " + esc(d["robot_type"]) + " — 모드 불일치"})'
         f'{" · 다른 프로젝트/미분류" if pname and d["name"] not in mine else ""}</option>'
         for d in dsets)
     task0 = (pr["task"] if pr and pr["task"] else CFG["default_task"])
@@ -2672,6 +2928,9 @@ async def api_record(req: Request):
     bad = await asyncio.to_thread(_preflight_ports)
     if bad:
         return JSONResponse({"error": "포트 점검 실패\n\n" + "\n".join(bad)}, status_code=400)
+    busy = exclusive_busy()      # 점검하는 몇 초 사이에 Control 등이 포트를 잡았을 수 있습니다
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 종료 후 시작하세요"}, status_code=400)
     if b.get("mode") == "resume":
         ds = (b.get("resume_ds") or "").strip()
         if not safe_name(ds):
@@ -2680,9 +2939,12 @@ async def api_record(req: Request):
         if not (root / "meta/info.json").exists():
             return JSONResponse({"error": "데이터셋 없음"}, status_code=400)
         rt = load_json(root / "meta/info.json", {}).get("robot_type", "")
-        if rt and rt != robot_name():
+        if not robot_type_ok(rt):
             return JSONResponse({"error": f"데이터셋은 {rt} 로 수집됨 — 현재 모드({robot_name()})와 다릅니다"},
                                 status_code=400)
+        j = dataset_busy(ds)
+        if j:
+            return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 데이터셋을 사용 중"}, status_code=400)
         resume, name = True, ds
     else:
         name = (b.get("name") or "").strip()
@@ -2696,7 +2958,8 @@ async def api_record(req: Request):
             "cameras": json.loads(json.dumps(CFG["cameras"])), "fps": int(CFG["fps"]),
             "task": task, "num_episodes": neps, "episode_time_s": ept,
             "repo_id": f"local/{name}", "root": str(DATA_ROOT / name), "resume": resume,
-            "streaming_encoding": bool(CFG.get("streaming_encoding", False))}
+            "streaming_encoding": bool(CFG.get("streaming_encoding", False)),
+            "max_relative_target": mrt_value(CFG.get("max_relative_target"))}
     try:
         jid = start_job("record", [sys.executable, str(Path(__file__).resolve()), "--worker", "record", "{jid}"],
                         spec=spec)
@@ -2718,7 +2981,7 @@ def api_record_status(jid: str):
         return JSONResponse({"error": "잘못된 작업 id"}, status_code=400)
     j = load_json(JOB_DIR / f"{jid}.json", {})
     return JSONResponse({"status": record_status(jid), "tail": log_tail(jid),
-                         "alive": pid_alive(j.get("pid"))})
+                         "alive": job_alive(j)})
 
 
 @app.post("/api/sendkey/{jid}/{key}")
@@ -2734,7 +2997,7 @@ def api_joblog(jid: str):
     if not safe_name(jid):
         return JSONResponse({"error": "잘못된 작업 id"}, status_code=400)
     j = load_json(JOB_DIR / f"{jid}.json", {})
-    return JSONResponse({"tail": log_tail(jid), "alive": pid_alive(j.get("pid"))})
+    return JSONResponse({"tail": log_tail(jid), "alive": job_alive(j)})
 
 
 # ----------------------------- 페이지: 학습 ----------------------------------
@@ -2771,7 +3034,7 @@ def train_page():
     <script>
     async function startTrain(e){{
       e.preventDefault();
-      const b={{dataset:ds.value,name:document.getElementById('name').value,
+      const b={{dataset:document.getElementById('ds').value,name:document.getElementById('name').value,
                steps:document.getElementById('steps').value,batch:document.getElementById('batch').value}};
       const r=await fetch('/api/train',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
       const d=await r.json();
@@ -2789,6 +3052,7 @@ def train_page():
       document.getElementById('which').textContent=d.current||'로그 없음';
       document.getElementById('tail').textContent=d.tail||'';
       const xs=d.points.map(p=>p[0]),ys=d.points.map(p=>p[1]);
+      if(!window.Chart) return;              // CDN 을 못 받으면(오프라인) 그래프만 생략
       if(!chart){{chart=new Chart(document.getElementById('chart'),{{type:'line',
         data:{{labels:xs,datasets:[{{label:'loss',data:ys,borderColor:'#5d9dd6',
           backgroundColor:'rgba(93,157,214,.08)',fill:true,pointRadius:0,borderWidth:1.5}}]}},
@@ -2831,7 +3095,7 @@ async def api_train(req: Request):
         else:
             return JSONResponse({"error": f"{name}_2 ~ _999 가 모두 존재합니다 — 이름을 바꾸세요"},
                                 status_code=400)
-    argv = ["python", "-m", "lerobot.scripts.lerobot_train",
+    argv = [sys.executable, "-m", "lerobot.scripts.lerobot_train",
             f"--dataset.repo_id=local/{ds}", f"--dataset.root={root}",
             "--policy.type=act", f"--output_dir={out}",
             f"--steps={steps}", f"--batch_size={batch}", "--num_workers=4",
@@ -2881,7 +3145,7 @@ def api_trainlog():
                         pass
     except Exception:
         pass
-    status = "running" if pid_alive(j["pid"]) else "finished"
+    status = "running" if job_alive(j) else "finished"
     return JSONResponse({"points": pts[-2000:], "tail": log_tail(j["id"]),
                          "current": f'{j["id"]} [{status}]'})
 
@@ -2920,7 +3184,7 @@ def rollout_page():
     ck_opts = ""
     for c in ckpts:
         rt = checkpoint_robot_type(c)
-        bad = bool(rt) and rt != robot_name()
+        bad = not robot_type_ok(rt)
         other = pname and c.split("/checkpoints/")[0] not in mine
         ck_opts += (f'<option value="{esc(c)}" {"disabled" if bad else ""}>{esc(c)}'
                     f'{" · " + esc(rt) + " — 모드 불일치" if bad else (" · " + esc(rt) if rt else "")}'
@@ -2979,16 +3243,16 @@ async def api_rollout(req: Request):
     b = await req.json()
     rel = b.get("ckpt", "")
     ck = (OUT_ROOT / rel).resolve()
-    if not str(ck).startswith(str(OUT_ROOT.resolve())) or not ck.is_dir():
-        return JSONResponse({"error": "체크포인트 없음"}, status_code=400)
+    if not rel or not _within(ck, OUT_ROOT) or not (ck / "config.json").is_file():
+        return JSONResponse({"error": "체크포인트 없음 — 목록에서 고르세요"}, status_code=400)
     dur = _clamp_int(b.get("duration"), 60, 0, 86400)
     task = (b.get("task") or CFG["default_task"]).strip()
     rt = checkpoint_robot_type(rel)
-    if rt and rt != robot_name():
+    if not robot_type_ok(rt):
         return JSONResponse({"error": f"체크포인트는 {rt} 데이터로 학습됨 — 현재 모드({robot_name()})와 다릅니다"},
                             status_code=400)
     try:
-        argv = (["python", "-m", "lerobot.scripts.lerobot_rollout", f"--policy.path={ck}"] + robot_cli_args()
+        argv = ([sys.executable, "-m", "lerobot.scripts.lerobot_rollout", f"--policy.path={ck}"] + robot_cli_args()
                 + ["--strategy.type=base", f"--duration={dur}", f"--task={task}",
                    f"--fps={CFG['fps']}"])
     except (NotImplementedError, ValueError) as e:
@@ -3008,22 +3272,35 @@ async def api_delete_checkpoint(req: Request):
     if "/checkpoints/" not in rel:
         return JSONResponse({"error": "체크포인트 경로 아님"}, status_code=400)
     run = rel.split("/checkpoints/")[0]
-    run_path = str((OUT_ROOT / run).resolve())
+    run_path = os.path.realpath(OUT_ROOT / run)
+
+    def uses_run(j):
+        # 학습(--output_dir)·추론(--policy.path) 인자를 실제 경로로 비교 (act_x 가 act_x_2 에 걸리지 않게)
+        for a in j.get("argv") or (j.get("cmd") or "").split():
+            k, sep, v = a.partition("=")
+            if k in ("--output_dir", "--policy.path") and v:
+                rv = os.path.realpath(v)
+                if rv == run_path or rv.startswith(run_path + os.sep):
+                    return True
+        return False
     for j in jobs_index():
-        if j["alive"] and run_path in j.get("cmd", ""):
+        if j["alive"] and uses_run(j):
             return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 출력을 사용 중"}, status_code=400)
     if scope == "run":
-        target = (OUT_ROOT / run).resolve()
+        raw = OUT_ROOT / run
     else:
         step = rel.split("/checkpoints/")[1].split("/")[0]
         if step == "last":
             return JSONResponse({"error": "last는 심볼릭 링크 — 숫자 체크포인트를 선택하세요"}, status_code=400)
-        target = (OUT_ROOT / run / "checkpoints" / step).resolve()
-    if not str(target).startswith(str(OUT_ROOT.resolve())) or not target.exists():
-        return JSONResponse({"error": "대상 없음"}, status_code=400)
-    if target.is_symlink():
+        raw = OUT_ROOT / run / "checkpoints" / step
+    if raw.is_symlink():
         return JSONResponse({"error": "심볼릭 링크는 삭제하지 않음"}, status_code=400)
-    shutil.rmtree(target)
+    target = raw.resolve()
+    # rel='/checkpoints/x' 처럼 run 이 비면 target 이 outputs 자체가 됩니다 — 반드시 막습니다
+    if (not run.strip("/") or not _within(target, OUT_ROOT) or target == OUT_ROOT.resolve()
+            or not target.exists()):
+        return JSONResponse({"error": "대상 없음"}, status_code=400)
+    await asyncio.to_thread(shutil.rmtree, target)     # 수 GB 면 수 초 — 이벤트 루프(E-STOP 포함)를 막지 않게
     if scope == "run":
         assign_to_project("models", run, "")
     return {"ok": True}
@@ -3247,7 +3524,8 @@ function openWS(){{
         updateRobot(side,a.actual);
       }});
       document.getElementById('warnbox').innerHTML=warn;
-      if(d.err){{cst.textContent='bus error';cst.classList.add('b-bad');}}
+      if(d.err){{ if(cst.textContent!=='bus error') setStatus('bus error','b-bad'); }}
+      else if(cst.textContent==='bus error') setStatus('연결됨','b-ok');     // 오류가 풀리면 배지도 되돌림
     }}
   }};
   // 서버는 오류를 보낸 직후 소켓을 닫습니다. 사유를 지우지 말 것 —
@@ -3287,7 +3565,7 @@ function showViewMsg(t){{
   function resize(){{const w=view.clientWidth,h=view.clientHeight;ren.setSize(w,h);cam.aspect=w/h;cam.updateProjectionMatrix();}}
   new ResizeObserver(resize).observe(view); resize();
   const picker=document.getElementById('armcolor');
-  picker.value=localStorage.getItem('armColor2')||'#ffffff';
+  try{{ picker.value=localStorage.getItem('armColor2')||'#ffffff'; }}catch(e){{ picker.value='#ffffff'; }}
   function applyColor(hex){{
     Object.values(robots).forEach(r=>r.traverse(o=>{{
       if(!o.isMesh) return;
@@ -3306,7 +3584,7 @@ function showViewMsg(t){{
         o.material.color.set(hex);
       }}
     }}));
-    localStorage.setItem('armColor2',hex);
+    try{{ localStorage.setItem('armColor2',hex); }}catch(e){{}}
   }}
   picker.addEventListener('input',()=>applyColor(picker.value));
   // URDFLoader.load 의 콜백은 parse 직후에 불립니다 — STL 은 아직 로딩 중입니다.
@@ -3388,7 +3666,9 @@ async def ws_control(sock: WebSocket):
     global CTL_OWNER
     await sock.accept()
     if not ws_authed(sock):
-        await sock.send_text(json.dumps({"type": "init", "error": "인증 필요 — 페이지를 새로고침하세요"}))
+        msg = ("다른 사이트에서 온 연결은 받지 않습니다" if not _same_origin(sock.headers)
+               else "인증 필요 — 페이지를 새로고침하세요")
+        await sock.send_text(json.dumps({"type": "init", "error": msg}))
         await sock.close()
         return
     if (busy_with(("record", "rollout")) or WATCH.on or CALIB.active or MOTORSETUP.active
@@ -3408,7 +3688,7 @@ async def ws_control(sock: WebSocket):
                     await asyncio.to_thread(arm.connect)
         except Exception as e:
             for arm in ARMS.values():
-                arm.disconnect()
+                await asyncio.to_thread(arm.disconnect)
             await sock.send_text(json.dumps({"type": "init", "error": f"팔 연결 실패: {e}"}))
             return
 
@@ -3422,8 +3702,28 @@ async def ws_control(sock: WebSocket):
         synced = False   # 토크 토글 직후 슬라이더 동기화 신호 1회
 
         def _set_torque_all(on):
+            # 팔마다 따로 — 한 팔이 실패해도 나머지 팔은 반드시 처리합니다
+            errs = []
             for a in ARMS.values():
-                a.set_torque(on)
+                try:
+                    a.set_torque(on)
+                except Exception as e:
+                    errs.append(f"{a.side}: {e}")
+            if errs:
+                raise RuntimeError(" / ".join(errs))
+
+        def _estop():
+            # 팔로워 토크부터 끕니다. 리더 정리는 그다음 (전원 없는 리더는 응답 대기로 늦어질 수 있음)
+            for a in ARMS.values():
+                a.follow = False
+            err = None
+            try:
+                _set_torque_all(False)
+            except Exception as e:
+                err = e
+            _leaders_off()
+            if err:
+                raise err
 
         def _leaders_off():
             for side, ldr in LEADERS.items():
@@ -3448,11 +3748,14 @@ async def ws_control(sock: WebSocket):
                     d = json.loads(msg)
                 except ValueError:
                     continue
+                if not isinstance(d, dict):
+                    continue
                 kind = d.get("type")
                 if kind == "target":
                     arm = ARMS.get(d.get("side"))
-                    if arm:
-                        for k, v in (d.get("joints") or {}).items():
+                    js_ = d.get("joints")
+                    if arm and isinstance(js_, dict):
+                        for k, v in js_.items():
                             if k in CTL_JOINTS:
                                 try:
                                     arm.target[k] = float(v)
@@ -3466,8 +3769,7 @@ async def ws_control(sock: WebSocket):
                         _first_arm().err = str(e)
                 elif kind == "estop":
                     try:
-                        await asyncio.to_thread(_leaders_off)
-                        await asyncio.to_thread(_set_torque_all, False)
+                        await asyncio.to_thread(_estop)
                     except Exception as e:
                         _first_arm().err = str(e)
                 elif kind == "follow":
@@ -3503,14 +3805,22 @@ async def ws_control(sock: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        CTL_OWNER = None
-        CAMS.close()                      # 탭 이탈 = 카메라 해제
-        for arm in ARMS.values():
-            arm.stop_loop()
-        for ldr in LEADERS.values():
-            ldr.disconnect()
-        for arm in ARMS.values():
-            arm.disconnect()              # + 토크 해제 + 시리얼 해제
+        def _cleanup():
+            global CTL_OWNER
+            try:
+                CAMS.close()              # 탭 이탈 = 카메라 해제
+                for arm in ARMS.values():
+                    arm.stop_loop()
+                for arm in ARMS.values():
+                    arm.disconnect()      # 토크 해제 + 시리얼 해제 (팔로워 먼저)
+                for ldr in LEADERS.values():
+                    ldr.disconnect()
+            finally:
+                CTL_OWNER = None          # 정리가 끝난 뒤에야 다른 작업이 포트를 잡을 수 있습니다
+        # 시리얼 재시도·스레드 join 이 이벤트 루프를 몇 초씩 막지 않도록 스레드에서 돌립니다.
+        # run_in_executor 는 부르는 즉시 스레드가 시작되므로, 이 태스크가 취소돼도(서버 종료 등) 정리는 끝까지 갑니다.
+        fut = asyncio.get_running_loop().run_in_executor(None, _cleanup)
+        await asyncio.shield(fut)
 
 
 def _first_arm():
@@ -3543,7 +3853,7 @@ def _mjpeg_from_files(jid, cam):
                     yield (boundary + b"\r\nContent-Type: image/jpeg\r\n"
                            + f"Content-Length: {len(data)}\r\n\r\n".encode() + data + b"\r\n")
             idle += 1
-            if idle % 20 == 0 and not pid_alive(load_json(jf, {}).get("pid")):
+            if idle % 20 == 0 and not job_alive(load_json(jf, {})):
                 break
             time.sleep(1.0 / PREVIEW_FPS)
 
@@ -3581,7 +3891,7 @@ def stream_cam(cam: str):
 @app.get("/urdf/{rest:path}")
 def serve_urdf(rest: str):
     p = (URDF_DIR / rest).resolve()
-    if not str(p).startswith(str(URDF_DIR.resolve())) or not p.exists():
+    if not _within(p, URDF_DIR) or not p.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(p)
 
@@ -3649,7 +3959,7 @@ def validate_config(cfg):
             return "양팔 id 형식 오류"
         except ValueError as e:
             return str(e)
-    seen_ports, cam_names, calib_ids = {}, set(), {}
+    seen_ports, cam_names, calib_ids, raw_arm_cams = {}, set(), {}, set()
     for arm in arms:
         if not isinstance(arm, dict):
             return "arms 원소 형식 오류"
@@ -3684,6 +3994,7 @@ def validate_config(cfg):
             err = _validate_cam(name, spec, arm_cam_names)
             if err:
                 return err
+            raw_arm_cams.add(name)
             full = f"{side}_{name}" if len(arms) > 1 else name
             if full in cam_names:
                 return f"카메라 이름 충돌: {full}"
@@ -3694,6 +4005,9 @@ def validate_config(cfg):
             return err
         if name in cam_names:
             return f"공용 카메라 이름이 팔 카메라와 충돌: {name}"
+        # BiSOFollower 는 공용 카메라를 왼팔이 같이 엽니다 — 팔 카메라 원래 이름(wrist)과 같으면 거부됩니다
+        if mode == "bimanual" and name in raw_arm_cams:
+            return f"공용 카메라 이름 {name} 이 팔 카메라 이름과 같습니다 — lerobot 양팔 규칙상 쓸 수 없습니다"
         cam_names.add(name)
     try:
         if not 1 <= int(cfg.get("fps", 30)) <= 120:
@@ -3898,12 +4212,16 @@ def wizard_state():
             mtime = Path(c["path"]).stat().st_mtime if c["ok"] else 0
             v = w.get(f"{side}|{role}", {})
             fresh = bool(v.get("verified")) and v.get("verified_ts", 0) >= mtime and v.get("port") == port
+            dg = ARMCHECK.history.get(port) if port else None
+            ee = (dg or {}).get("eeprom")
+            fcmp, fdiff = file_calib_compare(c["path"], ee) if c["ok"] else ("none", [])
             slots.append({
                 "side": side, "role": role, "port": port, "dev": pe["dev"] if pe else "",
                 "port_ok": pe is not None, "usb": (pe or {}).get("usb") or {},
                 "calib": {"ok": c["ok"], "id": c["id"], "path": c["path"],
                           "when": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)) if mtime else ""},
-                "diag": ARMCHECK.history.get(port),
+                "diag": dg,
+                "board": {"calib": board_calib_summary(ee), "file": fcmp, "diff": fdiff},
                 "verified": v.get("verified") if fresh else None,
                 "verified_stale": bool(v.get("verified")) and not fresh})
     busy = exclusive_busy()
@@ -3996,6 +4314,190 @@ async def api_wizard_verified(req: Request):
         "port": ARM_CFGS[side].get(f"{role}_port") or ""}
     save_json(WIZARD_FILE, d)
     return wizard_state()
+
+
+def board_calib_summary(eeprom):
+    """모터 EEPROM 의 Homing_Offset / Min·Max_Position_Limit 로 '보드에 캘리브레이션이 남아 있는지' 판정.
+    공장 출고값(오프셋 0, 범위 0~4095)이면 캘리브레이션 안 된 것입니다. wrist_roll 은 원래 0~4095 라 제외.
+    반환: calibrated | default | partial | unknown"""
+    if not eeprom or len(eeprom) < len(CTL_JOINTS):
+        return "unknown"
+    states = []
+    for j in CTL_JOINTS:
+        e = eeprom.get(j) or {}
+        h, lo, hi = e.get("homing_offset"), e.get("range_min"), e.get("range_max")
+        if h is None or lo is None or hi is None:
+            return "unknown"
+        if not 0 <= lo < hi <= 4095:
+            states.append("bad")
+        elif j != FULL_TURN_MOTOR:
+            states.append("default" if (h, lo, hi) == (0, 0, 4095) else "cal")
+    if all(x == "cal" for x in states):
+        return "calibrated"
+    if all(x == "default" for x in states):
+        return "default"
+    return "partial"
+
+
+def file_calib_compare(path, eeprom):
+    """캘리브레이션 파일과 EEPROM 값 비교. 반환 (상태, 다른 관절 목록) — 상태: match | mismatch | none | unknown"""
+    try:
+        f = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return "none", []
+    if not eeprom:
+        return "unknown", []
+    diff = []
+    for j in CTL_JOINTS:
+        a, b = f.get(j) or {}, eeprom.get(j) or {}
+        if any(a.get(k) != b.get(k) for k in ("homing_offset", "range_min", "range_max")):
+            diff.append(j)
+    return ("mismatch" if diff else "match"), diff
+
+
+_IMPORT_LOCK = threading.Lock()
+
+
+def import_board_calibration(side, role):
+    """모터 EEPROM 에 남은 캘리브레이션을 읽어 lerobot 캘리브레이션 파일(JSON)로 씁니다.
+    physical-ai-studio 가 하는 것과 같은 일 — 이미 캘리브레이션된 팔을 새 PC 에 꽂았을 때 다시 안 해도 됩니다.
+    서보에는 아무것도 쓰지 않습니다 (읽기만). 기존 파일은 .bak 으로 남깁니다."""
+    import tools_armcheck as AC
+    arm = ARM_CFGS[side]
+    port = arm.get(f"{role}_port") or ""
+    if not port:
+        raise RuntimeError("포트가 지정되지 않았습니다")
+    with _IMPORT_LOCK:
+        io = AC.BusIO(port)
+        try:
+            eeprom, missing = {}, []
+            for j in CTL_JOINTS:
+                vals = {}
+                for reg, key in (("Homing_Offset", "homing_offset"), ("Min_Position_Limit", "range_min"),
+                                 ("Max_Position_Limit", "range_max")):
+                    v, _ = io.read(AC.IDS[j], reg)
+                    vals[key] = v
+                if None in vals.values():
+                    missing.append(j)
+                eeprom[j] = vals
+        finally:
+            io.close()
+    if missing:
+        raise RuntimeError("응답 없는 모터: " + ", ".join(missing) + " — 진단부터 통과하세요")
+    st = board_calib_summary(eeprom)
+    if st != "calibrated":
+        raise RuntimeError({"default": "보드에 캘리브레이션이 없습니다 (공장 출고값) — 캘리브레이션을 하세요",
+                            "partial": "일부 모터만 캘리브레이션돼 있습니다 — 캘리브레이션을 다시 하세요"}.get(st, st))
+    out = {j: {"id": AC.IDS[j], "drive_mode": 0, **eeprom[j]} for j in CTL_JOINTS}
+    path = calib_file(role, arm[f"{role}_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        shutil.copy2(path, path.with_suffix(".json.bak"))
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(out, indent=4))        # lerobot _save_calibration 과 같은 모양
+    os.replace(tmp, path)
+    # 진단 기록도 지금 값으로 갱신 (파일 비교가 바로 '일치' 로 보이도록)
+    h = ARMCHECK.history.get(port)
+    if h is not None:
+        h["eeprom"] = eeprom
+    return str(path)
+
+
+@app.post("/api/wizard/import_calib")
+async def api_wizard_import_calib(req: Request):
+    b = await req.json()
+    side, role = b.get("side"), b.get("role")
+    if side not in ARM_CFGS or role not in ("follower", "leader"):
+        return JSONResponse({"error": "side/role 이 잘못됨"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 끝난 뒤 하세요"}, status_code=400)
+    try:
+        path = await asyncio.to_thread(import_board_calibration, side, role)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    st = wizard_state()
+    st["imported"] = path
+    return st
+
+
+def convert_mode(cfg, mode):
+    """한팔 ↔ 양팔 전환 (Setup 탭 setMode 와 같은 규칙). 한팔의 팔은 왼팔이 되고, 양팔 → 한팔은 왼팔을 남깁니다.
+    id 가 바뀌어 캘리브레이션 파일을 못 찾게 되므로, 같은 팔(같은 포트)이 지금 쓰던 파일을 새 id 로 복사합니다.
+    반환 (새 설정, 복사 계획 [(원본, 대상)]) — 복사는 검증을 통과한 뒤 apply_calib_copies 로 합니다."""
+    cfg = json.loads(json.dumps(cfg))
+    if cfg["mode"] == mode:
+        return cfg, []
+    a = cfg["arms"][0]
+    old = {r: a[f"{r}_id"] for r in ("follower", "leader")}
+    if mode == "bimanual":
+        a["side"] = "left"
+        for r in ("follower", "leader"):
+            if a[f"{r}_id"] == r:
+                a[f"{r}_id"] = f"{r}_left"
+        a["view"] = {"x": 0.0, "y": 0.12, "yaw_deg": 0.0}
+        cfg["arms"] = [a, {"side": "right", "follower_port": "", "follower_id": "follower_right",
+                           "leader_port": "", "leader_id": "leader_right", "cameras": {},
+                           "view": {"x": 0.0, "y": -0.12, "yaw_deg": 0.0}}]
+    else:
+        a["side"] = "main"
+        for r in ("follower", "leader"):
+            if a[f"{r}_id"] == f"{r}_left":
+                a[f"{r}_id"] = r
+        a["view"] = {"x": 0.0, "y": 0.0, "yaw_deg": 0.0}
+        cfg["arms"] = [a]
+    cfg["mode"] = mode
+    plan = []
+    for r in ("follower", "leader"):
+        src, dst = calib_file(r, old[r]), calib_file(r, a[f"{r}_id"])
+        if src != dst and src.is_file() and a.get(f"{r}_port"):
+            if dst.is_file() and dst.read_bytes() == src.read_bytes():
+                continue
+            plan.append((src, dst))
+    return cfg, plan
+
+
+def apply_calib_copies(plan):
+    """대상에 다른 내용의 파일이 있으면 .bak 으로 남기고 덮어씁니다
+    (그 파일은 다른 팔 것일 수 있고, 남겨 두면 연결할 때 엉뚱한 값이 보드에 써집니다)."""
+    done = []
+    for src, dst in plan:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        note = ""
+        if dst.is_file():
+            shutil.copy2(dst, dst.with_suffix(".json.bak"))
+            note = " (기존 파일은 .bak)"
+        shutil.copy2(src, dst)
+        done.append(f"{src.name} → {dst.name}{note}")
+    return done
+
+
+@app.post("/api/wizard/mode")
+async def api_wizard_mode(req: Request):
+    b = await req.json()
+    mode = b.get("mode")
+    if mode not in ("single", "bimanual"):
+        return JSONResponse({"error": "mode 는 single 또는 bimanual"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 끝난 뒤 바꾸세요"}, status_code=400)
+    cfg, plan = convert_mode(CFG, mode)
+    err = validate_config(cfg)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    copied = apply_calib_copies(plan)
+    frm, to = ("main", "left") if mode == "bimanual" else ("left", "main")
+    _write_active_config(cfg)
+    sync_active_env()
+    d = _wiz_load()                  # 같은 팔의 '확인됨' 기록도 새 side 이름으로 옮깁니다
+    w = d.get(env_name(), {})
+    for r in ("follower", "leader"):
+        if f"{frm}|{r}" in w:
+            w[f"{to}|{r}"] = w.pop(f"{frm}|{r}")
+    save_json(WIZARD_FILE, d)
+    st = wizard_state()
+    st["copied"] = copied
+    return st
 
 
 @app.get("/setup/wizard", response_class=HTMLResponse)
@@ -4212,15 +4714,24 @@ window.mountArm3D = async function(el, sides, views){
   function resize(){ const w=el.clientWidth||320, h=el.clientHeight||240; ren.setSize(w,h); cam.aspect=w/h; cam.updateProjectionMatrix(); }
   new ResizeObserver(resize).observe(el); resize();
   let color='#ffffff'; try{ color=localStorage.getItem('armColor2')||'#ffffff'; }catch(e){}
-  const robots={};
-  function paint(r){
+  const robots={}, hl={};
+  // 관절을 움직이는 서보 = 그 관절의 부모 링크에 붙은 sts3215 메시 (URDF 구조)
+  const LINK2JOINT={base_link:'shoulder_pan',shoulder_link:'shoulder_lift',upper_arm_link:'elbow_flex',
+                    lower_arm_link:'wrist_flex',wrist_link:'wrist_roll',gripper_link:'gripper'};
+  function motorJoint(o){ for(let p=o.parent;p;p=p.parent){ if(p.isURDFLink) return LINK2JOINT[p.name]||null; } return null; }
+  function paint(r, side){
     r.traverse(o=>{
       if(!o.isMesh) return;
-      if(!o.userData.rc){ o.userData.m=(o.material&&o.material.name)||''; o.material=new THREE.MeshStandardMaterial({metalness:0.15,roughness:0.55}); o.userData.rc=1; }
-      if(o.userData.m==='sts3215'){ o.material.color.set('#1a1a1a'); o.material.roughness=0.35; } else o.material.color.set(color);
+      if(!o.userData.rc){ o.userData.m=(o.material&&o.material.name)||''; o.userData.j=motorJoint(o);
+        o.material=new THREE.MeshStandardMaterial({metalness:0.15,roughness:0.55}); o.userData.rc=1; }
+      if(o.userData.m==='sts3215'){
+        const c=(hl[side]||{})[o.userData.j];
+        o.material.color.set(c||'#1a1a1a'); o.material.roughness=0.35;
+        o.material.emissive.set(c||'#000000'); o.material.emissiveIntensity=c?0.5:0;
+      } else o.material.color.set(color);
     });
   }
-  const mgr=new THREE.LoadingManager(); mgr.onLoad=()=>Object.values(robots).forEach(paint);
+  const mgr=new THREE.LoadingManager(); mgr.onLoad=()=>Object.keys(robots).forEach(s=>paint(robots[s],s));
   await Promise.all(sides.map(side=>new Promise(res=>{
     const loader=new URDFLoader(mgr); loader.workingPath='/urdf/'; loader.packages='/urdf';
     loader.load('/urdf/so101.urdf', r=>{
@@ -4230,8 +4741,18 @@ window.mountArm3D = async function(el, sides, views){
       robots[side]=r; scene.add(r); res();
     }, undefined, e=>{ console.error(e); res(); });
   })));
-  (function anim(){ requestAnimationFrame(anim); ctl.update(); ren.render(scene,cam); })();
+  // 화면에서 떨어져 나가면(단계 이동·다시 그리기) 렌더 루프를 멈추고 WebGL 컨텍스트를 돌려줍니다.
+  // 안 그러면 브라우저 한도(약 16개)를 넘어 오래된 3D 가 검게 죽습니다.
+  let alive=false;
+  (function anim(){
+    const on=ren.domElement.isConnected;
+    if(alive && !on){ ren.dispose(); try{ ren.forceContextLoss(); }catch(e){} return; }
+    if(on) alive=true;
+    requestAnimationFrame(anim); ctl.update(); ren.render(scene,cam);
+  })();
   return {
+    // 모터 강조: {관절: '#rrggbb' | null} — 진단 결과·캘리브레이션 진행 표시용
+    highlight(side, map){ hl[side]=map||{}; if(robots[side]) paint(robots[side], side); },
     update(side, joints){
       const r=robots[side]; if(!r) return;
       for(const j in joints){
@@ -4373,6 +4894,8 @@ async function select(i){
     cell.querySelector('.cl').textContent=sg.cam;
     const v=cell.querySelector('video'); v.dataset.from=sg.from; v.src=sg.url;
     v.addEventListener('loadedmetadata',()=>{ v.currentTime=vpos(v,T); });
+    v.addEventListener('error',()=>{ const m=document.createElement('p'); m.className='muted'; m.style.cssText='position:absolute;inset:auto 8px 8px 8px;margin:0;color:#e5c07b;font-size:12px';
+      m.textContent='영상을 재생할 수 없습니다 (파일 없음 또는 브라우저가 이 코덱을 못 읽음)'; cell.appendChild(m); });
     g.appendChild(cell); VIDS.push(v);
   });
   if(!e.segs.length) g.innerHTML='<p class=muted style="padding:14px;margin:0;background:var(--surface)">영상 없음</p>';
@@ -4390,7 +4913,9 @@ function vfrom(v){ return parseFloat(v.dataset.from)||0; }
 /* v3.0 은 에피소드들이 mp4 하나에 이어 붙어 있어서, from+DUR 은 정확히 다음 에피소드의 첫 프레임입니다.
    영상은 끝에서 반 프레임 앞까지만 보냅니다. */
 function vpos(v,t){ return vfrom(v)+Math.max(0, Math.min(t, DUR-0.5/(INFO.fps||30))); }
-function curT(){ if(VIDS.length) return VIDS[0].currentTime-vfrom(VIDS[0]); return PLAYING?(performance.now()-clock0)/1000:T; }
+/* 시계: 재생 가능한 첫 영상. 모두 못 읽으면(404·코덱) 벽시계로 — 그래야 그래프·3D 가 멈추지 않습니다 */
+function master(){ return VIDS.find(v=>!v.error && v.readyState>=2); }
+function curT(){ const m=master(); if(m) return m.currentTime-vfrom(m); return PLAYING?(performance.now()-clock0)/1000:T; }
 function play(){
   if(T>=DUR-0.05) seek(0);
   PLAYING=true; clock0=performance.now()-T*1000;
@@ -4403,7 +4928,8 @@ function tick(){
   if(!PLAYING) return;
   T=Math.max(0,curT());
   if(T>=DUR-0.5/(INFO.fps||30)){ T=DUR; pause(); VIDS.forEach(v=>{ v.currentTime=vpos(v,T); }); render(); return; }
-  VIDS.slice(1).forEach(v=>{ if(Math.abs((v.currentTime-vfrom(v))-T)>0.15) v.currentTime=vpos(v,T); });
+  const mv=master();
+  VIDS.forEach(v=>{ if(v!==mv && !v.error && Math.abs((v.currentTime-vfrom(v))-T)>0.15) v.currentTime=vpos(v,T); });
   render(); raf=requestAnimationFrame(tick);
 }
 function frameAt(t){
@@ -4512,6 +5038,7 @@ $('b_delm').onclick=async()=>{
 };
 window.addEventListener('resize',()=>{ if(DATA) CH.forEach(drawBase); });
 document.addEventListener('keydown',ev=>{
+  if(!INFO || INFO.error || ev.ctrlKey || ev.metaKey || ev.altKey) return;
   if(ev.target.tagName==='INPUT' && ev.target.type!=='checkbox' && ev.target.type!=='range') return;
   if(ev.key==='ArrowLeft'){ ev.preventDefault(); select(IDX-1); }
   else if(ev.key==='ArrowRight'){ ev.preventDefault(); select(IDX+1); }
@@ -4550,8 +5077,9 @@ WIZARD_HTML = """
 .wcard{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:8px}
 .wcard.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
 .wcard h3{margin:0;font-family:var(--mono);font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
-.wrow{display:flex;gap:8px;align-items:center;font-size:12.5px}
+.wrow{display:flex;gap:8px;align-items:center;font-size:12.5px;flex-wrap:wrap}
 .wrow .k{width:74px;color:var(--muted);font-family:var(--mono);font-size:11.5px}
+.modebar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 14px}
 .stepper{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 14px}
 .stepper .st{display:flex;gap:7px;align-items:center;padding:6px 10px;border-radius:8px;cursor:pointer;color:var(--muted);font-size:13px}
 .stepper .st.cur{background:var(--surface2);color:var(--text)}
@@ -4566,17 +5094,29 @@ WIZARD_HTML = """
 .wpanel .note{border-left:3px solid var(--accent);background:rgba(93,157,214,.08);padding:9px 12px;border-radius:0 6px 6px 0;margin:0 0 12px;line-height:1.7}
 .wpanel .note.ok{border-color:var(--ok);background:rgba(76,175,110,.08)}
 .wpanel .note.bad{border-color:var(--bad);background:rgba(201,96,96,.08)}
+.wpanel .note.warn{border-color:var(--warn);background:rgba(217,161,59,.08)}
+.wpanel details{margin:6px 0 10px}
+.wpanel summary{cursor:pointer;color:var(--muted);font-size:13px}
+.stagebox{background:var(--surface2);border:1px solid var(--accent);border-radius:10px;padding:14px 16px}
+.stagebox h3{margin:0 0 6px;font-size:15px}
+.stagebox .inst{color:var(--muted);margin:0 0 12px;line-height:1.7}
 #w3d{height:420px;background:#0a0d10;border:1px solid var(--line);border-radius:10px;position:relative;overflow:hidden}
 #w3d canvas{display:block}
+.legend{position:absolute;left:10px;bottom:8px;display:flex;gap:10px;font-size:11.5px;color:var(--muted);pointer-events:none}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
 .tbar{height:8px;background:var(--surface2);border-radius:4px;overflow:hidden;min-width:120px}
 .tbar i{display:block;height:100%;background:var(--warn);width:0}
+dl.dev{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:0 0 12px;font-size:12.5px}
+dl.dev dt{color:var(--muted);font-family:var(--mono);font-size:11.5px}
+dl.dev dd{margin:0;font-family:var(--mono);word-break:break-all}
 tr.best td{background:rgba(76,175,110,.10)}
 @media(max-width:900px){ .wbody{grid-template-columns:1fr} }
 </style>
 <div class=wrap>
 <p class=eyebrow>Setup wizard</p><h2>셋업 마법사</h2>
 <p class=muted style="max-width:900px">팔(보드) 하나씩 <b>포트 찾기 → 진단 → 캘리브레이션 → 확인</b> 순서로 안내합니다.
-모터를 구동하는 단계는 없습니다 — 손으로 움직여서 확인합니다. 한팔/양팔 전환과 카메라는 <a href="/setup">Setup</a> 에서 합니다.</p>
+모터를 구동하는 단계는 없습니다 — 손으로 움직여서 확인합니다. 카메라는 <a href="/setup#cameras">Setup</a> 에서 합니다.</p>
+<div class=modebar id=modebar></div>
 <div id=busy></div>
 <div class=wgrid id=over></div>
 <div id=wiz></div>
@@ -4591,15 +5131,46 @@ async function jget(u){ const r=await fetch(u); return r.json(); }
 async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); return r.json(); }
 const STEPS=[['port','포트 찾기'],['diag','진단'],['calib','캘리브레이션'],['verify','확인']];
 const RL={follower:'팔로워',leader:'리더'};
-let W=null, SLOT=null, STEP=null, T1=null, T2=null, ARM=null, ARMSIDE=null, WATCHING=false;
+const JOINTS=['shoulder_pan','shoulder_lift','elbow_flex','wrist_flex','wrist_roll','gripper'];
+const C_OK='#2dc937', C_WARN='#e5a50a', C_BAD='#d32f2f', C_CUR='#00c7fd';
+let W=null, SLOT=null, STEP=null, T1=null, T2=null, T3=null, ARM=null, ARMSIDE=null, WATCHING=false, CALIBING=false, MSING=false;
+/* 폴링용 — 서버 재시작·일시 오류에도 폴링 사슬이 끊기지 않게 예외 대신 null */
+async function jtry(u){ try{ const r=await fetch(u); return await r.json(); }catch(e){ return null; } }
+const slotKey=()=>SLOT?SLOT.side+'|'+SLOT.role:'';
 const tail=p=>{ if(!p) return ''; const t=p.split('/').pop(); return t.length>26?'…'+t.slice(-24):t; };
 const badge=(t,c)=>'<span class="badge '+(c||'')+'">'+E(t)+'</span>';
 function slotOf(side,role){ return W.slots.find(x=>x.side===side&&x.role===role); }
 function doneOf(s){ return {port:s.port_ok, diag:!!(s.diag&&s.diag.code<2&&!s.diag.missing.length), calib:s.calib.ok, verify:!!s.verified}; }
 function firstTodo(s){ const d=doneOf(s); return (STEPS.find(x=>!d[x[0]])||['verify'])[0]; }
-function stopTimers(){ clearTimeout(T1); clearTimeout(T2); T1=T2=null; }
+function stopTimers(){ clearTimeout(T1); clearTimeout(T2); clearTimeout(T3); T1=T2=T3=null; }
+function boardText(s){
+  const b=s.board||{};
+  if(b.calib==='unknown') return '';
+  if(!s.calib.ok) return b.calib==='calibrated'?badge('보드에 캘리브 있음','b-ok'):'';
+  if(b.file==='match') return badge('보드와 일치','b-ok');
+  if(b.file==='mismatch') return badge('보드와 다름','b-warn');
+  return '';
+}
 
-async function load(){ W=await jget('/api/wizard/state'); paintOver(); paintAfter(); }
+async function load(){ W=await jget('/api/wizard/state'); paintMode(); paintOver(); paintAfter(); }
+function paintMode(){
+  const bi=W.mode==='bimanual';
+  $('modebar').innerHTML='<span class=muted>구성</span>'
+    +'<button id=wm1 class="'+(bi?'':'primary')+'">한팔</button>'
+    +'<button id=wm2 class="'+(bi?'primary':'')+'">양팔 (left / right)</button>'
+    +'<span class=tiny>환경 <span class=mono>'+E(W.env)+'</span> · 바꾸면 이 환경 설정이 바뀝니다</span>';
+  $('wm1').onclick=()=>setMode('single'); $('wm2').onclick=()=>setMode('bimanual');
+}
+async function setMode(m){
+  if(W.mode===m) return;
+  if(m==='single' && !confirm('양팔 → 한팔: 왼팔(left)만 남기고 오른팔 설정(포트·카메라)을 지웁니다. 계속할까요?')) return;
+  await leave(); SLOT=null; STEP=null; $('wiz').innerHTML='';
+  const r=await jpost('/api/wizard/mode',{mode:m});
+  if(r.error){ alert(r.error); return; }
+  W=r; paintMode(); paintOver(); paintAfter();
+  history.replaceState(null,'',location.pathname);
+  if(r.copied&&r.copied.length) $('wiz').innerHTML='<div class=wpanel><p class="note ok">같은 팔의 캘리브레이션 파일을 새 이름으로 복사했습니다: <span class=mono>'+E(r.copied.join(', '))+'</span></p></div>';
+}
 function paintOver(){
   $('busy').innerHTML=W.busy?'<p class="badge b-warn">실행 중: '+E(W.busy)+'</p>':'';
   const g=$('over'); g.innerHTML='';
@@ -4609,7 +5180,7 @@ function paintOver(){
     const port=s.port_ok?badge('연결됨','b-ok')+' <span class=mono>'+E(tail(s.port))+'</span>'
       :(s.port?badge('연결 안 됨','b-bad')+' <span class=mono>'+E(tail(s.port))+'</span>':badge('미지정','b-warn'));
     const dg=s.diag?badge(s.diag.verdict, s.diag.code===0?'b-ok':s.diag.code===1?'b-warn':'b-bad')+(s.diag.power&&s.diag.power.system?' <span class=tiny>'+E(s.diag.power.system)+' · '+E(s.diag.when)+'</span>':''):'<span class=tiny>-</span>';
-    const cb=s.calib.ok?badge('있음','b-ok')+' <span class=tiny>'+E(s.calib.when)+'</span>':badge('없음','b-warn');
+    const cb=(s.calib.ok?badge('있음','b-ok')+' <span class=tiny>'+E(s.calib.when)+'</span>':badge('없음','b-warn'))+' '+boardText(s);
     const vf=s.verified?badge('확인됨','b-ok')+' <span class=tiny>'+E(s.verified)+'</span>':(s.verified_stale?badge('다시 확인 필요','b-warn'):'<span class=tiny>-</span>');
     const all=doneOf(s), complete=all.port&&all.diag&&all.calib&&all.verify;
     c.innerHTML='<h3>'+E(s.side)+' · '+RL[s.role]+'</h3>'
@@ -4626,7 +5197,7 @@ function paintOver(){
 function paintAfter(){
   const all=W.slots.every(s=>{ const d=doneOf(s); return d.port&&d.calib&&d.verify; });
   $('after').innerHTML='<div class=card style="margin-top:16px">'
-    +(all?'<p class="badge b-ok" style="margin-top:0">모든 팔 준비 완료</p>':'')
+    +(all?'<p class="badge b-ok" style="margin-top:0">모든 팔 준비 완료 — Control 탭에서 연결해 보세요</p>':'')
     +'<p style="margin-top:0"><b>카메라</b> — '+(W.cameras.length?W.cameras.length+'대 등록 ('+E(W.cameras.join(', '))+')':'아직 없음')
     +' · <a href="/setup#cameras">Setup 3 · 카메라</a>에서 화면으로 확인하고 추가하세요.</p>'
     +'<p style="margin-bottom:0"><b>환경</b> — 지금 구성은 <span class=mono>'+E(W.env)+'</span> 환경에 저장돼 있습니다 · '
@@ -4643,6 +5214,9 @@ async function leave(){
   stopTimers();
   if(WATCHING){ WATCHING=false; await jpost('/api/setup/watch/stop'); }
   if(STEP==='verify'){ await jpost('/api/wizard/verify/stop'); }
+  if(CALIBING){ CALIBING=false; await jpost('/api/calib/cancel'); }      // 저장 안 한 캘리브는 이전 값으로 되돌립니다
+  if(MSING){ MSING=false; await jpost('/api/setup/motors/cancel'); }     // 모터 ID 세팅이 포트를 계속 잡고 있지 않게
+  ARM=null;
 }
 async function go(step){
   await leave(); STEP=step;
@@ -4657,6 +5231,21 @@ async function go(step){
   ({port:stepPort,diag:stepDiag,calib:stepCalib,verify:stepVerify})[step](s);
 }
 async function refreshSlot(){ W=await jget('/api/wizard/state'); paintOver(); paintAfter(); return slotOf(SLOT.side,SLOT.role); }
+
+/* ---------- 3D (진단·캘리브·확인 공용) ---------- */
+function legend(items){ return '<div class=legend>'+items.map(x=>'<span><i style="background:'+x[0]+'"></i>'+E(x[1])+'</span>').join('')+'</div>'; }
+async function mount3D(leg){
+  const el=$('w3d'); if(!el) return null;
+  const my=STEP;
+  if(!W.urdf){ el.innerHTML='<p class=muted style="padding:14px">urdf/so101.urdf 가 없어 3D 를 못 그립니다 — 표의 숫자로 확인하세요.</p>'; ARM=null; return null; }
+  el.innerHTML=leg?legend(leg):'';
+  try{ const v={}; v[SLOT.side]={x:0,y:0,yaw_deg:0}; const a=await window.mountArm3D(el,[SLOT.side],v);
+       if(STEP!==my || $('w3d')!==el) return null; ARMSIDE=SLOT.side; ARM=a; return a; }
+  catch(e){ console.error(e); ARM=null; el.innerHTML='<p class=muted style="padding:14px">3D 를 불러오지 못했습니다 (인터넷 연결 필요) — 표의 숫자로 확인하세요.</p>'; return null; }
+}
+function hlDiag(levels){
+  const m={}; JOINTS.forEach(j=>{ const l=levels[j]; m[j]=l==='MISSING'||l==='FAIL'?C_BAD:l==='WARN'?C_WARN:l?C_OK:null; }); return m;
+}
 
 /* ---------- ① 포트 찾기 ---------- */
 function stepPort(s){
@@ -4703,13 +5292,16 @@ async function watchToggle(){
   const r=await jpost('/api/setup/watch',{ports:W.ports.map(p=>p.dev)});
   if(r.error){ alert(r.error); return; }
   WATCHING=true; $('wwatch').textContent='감시 중지';
-  const poll=async()=>{ if(!WATCHING) return; const st=await jget('/api/setup/watch'); if(st.on) paintPorts(st.state); T1=setTimeout(poll,400); };
+  const poll=async()=>{ if(!WATCHING) return; const st=await jtry('/api/setup/watch'); if(st&&st.on) paintPorts(st.state); T1=setTimeout(poll,400); };
   poll();
 }
 async function assign(dev,btn){
   if(btn) btn.disabled=true;
-  if(WATCHING){ WATCHING=false; stopTimers(); await jpost('/api/setup/watch/stop'); }
-  const r=await jpost('/api/wizard/assign',{side:SLOT.side,role:SLOT.role,dev:dev});
+  let r;
+  try{
+    if(WATCHING){ WATCHING=false; stopTimers(); await jpost('/api/setup/watch/stop'); }
+    r=await jpost('/api/wizard/assign',{side:SLOT.side,role:SLOT.role,dev:dev});
+  }catch(e){ r={error:'요청 실패: '+e}; }
   if(r.error){ alert(r.error); if(btn) btn.disabled=false; return; }
   W=r; paintOver(); paintAfter(); go('diag');
 }
@@ -4717,50 +5309,69 @@ async function assign(dev,btn){
 /* ---------- ② 진단 ---------- */
 async function stepDiag(s){
   if(!s.port_ok){ $('wstep').innerHTML='<div class=wpanel><p class="note bad">포트가 지정되지 않았거나 연결돼 있지 않습니다.</p><button class=primary id=wback>포트 찾기로</button></div>'; $('wback').onclick=()=>go('port'); return; }
-  $('wstep').innerHTML='<div class=wpanel><p class=muted>진단 중… 서보에 아무것도 쓰지 않습니다 (몇 초)</p></div>';
-  const r=await jpost('/api/setup/armcheck/start',{port:s.port, role:SLOT.role, sweep:false});
-  if(STEP!=='diag') return;
+  $('wstep').innerHTML='<div class=wbody><div class=wpanel><p class=muted>진단 중… 서보에 아무것도 쓰지 않습니다 (몇 초)</p></div><div id=w3d></div></div>';
+  mount3D([[C_OK,'정상'],[C_WARN,'주의'],[C_BAD,'불량·응답 없음']]);
+  const key=slotKey();
+  let r; try{ r=await jpost('/api/setup/armcheck/start',{port:s.port, role:SLOT.role, sweep:false}); }catch(e){ r={error:String(e)}; }
+  if(STEP!=='diag' || slotKey()!==key) return;       // 진단 도중 다른 팔로 옮겼으면 결과를 버립니다
   const st=r.state||{};
   if(r.error || st.stage==='error'){ $('wstep').innerHTML='<div class=wpanel><p class="note bad"></p><button id=wre>다시 진단</button></div>'; $('wstep').querySelector('.note').textContent='진단 실패 — '+(r.error||st.err); $('wre').onclick=()=>go('diag'); return; }
   const rep=st.report; s=await refreshSlot();
+  if(STEP!=='diag' || slotKey()!==key) return;
   const missing=Object.keys(rep.motors).filter(j=>rep.motors[j].model==null);
   const powerFail=rep.findings.some(f=>f.check==='전원'&&f.level==='FAIL');
-  const cls=rep.code===0?'ok':rep.code===2?'bad':'';
-  let h='<div class="wbody one"><div class=wpanel>'
-    +'<p class="note '+cls+'">판정: <b>'+E(rep.verdict)+'</b>'+(rep.power&&rep.power.system?' · 전원 '+E(rep.power.system)+' 계통 (중앙값 '+rep.power.median_v+' V)':'')+'</p>'
-    +'<table><tr><th>ID</th><th>관절</th><th class=num>전압</th><th class=num>온도</th><th class=num>흔들림</th><th>결과</th></tr>';
+  const happy=rep.code===0 && !missing.length;
+  const cls=rep.code===0?'ok':rep.code===2?'bad':'warn';
+  const nOk=Object.keys(rep.motors).length-missing.length;
+  const volts=Object.values(rep.motors).map(m=>m.voltage_v).filter(v=>v!=null);
+  let h='<div class=wpanel>'
+    +'<p class="note '+cls+'">판정: <b>'+E(rep.verdict)+'</b> · 모터 '+nOk+'/'+Object.keys(rep.motors).length
+    +(rep.power&&rep.power.system?' · 전원 '+E(rep.power.system)+' 계통 (중앙값 '+rep.power.median_v+' V)':(volts.length?' · '+Math.min.apply(null,volts).toFixed(1)+' V':''))+'</p>';
+  const b=s.board||{};
+  h+='<p style="margin:0 0 10px">보드 캘리브레이션: '+({calibrated:badge('저장돼 있음','b-ok'),default:badge('없음 (공장값)','b-warn'),partial:badge('일부만','b-warn'),unknown:badge('모름')})[b.calib||'unknown']
+    +(s.calib.ok?' · 파일 '+({match:badge('보드와 일치','b-ok'),mismatch:badge('보드와 다름: '+(b.diff||[]).join(', '),'b-warn')})[b.file]||'':'')+'</p>';
+  let tbl='<table><tr><th>ID</th><th>관절</th><th class=num>전압</th><th class=num>온도</th><th class=num>흔들림</th><th>결과</th></tr>';
   Object.keys(rep.motors).forEach(j=>{ const m=rep.motors[j];
-    h+='<tr><td class=mono>'+m.id+'</td><td class=mono>'+E(j)+'</td><td class=num>'+(m.voltage_v==null?'-':m.voltage_v.toFixed(1)+' V')+'</td>'
+    tbl+='<tr><td class=mono>'+m.id+'</td><td class=mono>'+E(j)+'</td><td class=num>'+(m.voltage_v==null?'-':m.voltage_v.toFixed(1)+' V')+'</td>'
       +'<td class=num>'+(m.temp_c==null?'-':m.temp_c+'°')+'</td><td class=num>'+(m.noise_ticks==null?'-':m.noise_ticks)+'</td>'
       +'<td>'+badge(m.model==null?'응답 없음':({OK:'정상',INFO:'정상',WARN:'주의',FAIL:'불량'})[m.level], m.level==='FAIL'||m.model==null?'b-bad':m.level==='WARN'?'b-warn':'')+'</td></tr>'; });
-  h+='</table>'+rep.findings.filter(f=>f.level==='WARN'||f.level==='FAIL').map(f=>'<p style="margin:5px 0">'+badge(f.level,f.level==='FAIL'?'b-bad':'b-warn')+' <span class=mono>'+E(f.joint||'팔 전체')+'</span> · '+E(f.message)+'</p>').join('');
+  tbl+='</table>'+rep.findings.filter(f=>f.level==='WARN'||f.level==='FAIL').map(f=>'<p style="margin:5px 0">'+badge(f.level,f.level==='FAIL'?'b-bad':'b-warn')+' <span class=mono>'+E(f.joint||'팔 전체')+'</span> · '+E(f.message)+'</p>').join('');
+  h+=happy?'<details><summary>모터별 자세히</summary>'+tbl+'</details>':tbl;
   if(missing.length){
     h+='<div class=stagebox style="margin-top:14px" id=wms><h3>모터 ID 세팅이 필요합니다</h3>'
-      +'<p class=inst>응답하지 않는 모터: <b>'+E(missing.join(', '))+'</b>. 새 모터는 전부 ID 1 이라 한 개씩만 보드에 꽂아 ID 를 써야 합니다.</p>'
+      +'<p class=inst>응답하지 않는 모터: <b>'+E(missing.join(', '))+'</b>. 새 모터는 전부 ID 1 이라 한 개씩만 보드에 꽂아 ID 를 써야 합니다. '
+      +'오른쪽 3D 에서 <b style="color:'+C_CUR+'">하늘색</b> 모터가 지금 연결할 모터입니다.</p>'
       +'<div id=wmsbody><button class=primary id=wmsgo>모터 ID 세팅 시작</button></div></div>';
   }
   h+='<div class=toolbar style="margin-top:14px"><button id=wre>다시 진단</button>'
     +'<button class=primary id=wnext '+(powerFail||missing.length?'disabled':'')+'>다음: 캘리브레이션</button>'
-    +(powerFail?'<span class="badge b-bad">전원을 먼저 바로잡으세요</span>':'')+'</div></div></div>';
-  $('wstep').innerHTML=h;
+    +(powerFail?'<span class="badge b-bad">전원을 먼저 바로잡으세요</span>':'')+'</div></div>';
+  $('wstep').querySelector('.wpanel').outerHTML=h;
   $('wre').onclick=()=>go('diag'); $('wnext').onclick=()=>go('calib');
   if($('wmsgo')) $('wmsgo').onclick=()=>msStart(s);
+  const lv=(s.diag&&s.diag.levels)||{};
+  const paint=()=>{ if(ARM) ARM.highlight(SLOT.side,hlDiag(lv)); else if(STEP==='diag') T3=setTimeout(paint,300); };
+  paint();
 }
 async function msStart(s){
   if(!confirm('모터를 한 개씩만 보드에 연결한 상태여야 합니다. 시작할까요?')) return;
   const r=await jpost('/api/setup/motors/start',{port:s.dev||s.port});
   if(r.error){ alert(r.error); return; }
+  MSING=true;
   msPoll();
 }
 async function msPoll(){
-  const m=await jget('/api/setup/motors'); const b=$('wmsbody'); if(!b||STEP!=='diag') return;
+  const m=await jtry('/api/setup/motors'); const b=$('wmsbody'); if(!b||STEP!=='diag') return;
+  if(!m){ setTimeout(msPoll,1000); return; }
+  if(m.stage!=='running') MSING=false;
+  if(ARM && m.order){ const hm={}; (m.done||[]).forEach(d=>hm[d.name]=C_OK); if(m.stage==='running'&&m.current) hm[m.current]=C_CUR; ARM.highlight(SLOT.side,hm); }
   if(m.stage==='running'){
     b.innerHTML='<p>지금 연결할 모터: <b class=mono>'+E(m.current)+'</b> → ID <b>'+E(m.current_id)+'</b> · 완료 '+m.done.length+'/'+m.order.length+'</p>'
       +(m.err?'<p class="badge b-bad"></p>':'')+(m.last?'<p class=tiny>'+E(m.last)+'</p>':'')
       +'<div class=toolbar><button class=primary id=wmsw>ID 쓰기</button><button id=wmsc>취소</button></div>';
     if(m.err) b.querySelector('.b-bad').textContent=m.err;
     $('wmsw').onclick=async()=>{ $('wmsw').disabled=true; await jpost('/api/setup/motors/write'); msPoll(); };
-    $('wmsc').onclick=async()=>{ await jpost('/api/setup/motors/cancel'); go('diag'); };
+    $('wmsc').onclick=async()=>{ MSING=false; await jpost('/api/setup/motors/cancel'); go('diag'); };
   }else if(m.stage==='done'){
     b.innerHTML='<p class="badge b-ok">6개 모두 ID 기록 완료 — 모터를 전부 다시 연결하고 다시 진단하세요</p>';
   }else if(m.stage==='error'){
@@ -4772,31 +5383,113 @@ async function msPoll(){
 function stepCalib(s){
   const back='/setup/wizard?slot='+SLOT.side+'|'+SLOT.role+'&step=verify';
   const link='/calib?side='+encodeURIComponent(SLOT.side)+'&role='+SLOT.role+'&next='+encodeURIComponent(back);
-  $('wstep').innerHTML='<div class="wbody one"><div class=wpanel>'
-    +(s.calib.ok
-      ?'<p class="note ok">캘리브레이션 파일이 있습니다 — <span class=mono>'+E(s.calib.id)+'.json</span> ('+E(s.calib.when)+')</p>'
-       +'<p class=muted>같은 팔이면 그대로 쓰고 다음 단계에서 3D 로 확인하세요. 다른 팔의 파일이면 다시 하세요 — 엔코더 값이 팔마다 다릅니다.</p>'
-       +'<div class=toolbar><button class=primary id=wnext>그대로 쓰고 다음: 확인</button><a class=btnlink href="'+E(link)+'">다시 캘리브레이션 &rarr;</a></div>'
-      :'<p class="note">캘리브레이션 파일이 없습니다 — <span class=mono>'+E(s.calib.id)+'.json</span></p>'
-       +'<p class=muted>Calib 탭에서 관절마다 양 끝까지 한 번씩 쓸면 됩니다. 저장하면 이 마법사로 돌아오는 버튼이 나옵니다.<br>'
-       +'Calib 는 토크를 끕니다 — 팔로워는 받치세요.</p>'
-       +'<div class=toolbar><a class=btnlink href="'+E(link)+'"><b>캘리브레이션 하러 가기 &rarr;</b></a></div>')
-    +'</div></div>';
+  const b=s.board||{}, fname='<span class=mono>'+E(s.calib.id)+'.json</span>';
+  let h='<div class=wbody><div class=wpanel id=wcp>', btns='';
+  if(s.calib.ok && b.file==='match'){
+    h+='<p class="note ok">캘리브레이션 파일 '+fname+' ('+E(s.calib.when)+') 이 보드에 저장된 값과 <b>일치</b>합니다.</p>';
+    btns='<button class=primary id=wnext>그대로 쓰고 다음: 확인</button><button id=wnew>새로 캘리브레이션</button>';
+  }else if(s.calib.ok && b.file==='mismatch'){
+    h+='<p class="note warn">파일 '+fname+' 과 보드에 저장된 값이 다릅니다 ('+E((b.diff||[]).join(', '))+').<br>'
+      +'다른 팔의 파일이거나, 다른 PC 에서 이 팔을 다시 캘리브레이션한 경우입니다. 녹화·제어를 시작하면 <b>파일 값이 보드에 다시 써집니다.</b></p>';
+    btns='<button class=primary id=wnew>새로 캘리브레이션</button><button id=wimp>보드 값으로 파일 맞추기</button><button id=wnext>파일 그대로 — 확인에서 보기</button>';
+  }else if(s.calib.ok){
+    h+='<p class="note ok">캘리브레이션 파일이 있습니다 — '+fname+' ('+E(s.calib.when)+')</p>'
+      +'<p class=muted>같은 팔이면 그대로 쓰고 다음 단계에서 3D 로 확인하세요. 진단을 먼저 하면 보드 값과 비교해 드립니다.</p>';
+    btns='<button class=primary id=wnext>그대로 쓰고 다음: 확인</button><button id=wnew>새로 캘리브레이션</button>';
+  }else if(b.calib==='calibrated'){
+    h+='<p class="note ok">파일 '+fname+' 은 없지만 <b>보드(모터 EEPROM)에 캘리브레이션이 저장돼 있습니다.</b><br>'
+      +'이미 캘리브레이션한 팔을 새 PC 에 꽂은 경우입니다 — 가져오면 다시 할 필요가 없습니다. 모터에는 아무것도 쓰지 않습니다.</p>';
+    btns='<button class=primary id=wimp>보드에서 가져오기 (추천)</button><button id=wnew>새로 캘리브레이션</button>';
+  }else{
+    h+='<p class=note>캘리브레이션 파일이 없습니다 — '+fname+(b.calib==='default'?' · 보드도 공장값입니다':'')+'</p>';
+    btns='<button class=primary id=wnew>캘리브레이션 시작</button>';
+  }
+  h+='<div class=toolbar>'+btns+'</div><div id=wcal style="margin-top:14px"></div>'
+    +'<p class=tiny style="margin-top:10px">예전 화면이 편하면 <a href="'+E(link)+'">Calib 탭에서 하기</a> — 저장하면 이 마법사로 돌아옵니다.</p>'
+    +'</div><div id=w3d></div></div>';
+  $('wstep').innerHTML=h;
   if($('wnext')) $('wnext').onclick=()=>go('verify');
+  if($('wnew')) $('wnew').onclick=calStart;
+  if($('wimp')) $('wimp').onclick=importCalib;
+  mount3D([[C_OK,'범위 기록됨'],[C_WARN,'더 움직이세요'],[C_BAD,'아직 안 움직임'],[C_CUR,'자동 (wrist_roll)']]);
+}
+async function importCalib(){
+  const btn=$('wimp'); if(btn) btn.disabled=true;
+  const r=await jpost('/api/wizard/import_calib',{side:SLOT.side,role:SLOT.role});
+  if(r.error){ alert(r.error); if(btn) btn.disabled=false; return; }
+  W=r; paintOver(); paintAfter();
+  go('verify');
+}
+async function calStart(){
+  const who=SLOT.side+' '+RL[SLOT.role];
+  if(!confirm(who+' 캘리브레이션을 시작합니다. 토크가 꺼집니다'+(SLOT.role==='follower'?' — 팔로워가 주저앉지 않게 받치세요.':'.')+' 계속할까요?')) return;
+  const btns=document.querySelectorAll('#wcp .toolbar button'); btns.forEach(b=>b.disabled=true);
+  const r=await jpost('/api/calib/start',{side:SLOT.side,role:SLOT.role});
+  if(r.error){ alert(r.error); btns.forEach(b=>b.disabled=false); return; }
+  CALIBING=true;
+  $('wcal').innerHTML='<div class=stagebox><h3>범위 기록 중</h3>'
+    +'<p class=inst>각 관절을 <b>기계적 한계 양 끝까지</b> 한 번씩 천천히 움직이세요 (한 관절씩). 3D 의 모터가 모두 <b style="color:'+C_OK+'">초록</b>이 되면 저장하세요.<br>'
+    +'wrist_roll 은 범위를 기록하지 않습니다 — <b>저장할 때의 자세가 0°</b> 이니 그리퍼를 똑바로 두고 저장하세요.</p>'
+    +'<div id=wcerr></div><table id=wctbl></table>'
+    +'<div class=toolbar style="margin-top:12px"><button class=primary id=wcsave disabled>저장</button><button id=wccancel>취소 (이전 값으로 되돌림)</button></div></div>';
+  $('wcsave').onclick=calSave; $('wccancel').onclick=async()=>{ CALIBING=false; stopTimers(); await jpost('/api/calib/cancel'); go('calib'); };
+  calPoll();
+}
+async function calPoll(){
+  if(!CALIBING || STEP!=='calib') return;
+  const c=await jtry('/api/calib/state');
+  if(!CALIBING || STEP!=='calib') return;
+  if(!c){ T2=setTimeout(calPoll,1000); return; }
+  if(c.stage!=='ranging' || c.side!==SLOT.side || c.role!==SLOT.role){
+    CALIBING=false; $('wcal').innerHTML='<p class="note bad"></p>'; $('wcal').firstChild.textContent='캘리브레이션이 중단됐습니다 '+(c.err?'— '+c.err:'(다른 화면에서 취소됨)'); return; }
+  const blk=new Set(c.block), wrn=new Set(c.warn), ovr=new Set(c.over), hm={};
+  let h='<tr><th>관절</th><th class=num>현재</th><th class=num>min</th><th class=num>max</th><th>범위</th></tr>';
+  c.rows.forEach(r=>{
+    const col=r.full_turn?C_CUR:(blk.has(r.name)||ovr.has(r.name))?C_BAD:wrn.has(r.name)?C_WARN:C_OK;
+    hm[r.name]=col;
+    const pct=r.full_turn?100:Math.min(100,(r.span_deg||0)/Math.max(c.span_ok_deg,1)*100);
+    h+='<tr><td class=mono>'+E(r.name)+'</td><td class="num mono">'+(r.pos==null?'-':r.pos)+'</td>'
+      +'<td class="num mono">'+(r.full_turn?'-':(r.min==null?'-':r.min))+'</td><td class="num mono">'+(r.full_turn?'-':(r.max==null?'-':r.max))+'</td>'
+      +'<td><div style="display:flex;gap:8px;align-items:center"><div class=tbar><i style="width:'+pct+'%;background:'+col+'"></i></div>'
+      +'<span class=tiny>'+(r.full_turn?'자동':(r.span_deg==null?'-':r.span_deg+'°'))+'</span></div></td></tr>';
+  });
+  $('wctbl').innerHTML=h;
+  let e='';
+  if(c.over.length) e+='<p class="note bad">한 바퀴 넘게 돈 관절: '+E(c.over.join(', '))+' — 기계적 한계 안에서만 움직이세요 (취소 후 다시)</p>';
+  if(c.err) e+='<p class="note bad">'+E(c.err)+'</p>';
+  if($('wcerr').innerHTML!==e) $('wcerr').innerHTML=e;
+  $('wcsave').disabled=!!(c.block.length||c.over.length);
+  $('wcsave').title=c.block.length?'아직 안 움직인 관절: '+c.block.join(', '):'';
+  if(ARM) ARM.highlight(SLOT.side,hm);
+  T2=setTimeout(calPoll,200);
+}
+async function calSave(){
+  const c=await jget('/api/calib/state');
+  if(c.warn.length && !confirm('범위가 좁은 관절이 있습니다: '+c.warn.join(', ')+' — 그래도 저장할까요?')) return;
+  $('wcsave').disabled=true;
+  const r=await jpost('/api/calib/finish');
+  if(r.error){ alert(r.error); $('wcsave').disabled=false; return; }
+  CALIBING=false; stopTimers();
+  await refreshSlot();
+  go('verify');
 }
 
 /* ---------- ④ 확인 ---------- */
 async function stepVerify(s){
   if(!s.calib.ok){ $('wstep').innerHTML='<div class=wpanel><p class=note>캘리브레이션이 먼저 필요합니다.</p><button class=primary id=wb>캘리브레이션으로</button></div>'; $('wb').onclick=()=>go('calib'); return; }
+  const usb=s.usb||{};
   $('wstep').innerHTML='<div class=wbody><div class=wpanel>'
     +'<p class=note>팔을 손으로 움직여 보세요. <b>오른쪽 3D 가 실물과 같은 방향·같은 각도로 움직이면</b> 완료를 누르세요.</p>'
+    +'<dl class=dev><dt>포트</dt><dd>'+E(s.port)+(s.dev&&s.dev!==s.port?' → '+E(s.dev):'')+'</dd>'
+    +'<dt>보드</dt><dd>'+E(usb.product||'-')+(usb.serial?' · sn '+E(usb.serial):'')+'</dd>'
+    +'<dt>캘리브</dt><dd>'+E(s.calib.path)+' ('+E(s.calib.when)+')</dd></dl>'
     +'<div id=wvwarn></div><table id=wvtbl></table>'
     +'<div class=toolbar style="margin-top:14px"><button class=primary id=wok disabled title="관절값이 들어와야 누를 수 있습니다">일치함 — 완료</button>'
     +'<button id=wcal>다시 캘리브레이션</button></div>'
     +'<p class=tiny style="margin-top:8px">읽기만 합니다. 방향이 반대거나 각도가 어긋나면 다른 팔의 캘리브레이션 파일이거나 캘리브 때 자세가 틀린 것입니다.</p>'
     +'</div><div id=w3d><p class=muted style="padding:14px">3D 불러오는 중…</p></div></div>';
   $('wcal').onclick=()=>go('calib');
-  $('wok').onclick=async()=>{ const r=await jpost('/api/wizard/verified',{side:SLOT.side,role:SLOT.role}); if(r.error){ alert(r.error); return; } W=r; STEP=null; paintOver(); paintAfter();
+  $('wok').onclick=async()=>{ const r=await jpost('/api/wizard/verified',{side:SLOT.side,role:SLOT.role}); if(r.error){ alert(r.error); return; } W=r; stopTimers(); STEP=null; ARM=null; paintOver(); paintAfter();
     const nx=W.slots.find(x=>{ const d=doneOf(x); return !(d.port&&d.calib&&d.verify); });
     $('wiz').innerHTML='<div class=wpanel><p class="note ok"><b>'+E(SLOT.side)+' · '+RL[SLOT.role]+'</b> 확인 완료</p>'
       +(nx?'<button class=primary id=wnx>다음 팔: '+E(nx.side)+' · '+RL[nx.role]+'</button>':'<p>모든 팔이 준비됐습니다. 아래에서 카메라와 환경을 확인하세요.</p>')+'</div>';
@@ -4805,20 +5498,14 @@ async function stepVerify(s){
   if(STEP!=='verify') { jpost('/api/wizard/verify/stop'); return; }
   if(r.error){ $('wvwarn').innerHTML='<p class="note bad"></p>'; $('wvwarn').firstChild.textContent='읽기 시작 실패 — '+r.error;
     $('w3d').innerHTML='<p class=muted style="padding:14px">관절값을 못 읽어 3D 를 표시하지 않습니다.</p>'; return; }
-  mount3D();
+  mount3D(null);
   vpoll();
-}
-async function mount3D(){
-  const el=$('w3d'); if(!el) return;
-  if(!W.urdf){ el.innerHTML='<p class=muted style="padding:14px">urdf/so101.urdf 가 없어 3D 를 못 그립니다 — 아래 숫자로 확인하세요.</p>'; ARM=null; return; }
-  el.innerHTML='';
-  try{ ARMSIDE=SLOT.side; const v={}; v[SLOT.side]={x:0,y:0,yaw_deg:0}; ARM=await window.mountArm3D(el,[SLOT.side],v); }
-  catch(e){ console.error(e); ARM=null; el.innerHTML='<p class=muted style="padding:14px">3D 를 불러오지 못했습니다 (인터넷 연결 필요) — 아래 숫자로 확인하세요.</p>'; }
 }
 async function vpoll(){
   if(STEP!=='verify') return;
-  const v=await jget('/api/wizard/verify');
+  const v=await jtry('/api/wizard/verify');
   if(STEP!=='verify') return;
+  if(!v){ T2=setTimeout(vpoll,1000); return; }
   const t=$('wvtbl');
   if(t){
     let h='<tr><th>관절</th><th class=num>값</th></tr>';
@@ -4837,14 +5524,18 @@ async function vpoll(){
   T2=setTimeout(vpoll,100);
 }
 
-addEventListener('pagehide',()=>{ if(STEP==='verify') navigator.sendBeacon('/api/wizard/verify/stop'); if(WATCHING) navigator.sendBeacon('/api/setup/watch/stop'); });
+addEventListener('pagehide',()=>{
+  if(STEP==='verify') navigator.sendBeacon('/api/wizard/verify/stop');
+  if(WATCHING) navigator.sendBeacon('/api/setup/watch/stop');
+  if(CALIBING) navigator.sendBeacon('/api/calib/cancel');
+  if(MSING) navigator.sendBeacon('/api/setup/motors/cancel');
+});
 (async()=>{
   await load();
   const q=new URLSearchParams(location.search), slot=(q.get('slot')||'').split('|');
   if(slot.length===2 && slotOf(slot[0],slot[1])) openSlot(slot[0],slot[1],q.get('step')||null);
 })();
 </script>"""
-
 
 SETUP_HTML = """
 <style>
@@ -5021,27 +5712,20 @@ async function boot(){
 function dump(){ $('cfgdump').textContent=JSON.stringify(CFG,null,2); }
 
 /* ---------- 팔 ---------- */
-function setMode(m){
+async function setMode(m){
+  // 셋업 마법사와 같은 서버 규칙으로 바로 적용합니다 (id 변경 + 같은 팔 캘리브레이션 파일 복사)
   if(CFG.mode===m) return;
-  if(m==='bimanual'){
-    const a=CFG.arms[0];
-    a.side='left';
-    if(a.follower_id==='follower') a.follower_id='follower_left';
-    if(a.leader_id==='leader')     a.leader_id='leader_left';
-    a.view={x:0, y:0.12, yaw_deg:0};        // 3D 배치: 왼팔은 왼쪽으로
-    CFG.arms=[a,{side:'right',follower_port:'',follower_id:'follower_right',
-                 leader_port:'',leader_id:'leader_right',cameras:{},
-                 view:{x:0, y:-0.12, yaw_deg:0}}];
-  }else{
-    if(CFG.arms.length>1 && !confirm('오른팔 설정(포트·카메라)을 지웁니다. 계속할까요?')) return;
-    const a=CFG.arms[0];
-    a.side='main';
-    if(a.follower_id==='follower_left') a.follower_id='follower';
-    if(a.leader_id==='leader_left')     a.leader_id='leader';
-    CFG.arms=[a];
-  }
-  CFG.mode=m;
-  renderArms(); renderPorts(); renderCurCams(); dump(); dirty('모드 변경');
+  const unsaved=$('savemsg').textContent.indexOf('저장 버튼')>=0;
+  const msg=(m==='single'?'양팔 → 한팔: 왼팔(left)만 남기고 오른팔 설정(포트·카메라)을 지웁니다. '
+                         :'한팔 → 양팔: 지금 팔이 left 가 되고 right 칸이 새로 생깁니다. ')
+            +(unsaved?'저장하지 않은 변경은 버려집니다. ':'')+'바로 적용할까요?';
+  if(!confirm(msg)) return;
+  let r;
+  try{ r=await (await fetch('/api/wizard/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})})).json(); }
+  catch(e){ alert('모드 변경 실패: '+e); return; }
+  if(r.error){ alert(r.error); return; }
+  if(r.copied&&r.copied.length) alert('같은 팔의 캘리브레이션 파일을 새 이름으로 복사했습니다: '+r.copied.join(', '));
+  location.reload();
 }
 
 function renderArms(){
@@ -5670,11 +6354,22 @@ class CalibSession:
             from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
             dev = SOLeader(SOLeaderTeleopConfig(id=arm["leader_id"], port=port, use_degrees=True))
         self.old_calib = dict(dev.calibration) if dev.calibration else None
-        dev.connect(calibrate=False)           # calibrate=True 면 input() 에서 멈춥니다
+        # calibrate=True 면 input() 에서 멈춥니다. 팔로워는 Goal=현재 위치로 맞춘 뒤 configure 해서
+        # 연결 순간 이전 목표로 튀지 않게 합니다 (connect_follower 참고)
+        if role == "follower":
+            connect_follower(dev)
+        else:
+            try:
+                dev.connect(calibrate=False)
+            except Exception:
+                close_arm(dev, disable_torque=False)
+                raise
         try:
             from lerobot.motors.feetech import OperatingMode
             # configure() 의 torque_disabled() 가 끝나며 토크를 다시 켜므로 여기서 확실히 끕니다
-            dev.bus.disable_torque()
+            failed = torque_off_all(dev.bus)
+            if failed:
+                raise RuntimeError(f"토크 해제 실패: {', '.join(failed)} — 전원·케이블 확인")
             for m in dev.bus.motors:
                 dev.bus.write("Operating_Mode", m, OperatingMode.POSITION.value)
             # Homing_Offset=0, 위치 제한 전체 개방 → 이제 읽는 값이 곧 원시 엔코더값
@@ -5682,10 +6377,12 @@ class CalibSession:
             self.reset_done = True
             pos = dev.bus.sync_read("Present_Position", normalize=False)
         except Exception:
-            try:
-                dev.disconnect()
-            except Exception:
-                pass
+            if self.reset_done and self.old_calib:
+                try:
+                    dev.bus.write_calibration(self.old_calib)
+                except Exception:
+                    pass
+            close_arm(dev)
             raise
         self.pos = {k: int(v) for k, v in pos.items()}
         self.prev_raw = dict(self.pos)
@@ -5732,10 +6429,7 @@ class CalibSession:
         dev, self.device = self.device, None
         if dev is not None:
             with self.lock:
-                try:
-                    dev.disconnect()
-                except Exception:
-                    pass
+                close_arm(dev)
 
     # ---- 판정 ----------------------------------------------------------------
     def problems(self):
@@ -5761,13 +6455,18 @@ class CalibSession:
         if m == FULL_TURN_MOTOR:
             # 전체 회전 관절: 지금 자세를 0° 기준으로, 범위는 한 바퀴 전체
             cur = int(self.pos.get(m, half))
-            off = cur - half
-            return _signed_mod(off), 0, RES - 1
+            off = _signed_mod(cur - half)
+            # Homing_Offset 은 부호-크기(11비트) 인코딩이라 ±2047 까지만 됩니다. -2048 은 2047 로 (1 tick 차이)
+            return (2047 if off == -RES_HALF else off), 0, RES - 1
         lo, hi = float(self.lo[m]), float(self.hi[m])
         center = (lo + hi) / 2
         half_span = (hi - lo) / 2
         off = _signed_mod(int(round(center)) - half)
-        return off, int(round(half - half_span)), int(round(half + half_span))
+        rmin, rmax = int(round(half - half_span)), int(round(half + half_span))
+        if off == -RES_HALF:
+            # -2048 대신 2047 을 쓰면 Present 가 +1 tick 밀리므로 범위도 같이 +1
+            off, rmin, rmax = 2047, rmin + 1, rmax + 1
+        return off, rmin, rmax
 
     def finish(self):
         if self.stage != "ranging":
@@ -6142,6 +6841,7 @@ def make_devices(spec):
     """spec = 시작 시점의 설정 스냅샷. (robot, teleop, 하위 팔 객체 목록) — 한팔/양팔 분기.
     하위 팔 객체 목록은 캘리브레이션 파일 확인·기록용입니다."""
     arms = {a["side"]: a for a in spec["arms"]}
+    mrt = mrt_value(spec.get("max_relative_target"))
     if spec["mode"] == "bimanual":
         from lerobot.robots.bi_so_follower import BiSOFollower, BiSOFollowerConfig
         from lerobot.robots.so_follower import SOFollowerConfig
@@ -6150,8 +6850,10 @@ def make_devices(spec):
         L, R = arms["left"], arms["right"]
         robot = BiSOFollower(BiSOFollowerConfig(
             id=bimanual_base_id("follower", arms),
-            left_arm_config=SOFollowerConfig(port=L["follower_port"], cameras=_cam_configs(L["cameras"])),
-            right_arm_config=SOFollowerConfig(port=R["follower_port"], cameras=_cam_configs(R["cameras"])),
+            left_arm_config=SOFollowerConfig(port=L["follower_port"], max_relative_target=mrt,
+                                             cameras=_cam_configs(L["cameras"])),
+            right_arm_config=SOFollowerConfig(port=R["follower_port"], max_relative_target=mrt,
+                                              cameras=_cam_configs(R["cameras"])),
             cameras=_cam_configs(spec["cameras"])))
         teleop = BiSOLeader(BiSOLeaderConfig(
             id=bimanual_base_id("leader", arms),
@@ -6165,7 +6867,8 @@ def make_devices(spec):
         cams = dict(arm["cameras"])
         cams.update(spec["cameras"])
         robot = SOFollower(SOFollowerRobotConfig(id=arm["follower_id"], port=arm["follower_port"],
-                                                 use_degrees=True, cameras=_cam_configs(cams)))
+                                                 use_degrees=True, max_relative_target=mrt,
+                                                 cameras=_cam_configs(cams)))
         teleop = SOLeader(SOLeaderTeleopConfig(id=arm["leader_id"], port=arm["leader_port"],
                                                use_degrees=True))
         subs = [robot, teleop]
@@ -6198,7 +6901,7 @@ class _Preview:
         st = dict(self.status)
         if st.get("t0"):
             st["elapsed"] = round(time.time() - st["t0"], 1)
-        tmp = self.rd / "status.json.tmp"
+        tmp = self.rd / "status.json.preview.tmp"     # put() 과 다른 임시 파일 (동시 쓰기 섞임 방지)
         tmp.write_text(json.dumps(st))
         os.replace(tmp, self.rd / "status.json")
 
@@ -6225,10 +6928,7 @@ class _Preview:
 
     def stop(self):
         self.on = False
-        try:
-            self.write_status()
-        except Exception:
-            pass
+        self.thread.join(timeout=2)     # 늦게 끝난 os.replace 가 최종 상태를 덮어쓰지 않게
 
 
 def worker_record(jid):
@@ -6247,12 +6947,20 @@ def worker_record(jid):
 
     def on_key(k):
         # exit_early 는 record_loop 안에서 소비되므로, 어느 단계에 있든 현재 루프를 깨웁니다.
+        # 단계에 맞지 않는 키는 무시합니다 (대기 중 'r' 이 다음 에피소드를 버리거나, 녹화 중 's' 가 저장처럼 동작하는 것 방지)
+        ph = status.get("phase")
         if k == "s":
+            if ph != "ready":
+                return
             ui["start"] = True
             events["exit_early"] = True
         elif k == "n":
+            if ph != "record":
+                return
             events["exit_early"] = True
         elif k == "r":
+            if ph != "record":
+                return
             events["rerecord_episode"] = True
             events["exit_early"] = True
         elif k == "q":
@@ -6326,7 +7034,8 @@ def worker_record(jid):
                                    num_episodes=int(spec["num_episodes"]),
                                    push_to_hub=False, streaming_encoding=bool(spec.get("streaming_encoding", False)))
         put(phase="dataset")
-        ncam = len(robot.cameras)
+        # 양팔은 robot.cameras 가 이름 충돌(wrist)로 줄어드므로 관측 키에서 셉니다
+        ncam = sum(1 for v in robot.observation_features.values() if isinstance(v, tuple))
         iw_p = dcfg.num_image_writer_processes if ncam else 0
         iw_t = dcfg.num_image_writer_threads_per_camera * ncam if ncam else 0
         if spec.get("resume"):
@@ -6347,11 +7056,14 @@ def worker_record(jid):
                 encoder_queue_maxsize=dcfg.encoder_queue_maxsize)
 
         put(phase="connecting")            # 시리얼 + 카메라 오픈. 카메라가 말썽이면 여기서 오래 걸립니다
-        robot.connect(calibrate=False)     # calibrate=True 면 input() → 파이프에서 EOFError
-        teleop.connect(calibrate=False)
-        for d in subs:
-            if not d.bus.is_calibrated:
-                d.bus.write_calibration(d.calibration)
+        # calibrate=True 면 input() → 파이프에서 EOFError. 팔 하나씩 안전 순서로 연결합니다
+        # (토크 끈 채 캘리브레이션 기록 → Goal=현재 위치 → configure). 양팔도 lerobot 이 팔별 connect 를 부릅니다.
+        followers = [robot.left_arm, robot.right_arm] if hasattr(robot, "left_arm") else [robot]
+        leaders = [teleop.left_arm, teleop.right_arm] if hasattr(teleop, "left_arm") else [teleop]
+        for d in followers:
+            connect_follower(d)
+        for d in leaders:
+            connect_leader(d)
         # 미리보기 이름은 관측 키 기준 — 양팔이면 left_wrist / right_wrist / top 처럼 접두사가 붙습니다
         # (robot.cameras 는 호환용이라 양팔에서 이름이 겹칩니다)
         status["cams"] = [k for k, v in robot.observation_features.items() if isinstance(v, tuple)]
@@ -6383,6 +7095,7 @@ def worker_record(jid):
             """대기(READY). 기록하지 않고 리더 팔로우만 유지합니다.
             dataset=None 이면 record_loop 은 add_frame 을 건너뜁니다."""
             ui["start"] = False
+            events["rerecord_episode"] = False    # 대기 중에 누른 '버리고 다시' 가 다음 에피소드를 버리지 않게
             put(phase="ready", t0=None, phase_len=0, episode=dataset.num_episodes, last=last)
             while not ui["start"] and not events["stop_recording"]:
                 record_loop(robot=robot, events=events, fps=fps,
@@ -6392,6 +7105,7 @@ def worker_record(jid):
                 read_temps()
                 put()
             events["exit_early"] = False
+            events["rerecord_episode"] = False
             ui["start"] = False
 
         with VideoEncodingManager(dataset):
@@ -6417,6 +7131,11 @@ def worker_record(jid):
                     dataset.clear_episode_buffer()
                     last = "버림"
                     continue
+                # 시작 직후 바로 '저장하고 다음' → 프레임 0개. save_episode 가 예외를 내므로 건너뜁니다
+                if not dataset.has_pending_frames():
+                    dataset.clear_episode_buffer()
+                    last = "빈 에피소드 — 저장 안 함"
+                    continue
                 put(phase="saving", t0=None)
                 dataset.save_episode()
                 recorded += 1
@@ -6428,6 +7147,16 @@ def worker_record(jid):
         rc = 1
     finally:
         alive["on"] = False
+        # 팔부터 놓습니다 — finalize 가 길어지는 동안 두 번째 '중지'(SIGKILL)가 와도 토크가 남지 않게.
+        # 양팔에서 한쪽만 연결된 채 실패해도 is_connected 가 False 라 disconnect() 를 건너뛰므로 팔별로 닫습니다.
+        if robot is not None:
+            for d in ([robot.left_arm, robot.right_arm] if hasattr(robot, "left_arm") else [robot]):
+                close_arm(d)
+        if teleop is not None:
+            for d in ([teleop.left_arm, teleop.right_arm] if hasattr(teleop, "left_arm") else [teleop]):
+                close_arm(d, disable_torque=False)
+        if preview is not None:
+            preview.stop()
         put(phase="finalizing", t0=None)
         if dataset is not None:
             try:
@@ -6435,14 +7164,6 @@ def worker_record(jid):
             except Exception as e:
                 logging.exception("finalize failed")
                 put(err=f"finalize: {e}")
-        for dev in (robot, teleop):
-            try:
-                if dev is not None and dev.is_connected:
-                    dev.disconnect()
-            except Exception:
-                pass
-        if preview is not None:
-            preview.stop()
         put(phase="error" if rc else "done")
     return rc
 
@@ -6634,8 +7355,9 @@ async function refresh(){
 }
 refresh(); setInterval(refresh,500);
 document.addEventListener('keydown',e=>{
-  if(e.target.tagName==='INPUT')return;
-  if(['s','n','r'].includes(e.key)) key(e.key);
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
+  if(e.ctrlKey||e.metaKey||e.altKey||e.repeat)return;      // Ctrl+R(새로고침) 이 '버리고 다시' 로 가지 않게
+  if(['s','n','r'].includes(e.key)) key(e.key);            // 단계에 맞지 않는 키는 워커가 무시합니다
 });
 </script>"""
 
@@ -6703,7 +7425,7 @@ def serve_video(ds: str, rest: str):
     if not safe_name(ds):
         return JSONResponse({"error": "not found"}, status_code=404)
     p = (DATA_ROOT / ds / "videos" / rest).resolve()
-    if not str(p).startswith(str(DATA_ROOT.resolve())) or not p.exists():
+    if not _within(p, DATA_ROOT / ds / "videos") or not p.is_file():
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(p, media_type="video/mp4")
 
