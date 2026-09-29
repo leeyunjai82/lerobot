@@ -874,7 +874,7 @@ class ArmCtl:
                 # 서보의 Goal_Position 은 이전 세션 값이 RAM 에 그대로 남아 있습니다.
                 # 그 상태로 토크만 켜면 서보가 그 목표로 전속 이동합니다.
                 # 기계적 스톱에 부딪히면 과부하 보호가 걸려 토크가 빠지고,
-                # 그 뒤로는 어떤 명령도 받지 않습니다 (전원 재투입 전까지).
+                # 보호가 풀릴 때까지 명령을 따르지 않습니다 (위치 명령 재전송으로 해제).
                 # 그래서 반드시 '현재 위치를 목표로 먼저 쓰고' 토크를 켭니다.
                 self.actual = self.read()
                 self.target = dict(self.actual)
@@ -2680,7 +2680,7 @@ def _arms_state():
         for n in stuck:
             te, ld = a.ten.get(n), a.load.get(n)
             if te == 0:
-                why = "서보가 토크를 뺐습니다 (과부하 보호) — 전원 재투입 필요할 수 있음"
+                why = "서보가 토크를 뺐습니다 (과부하 보호) — 토크를 껐다 다시 켜 보고, 안 풀리면 전원 재투입"
             elif te == 1 and ld is not None and abs(ld) > 200:
                 why = f"토크는 켜져 있는데 부하 {abs(ld)} — 기계적으로 막혀 버티는 중 (과열 위험)"
             elif te == 1:

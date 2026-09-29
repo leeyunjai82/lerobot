@@ -14,6 +14,7 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 | `urdf/` | SO-101 URDF/STL (Control 탭 3D 뷰용) |
 | `lerobot_conda.sh` | 새 기기 셋업 (conda env, PyTorch, lerobot 핀 커밋, 의존성) |
 | `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
+| `tools_armcheck.py` | 팔 한 개(보드 1개)의 불량 점검 — 응답·보호 플래그·전원·엔코더·구동 |
 
 실행하면 `~/project/lerobot/` 아래에 자동 생성되는 것:
 
@@ -160,8 +161,9 @@ lerobot CLI 는 먼저 "관절을 가동범위 중앙에 놓고 Enter" 를 요�
 
 STS3215 의 `Goal_Position` 은 RAM 에 **이전 세션 값이 그대로 남아** 있습니다.
 그 상태로 `Torque_Enable=1` 만 쓰면 서보가 그 목표로 전속 이동합니다.
-기계적 스톱에 부딪히면 과부하 보호가 걸려 서보가 스스로 토크를 빼고, 그 뒤로는
-어떤 `Goal_Position` 도 받지 않습니다 (전원 재투입 전까지). 증상은 "토크 ON 직후 관절 하나가
+기계적 스톱에 부딪히면 과부하 보호가 걸려 서보가 스스로 토크를 빼고, 보호가 풀릴 때까지
+명령을 따르지 않습니다 (Seeed 공식 도구 설명: 과부하·과전류 보호는 위치 명령을 다시 보내면 해제).
+증상은 "토크 ON 직후 관절 하나가
 끝까지 접힌 채 아무 명령도 안 먹고, 온도는 오르지 않음" 입니다 — 버티는 중이면 뜨거워지지만
 보호로 토크가 빠지면 차갑습니다.
 
@@ -184,7 +186,7 @@ Control 탭의 명령 적분기는 목표에 도달하면(데드밴드 0.2°) �
 
 | Torque_Enable | Present_Load | 판정 |
 |---|---|---|
-| 0 | — | 서보가 **스스로 토크를 뺌** (과부하 보호 래치) — 전원 재투입 필요할 수 있음 |
+| 0 | — | 서보가 **스스로 토크를 뺌** (과부하 보호) — 현재 위치를 목표로 다시 쓰고 토크를 다시 켜면 풀림. 안 풀리면 전원 재투입 |
 | 1 | 큼 (>200) | **기계적으로 막혀 버티는 중** — 그대로 두면 과열 |
 | 1 | ~0 | 서보가 명령을 안 받음 (배선·ID·펌웨어) |
 
@@ -243,6 +245,42 @@ CLI(`lerobot-record`)는 연결이 끝나면 곧바로 episode 0 을 찍고, `re
 화면에 띄웁니다. Feetech 는 반이중 버스라 녹화 루프와 **동시에** 읽으면 패킷이 섞입니다 —
 반드시 `record_loop` 바깥에서 읽어야 합니다. 대기가 길어지면 서보는 계속 토크를 물고
 리더를 따라가므로 발열이 쌓입니다 (STS3215 는 토크를 끄면 팔이 처져서 끌 수도 없습니다).
+
+## 팔 불량 점검 — `tools_armcheck.py`
+
+lrweb 없이 단독으로 돕니다 (lerobot conda env 안에서). 포트 하나 = 팔 하나.
+lrweb 가 그 포트를 잡고 있으면(Control·Collect·Setup 포트 감시) 먼저 끄세요.
+
+```bash
+python tools_armcheck.py --port /dev/serial/by-id/usb-... --role follower          # 기본: 서보에 아무것도 안 씀
+python tools_armcheck.py --port ... --role leader   --sweep                        # + 손으로 관절 쓸기
+python tools_armcheck.py --port ... --role follower --move                         # + 관절마다 13° 구동
+```
+
+| 단계 | 서보에 쓰는 것 | 보는 것 |
+|---|---|---|
+| 기본 | 없음 | ID 1~6 응답, 모델(STS3215), 보호 플래그(Status 레지스터 + 응답 에러 바이트), 5V/12V 계통과 전압 범위, 모터 간 전압 편차, 온도, 정지 중 엔코더 흔들림, 통신 누락 |
+| `--sweep` | `Torque_Enable=0` | 관절마다 손으로 양 끝까지 → 움직인 범위, 엔코더 튐, 읽기 실패 |
+| `--move` | `Goal_Position`(현재 위치 먼저) → `Torque_Enable=1` | 관절 하나씩 가동범위 중앙 쪽으로 150 tick(≈13°) 갔다 오기 → 도달 여부·시간·최대 전류 |
+
+EEPROM 은 쓰지 않습니다. 종료 코드 `0 정상 / 1 주의 / 2 불량 의심 / 3 실행 실패`, `--json` 으로 기록용 출력.
+
+**`--role` 을 꼭 주세요.** 리더(7.4V 모터)가 12V 계통으로 읽히면 즉시 전원 분리를 요구하고
+구동 시험을 막습니다. 리더에는 `--move` 를 하지 않습니다.
+
+판정 기준의 출처:
+
+| 값 | 출처 |
+|---|---|
+| 보호 비트: 1 전압 · 2 각도센서 · 4 과열 · 8 과전류 · 32 과부하 | Feetech SDK `protocol_packet_handler.py` `ERRBIT_*` |
+| 전압 = `Present_Voltage / 10` V, 5V 계통 4.5~5.5 V / 12V 계통 10.5~13.5 V (7.0 V 미만이면 5V) | [Seeed_RoboController](https://github.com/Seeed-Projects/Seeed_RoboController) `servo_middle_calibration.py` |
+| 온도 60 °C 초과 주의, 70 °C 초과 서보가 토크 차단 | 같은 저장소 `servo_middle_calibration.py`, `factory_calibration_tool.py` |
+| 전류 1 단위 ≈ 6.5 mA, Status 레지스터(65)를 보호 비트로 해석 | 같은 저장소 `factory_calibration_tool.py` |
+| 엔코더 흔들림 3/10 tick, 튐 400 tick, 도착 허용 30 tick, 1.5 s, 온도 편차 8 °C | 경험값 — 옵션으로 조정 |
+
+Seeed 저장소의 `servo_register_diag.py --move` 는 **조립된 팔에 쓰지 마세요.**
+목표 위치를 먼저 쓰지 않고 토크를 켠 뒤 절대 위치(1500 → 2600 → 2048)로 보내서,
+관절이 가동범위 끝에 있으면 기계적 스톱이나 책상에 부딪힙니다. 단품 서보용입니다.
 
 ## 접속
 
