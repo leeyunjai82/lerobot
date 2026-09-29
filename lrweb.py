@@ -39,6 +39,7 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    RedirectResponse,
     Response,
     StreamingResponse,
 )
@@ -307,6 +308,195 @@ def save_marks(m):
     save_json(MARKS_FILE, m)
 
 
+# ----------------------------- 환경 · 프로젝트 · 데이터셋 메타 ------------------
+# 환경 = 하드웨어 구성 한 벌(모드·포트·캘리브 id·카메라·fps).
+# 활성 환경은 언제나 lrweb_config.json 입니다 — 나머지 코드는 이 파일만 봅니다.
+# 이름 붙은 사본을 lrweb_envs/<이름>.json 에 두고, 전환하면 그 사본을 활성 설정으로 복사합니다.
+ENV_DIR = PROJ / "lrweb_envs"
+PROJECTS_FILE = PROJ / "lrweb_projects.json"
+DSMETA_FILE = PROJ / "lrweb_dsmeta.json"
+DEFAULT_ENV = "default"
+
+
+def env_name():
+    return (CFG or {}).get("env_name") or DEFAULT_ENV
+
+
+def _env_file(name):
+    if not safe_name(name):
+        raise ValueError("환경 이름은 영문/숫자/._- 만")
+    return ENV_DIR / f"{name}.json"
+
+
+def _env_summary(name, cfg, mtime=None):
+    arms = [{"side": a.get("side"), "follower_port": a.get("follower_port", ""),
+             "leader_port": a.get("leader_port", ""),
+             "follower_id": a.get("follower_id", ""), "leader_id": a.get("leader_id", ""),
+             "cameras": sorted((a.get("cameras") or {}).keys())}
+            for a in (cfg.get("arms") or []) if isinstance(a, dict)]
+    return {"name": name, "mode": cfg.get("mode", "single"), "arms": arms,
+            "cameras": sorted((cfg.get("cameras") or {}).keys()), "fps": cfg.get("fps"),
+            "updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)) if mtime else "",
+            "active": name == env_name()}
+
+
+def _write_active_config(cfg):
+    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    merged.update(cfg)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
+    _rebind(load_config())
+
+
+def sync_active_env():
+    """활성 설정을 그 이름의 환경 파일에도 씁니다 (Setup 저장 때마다)."""
+    ENV_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = json.loads(json.dumps(CFG))
+    cfg["env_name"] = env_name()
+    save_json(_env_file(env_name()), cfg)
+
+
+def list_envs():
+    ENV_DIR.mkdir(parents=True, exist_ok=True)
+    if not _env_file(env_name()).exists():
+        sync_active_env()                 # 처음 켤 때 지금 설정이 'default' 환경이 됩니다
+    out = []
+    for f in sorted(ENV_DIR.glob("*.json")):
+        cfg = load_json(f, None)
+        if isinstance(cfg, dict) and safe_name(f.stem):
+            out.append(_env_summary(f.stem, cfg, f.stat().st_mtime))
+    return out
+
+
+def activate_env(name):
+    cfg = load_json(_env_file(name), None)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"환경 없음: {name}")
+    cfg["env_name"] = name
+    err = validate_config(cfg)
+    if err:
+        raise ValueError(f"환경 '{name}' 의 설정이 올바르지 않습니다: {err}")
+    _write_active_config(cfg)
+
+
+def save_env_as(name):
+    if _env_file(name).exists():
+        raise ValueError(f"이미 있는 환경 이름: {name}")
+    cfg = json.loads(json.dumps(CFG))
+    cfg["env_name"] = name
+    _write_active_config(cfg)
+    sync_active_env()
+
+
+def rename_env(old, new):
+    src, dst = _env_file(old), _env_file(new)
+    if not src.exists():
+        raise ValueError(f"환경 없음: {old}")
+    if dst.exists():
+        raise ValueError(f"이미 있는 환경 이름: {new}")
+    cfg = load_json(src, {})
+    cfg["env_name"] = new
+    save_json(dst, cfg)
+    src.unlink()
+    if old == env_name():
+        c = json.loads(json.dumps(CFG))
+        c["env_name"] = new
+        _write_active_config(c)
+    meta = load_dsmeta()
+    for m in meta.values():
+        if m.get("env") == old:
+            m["env"] = new
+    save_dsmeta(meta)
+    d = load_projects()
+    for pr in d["projects"].values():
+        if pr.get("env") == old:
+            pr["env"] = new
+    save_projects(d)
+
+
+def delete_env(name):
+    if name == env_name():
+        raise ValueError("사용 중인 환경은 지울 수 없습니다 — 다른 환경으로 전환한 뒤 지우세요")
+    f = _env_file(name)
+    if not f.exists():
+        raise ValueError(f"환경 없음: {name}")
+    f.unlink()
+
+
+# 데이터셋 메타 — lerobot 파일은 건드리지 않고 lrweb 쪽에만 둡니다 {데이터셋: {env, created}}
+def load_dsmeta():
+    d = load_json(DSMETA_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def save_dsmeta(d):
+    save_json(DSMETA_FILE, d)
+
+
+# 프로젝트 = 한 가지 태스크 묶음 {task, env, datasets[], models[]}.
+# 데이터셋·모델은 한 프로젝트에만 속합니다. 프로젝트가 없거나 '전체' 면 지금과 똑같이 동작합니다.
+def load_projects():
+    d = load_json(PROJECTS_FILE, {})
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("active", "")
+    d.setdefault("projects", {})
+    for pr in d["projects"].values():
+        pr.setdefault("task", "")
+        pr.setdefault("env", "")
+        pr.setdefault("datasets", [])
+        pr.setdefault("models", [])
+    if d["active"] not in d["projects"]:
+        d["active"] = ""
+    return d
+
+
+def save_projects(d):
+    save_json(PROJECTS_FILE, d)
+
+
+def active_project():
+    d = load_projects()
+    name = d["active"]
+    return (name, d["projects"][name]) if name else ("", None)
+
+
+def _touch(pr):
+    pr["updated"] = time.strftime("%Y-%m-%d %H:%M")
+
+
+def project_of(kind, item):
+    """kind: 'datasets' | 'models'"""
+    for name, pr in load_projects()["projects"].items():
+        if item in pr[kind]:
+            return name
+    return ""
+
+
+def assign_to_project(kind, item, project):
+    """item 을 project 로 옮깁니다 (빈 문자열이면 미분류)."""
+    d = load_projects()
+    if project and project not in d["projects"]:
+        raise ValueError(f"프로젝트 없음: {project}")
+    for pr in d["projects"].values():
+        if item in pr[kind]:
+            pr[kind].remove(item)
+            _touch(pr)
+    if project:
+        d["projects"][project][kind].append(item)
+        _touch(d["projects"][project])
+    save_projects(d)
+
+
+def rename_in_projects(kind, old, new):
+    d = load_projects()
+    for pr in d["projects"].values():
+        if old in pr[kind]:
+            pr[kind] = [new if x == old else x for x in pr[kind]]
+            _touch(pr)
+    save_projects(d)
+
+
 def _clamp_int(v, default, lo, hi):
     try:
         n = int(v)
@@ -473,6 +663,8 @@ def ep_video_segments(df, ep):
                          "to": float(row.get(f"videos/{k}/to_timestamp", 0))})
         except Exception:
             continue
+    # 전경 카메라(top 등)를 앞에 — 썸네일·첫 칸에 손목 카메라보다 알아보기 쉽습니다
+    segs.sort(key=lambda sg: (0 if sg["cam"] in ("top", "overview", "front", "scene") else 1, sg["cam"]))
     return segs
 
 
@@ -1367,6 +1559,7 @@ class ArmCheckSession:
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.history = {}        # port -> 마지막 판정 요약 (셋업 마법사가 봅니다)
         self._reset()
 
     def _reset(self):
@@ -1411,6 +1604,13 @@ class ArmCheckSession:
             AC.finalize(rep)
             self._close()
             self.stage = "done"
+            self._remember()
+
+    def _remember(self):
+        d = self.rep.as_dict()
+        self.history[self.port] = {"verdict": d["verdict"], "code": d["code"], "power": d["power"],
+                                   "role": self.role, "when": time.strftime("%H:%M"),
+                                   "missing": [j for j, m in d["motors"].items() if m.get("model") is None]}
 
     def _sample(self):
         import tools_armcheck as AC
@@ -1439,6 +1639,7 @@ class ArmCheckSession:
         AC.finalize(self.rep)
         self._close()
         self.stage = "done"
+        self._remember()
 
     def fail(self, e):
         self._stop_sampler()
@@ -1470,6 +1671,113 @@ class ArmCheckSession:
 ARMCHECK = ArmCheckSession()
 
 
+def calib_file(role, calib_id):
+    sub_dir = "robots/so_follower" if role == "follower" else "teleoperators/so_leader"
+    return CALIB_ROOT / sub_dir / f"{calib_id}.json"
+
+
+class VerifySession:
+    """셋업 마법사 '확인' 단계. 캘리브레이션 파일로 정규화한 현재 관절값을 읽기만 합니다.
+    서보에는 쓰지 않습니다 — '토크 끄기' 를 누를 때만 Torque_Enable=0.
+
+    서보 EEPROM 의 Homing_Offset 이 파일과 다르면, 연결할 때 lerobot 이 파일 값을 써 넣습니다
+    (write_calibration). 그때 보일 값을 미리 보여 주려고 그 차이만큼 보정해서 정규화합니다."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._reset()
+
+    def _reset(self):
+        self.bus = None
+        self.side = self.role = ""
+        self.on = False
+        self.joints = {}
+        self.torque = {}
+        self.adj = {}
+        self.warn = []
+        self.err = ""
+        self._th = None
+
+    @property
+    def active(self):
+        return self.on
+
+    def start(self, side, role):
+        from lerobot.motors import MotorCalibration
+        from lerobot.motors.feetech import FeetechMotorsBus
+        self.stop()
+        arm = ARM_CFGS[side]
+        port = arm.get(f"{role}_port") or ""
+        f = calib_file(role, arm[f"{role}_id"])
+        if not port:
+            raise RuntimeError("포트가 지정되지 않았습니다")
+        if not f.is_file():
+            raise RuntimeError(f"캘리브레이션 파일이 없습니다: {f}")
+        data = json.loads(f.read_text())
+        cal = {n: MotorCalibration(**data[n]) for n in CTL_JOINTS}
+        bus = FeetechMotorsBus(port, _feetech_motors(), calibration=cal)
+        bus.connect(handshake=False)
+        try:
+            eeprom = bus.sync_read("Homing_Offset", normalize=False)
+            self.torque = {k: int(v) for k, v in bus.sync_read("Torque_Enable", normalize=False).items()}
+        except Exception:
+            bus.disconnect(disable_torque=False)
+            raise
+        self.adj = {n: int(eeprom[n]) - int(cal[n].homing_offset) for n in CTL_JOINTS}
+        diff = [n for n, v in self.adj.items() if v]
+        self.warn = ([f"서보에 저장된 homing offset 이 파일과 다릅니다 ({', '.join(diff)}) — "
+                      "Control·수집에서 연결할 때 파일 값이 써집니다. 아래 값은 그 기준입니다."] if diff else [])
+        self.bus, self.side, self.role, self.err = bus, side, role, ""
+        self.on = True
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def _loop(self):
+        last_t = 0.0
+        while self.on:
+            try:
+                with self.lock:
+                    raw = self.bus.sync_read("Present_Position", normalize=False)
+                    if time.monotonic() - last_t > 1.0:
+                        self.torque = {k: int(v) for k, v in
+                                       self.bus.sync_read("Torque_Enable", normalize=False).items()}
+                        last_t = time.monotonic()
+                ids = {self.bus.motors[n].id: int(v) + self.adj.get(n, 0) for n, v in raw.items()}
+                norm = self.bus._normalize(ids)
+                self.joints = {n: round(float(norm[self.bus.motors[n].id]), 1) for n in raw}
+                self.err = ""
+            except Exception as e:
+                self.err = f"{type(e).__name__}: {e}"
+            time.sleep(0.05)
+
+    def torque_off(self):
+        if not self.on:
+            raise RuntimeError("확인 중이 아닙니다")
+        with self.lock:
+            self.bus.disable_torque()
+            self.torque = {k: int(v) for k, v in self.bus.sync_read("Torque_Enable", normalize=False).items()}
+
+    def stop(self):
+        self.on = False
+        th, self._th = self._th, None
+        if th is not None:
+            th.join(timeout=2)
+        bus, self.bus = self.bus, None
+        if bus is not None:
+            try:
+                bus.disconnect(disable_torque=False)     # 토크 상태는 건드리지 않습니다
+            except Exception:
+                pass
+        self._reset()
+
+    def state(self):
+        return {"on": self.on, "side": self.side, "role": self.role, "joints": self.joints,
+                "torque_on": [k for k, v in self.torque.items() if v], "warn": self.warn, "err": self.err}
+
+
+VERIFY = VerifySession()
+
+
 def busy_with(kinds):
     for j in jobs_index():
         if j["alive"] and j["kind"] in kinds:
@@ -1489,6 +1797,8 @@ def robot_busy():
         return {"id": "motor-id-setup (Setup 탭)", "kind": "setup", "alive": True}
     if ARMCHECK.active:
         return {"id": "arm-check (Setup 탭)", "kind": "setup", "alive": True}
+    if VERIFY.active:
+        return {"id": "verify (셋업 마법사)", "kind": "setup", "alive": True}
     return busy_with(("record", "rollout"))
 
 
@@ -1508,6 +1818,8 @@ def exclusive_busy():
         return {"id": "motor-id-setup (Setup 탭)", "kind": "setup", "alive": True}
     if ARMCHECK.active:
         return {"id": "arm-check (Setup 탭)", "kind": "setup", "alive": True}
+    if VERIFY.active:
+        return {"id": "verify (셋업 마법사)", "kind": "setup", "alive": True}
     return busy_with(("record", "rollout", "train"))
 
 
@@ -1673,8 +1985,12 @@ def nav_html(active=""):
                    f'{esc(j["kind"].upper())} · {esc(j["id"])}{extra}</div>')
     else:
         cluster = '<div class=statuscluster><span class=dot></span>IDLE</div>'
-    mode_badge = ('<span class="badge b-run">양팔</span>' if BIMANUAL
-                  else '<span class="badge">한팔</span>')
+    pname, _ = active_project()
+    mode_badge = (f'<a href="/projects" title="프로젝트"><span class="badge b-run">{esc(pname)}</span></a> '
+                  if pname else '<a href="/projects" title="프로젝트"><span class=badge>전체</span></a> ')
+    mode_badge += f'<a href="/setup#envcard" title="환경"><span class=badge>{esc(env_name())}</span></a> '
+    mode_badge += ('<span class="badge b-run">양팔</span>' if BIMANUAL
+                   else '<span class="badge">한팔</span>')
     if not ports_configured():
         mode_badge += ' <a href="/setup"><span class="badge b-warn">포트 미설정</span></a>'
     cluster = cluster.replace('<div class=statuscluster>',
@@ -1685,7 +2001,7 @@ def nav_html(active=""):
         return f'<a href="{href}"{on}>{label}</a>'
 
     return (f'<div class=appbar><div class=brand>LRWEB <small>/ SO-101 PIPELINE</small></div>'
-            f'<div class=nav>{tab("/", "Datasets", "ds")}{tab("/collect", "Collect", "co")}'
+            f'<div class=nav>{tab("/projects", "Projects", "pj")}{tab("/", "Datasets", "ds")}{tab("/collect", "Collect", "co")}'
             f'{tab("/train", "Training", "tr")}{tab("/rollout", "Rollout", "ro")}'
             f'{tab("/control", "Control", "ct")}{tab("/calib", "Calib", "cb")}{tab("/setup", "Setup", "st")}'
             f'{tab("/jobs", "Jobs", "jb")}</div>{cluster}'
@@ -1726,36 +2042,195 @@ def api_sw():
 
 
 # ----------------------------- 페이지: 데이터셋 -------------------------------
+# ----------------------------- 프로젝트 ---------------------------------------
+def dataset_thumb(ds):
+    """썸네일용: 첫 에피소드의 첫 카메라 영상 URL 과 시작 시각. 프레임은 브라우저가 뽑습니다
+    (서버에서 디코딩하지 않으므로 AV1 등 코덱과 무관)."""
+    try:
+        segs = ep_video_segments(episodes_df(ds), 0)
+    except Exception:
+        return None
+    if not segs:
+        return None
+    s0 = segs[0]
+    return {"url": f"/videos/{ds}/{s0['path']}", "t": s0["from"]}
+
+
+def projects_view():
+    d = load_projects()
+    dsets = {x["name"]: x for x in list_datasets()}
+    ckpt_runs = {r.split("/checkpoints/")[0] for r in list_checkpoints()}
+    runs = {p.name for p in OUT_ROOT.iterdir() if p.is_dir()} if OUT_ROOT.exists() else set()
+    assigned = set()
+    meta = load_dsmeta()
+    out = []
+    for name, pr in d["projects"].items():
+        ds = [dsets[x] for x in pr["datasets"] if x in dsets]
+        assigned.update(x["name"] for x in ds)
+        latest = max(ds, key=lambda x: meta.get(x["name"], {}).get("created", ""), default=None)
+        out.append({"name": name, "task": pr["task"], "env": pr["env"],
+                    "datasets": [{"name": x["name"], "episodes": x["episodes"]} for x in ds],
+                    "episodes": sum(x["episodes"] for x in ds if isinstance(x["episodes"], int)),
+                    "models": [{"name": m, "has_ckpt": m in ckpt_runs} for m in pr["models"] if m in runs],
+                    "updated": pr.get("updated", ""), "created": pr.get("created", ""),
+                    "thumb": dataset_thumb(latest["name"]) if latest else None})
+    out.sort(key=lambda x: x["updated"], reverse=True)
+    unassigned = [{"name": n, "episodes": x["episodes"]} for n, x in dsets.items() if n not in assigned]
+    return {"active": d["active"], "projects": out, "unassigned": unassigned,
+            "envs": [e["name"] for e in list_envs()], "env": env_name(),
+            "all": {"datasets": len(dsets),
+                    "episodes": sum(x["episodes"] for x in dsets.values() if isinstance(x["episodes"], int)),
+                    "models": len(runs)}}
+
+
+@app.get("/api/projects")
+def api_projects():
+    return projects_view()
+
+
+@app.post("/api/projects/save")
+async def api_project_save(req: Request):
+    b = await req.json()
+    name = (b.get("name") or "").strip()
+    old = (b.get("old") or "").strip()
+    if not safe_name(name):
+        return JSONResponse({"error": "프로젝트 이름은 영문/숫자/._- 만"}, status_code=400)
+    env = (b.get("env") or "").strip()
+    if env and not safe_name(env):
+        return JSONResponse({"error": "환경 이름 오류"}, status_code=400)
+    d = load_projects()
+    if old and old not in d["projects"]:
+        return JSONResponse({"error": f"프로젝트 없음: {old}"}, status_code=400)
+    if name != old and name in d["projects"]:
+        return JSONResponse({"error": f"이미 있는 프로젝트: {name}"}, status_code=400)
+    pr = d["projects"].pop(old) if old else {"datasets": [], "models": [],
+                                             "created": time.strftime("%Y-%m-%d %H:%M")}
+    pr["task"] = (b.get("task") or "").strip()[:300]
+    pr["env"] = env
+    _touch(pr)
+    d["projects"][name] = pr
+    if old and d["active"] == old:
+        d["active"] = name
+    if not old and b.get("activate"):
+        d["active"] = name
+    save_projects(d)
+    return projects_view()
+
+
+@app.post("/api/projects/activate")
+async def api_project_activate(req: Request):
+    b = await req.json()
+    name = (b.get("name") or "").strip()
+    d = load_projects()
+    if name and name not in d["projects"]:
+        return JSONResponse({"error": f"프로젝트 없음: {name}"}, status_code=400)
+    d["active"] = name
+    save_projects(d)
+    return projects_view()
+
+
+@app.post("/api/projects/delete")
+async def api_project_delete(req: Request):
+    b = await req.json()
+    d = load_projects()
+    name = (b.get("name") or "").strip()
+    if name not in d["projects"]:
+        return JSONResponse({"error": f"프로젝트 없음: {name}"}, status_code=400)
+    del d["projects"][name]
+    if d["active"] == name:
+        d["active"] = ""
+    save_projects(d)
+    return projects_view()
+
+
+@app.post("/api/projects/assign")
+async def api_project_assign(req: Request):
+    b = await req.json()
+    kind = b.get("kind")
+    item = (b.get("item") or "").strip()
+    if kind not in ("datasets", "models") or not safe_name(item):
+        return JSONResponse({"error": "잘못된 요청"}, status_code=400)
+    try:
+        assign_to_project(kind, item, (b.get("project") or "").strip())
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return projects_view()
+
+
+@app.get("/projects", response_class=HTMLResponse)
+def projects_page():
+    return CSS + nav_html("pj") + PROJECTS_HTML
+
+
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(all: int = 0):
+    pname, pr = active_project()
+    meta = load_dsmeta()
+    projects = load_projects()["projects"]
+    owner = {x: n for n, pj in projects.items() for x in pj["datasets"]}
+    dsets = list_datasets()
+    show_all = bool(all) or not pname
+    view = dsets if show_all else [d for d in dsets if owner.get(d["name"]) == pname]
+    cur_env = env_name()
+
     def _row(d):
+        n = d["name"]
         mismatch = ' <span class="badge b-warn">모드 불일치</span>' \
             if d["robot_type"] and d["robot_type"] != robot_name() else ""
         ver = d["version"]
         verbadge = (f'<span class=badge>{esc(ver)}</span>' if ver == "v3.0"
                     else f'<span class="badge b-warn">{esc(ver)}</span>')
-        return (f'<tr><td><a href="/ds/{esc(d["name"])}" class=mono>{esc(d["name"])}</a></td>'
+        env = meta.get(n, {}).get("env", "")
+        envcell = (f'<span class=mono style="color:{"var(--text)" if env == cur_env else "var(--dim)"}">{esc(env)}</span>'
+                   if env else '<span class=tiny>-</span>')
+        projcell = ""
+        if show_all and projects:
+            opts = "".join(f'<option value="{esc(x)}"{" selected" if owner.get(n) == x else ""}>{esc(x)}</option>'
+                           for x in projects)
+            projcell = (f'<td><select onchange="moveDs({jsattr(n)},this.value)">'
+                        f'<option value="">미분류</option>{opts}</select></td>')
+        return (f'<tr><td><a href="/ds/{esc(n)}" class=mono>{esc(n)}</a></td>'
                 f'<td class=num>{esc(d["episodes"])}</td><td class=num>{esc(d["frames"])}</td>'
                 f'<td class=num>{esc(d["fps"])}</td>'
                 f'<td class=mono style="color:var(--muted)">{esc(d["robot_type"])}{mismatch}</td>'
+                f'<td>{envcell}</td>{projcell}'
                 f'<td>{verbadge}</td>'
                 f'<td class=num style="color:var(--muted)">{esc(human_bytes(d["bytes"]))}</td>'
                 f'<td style="text-align:right;white-space:nowrap">'
-                f'<a class=btnlink href="/api/download/{esc(d["name"])}" '
+                f'<a class=btnlink href="/ds/{esc(n)}">리뷰</a> '
+                f'<a class=btnlink href="/api/download/{esc(n)}" '
                 f'title="폴더를 그대로 tar 로 내려받습니다 ({d["files"]}개 파일)">다운로드</a> '
-                f'<button class=danger onclick="delDs({jsattr(d["name"])})">삭제</button></td></tr>')
-    rows = "".join(_row(d) for d in list_datasets())
-    empty = ('' if rows else
-             '<tr><td colspan=8 class=muted>데이터셋이 없습니다 — Collect 탭에서 수집을 시작하세요</td></tr>')
+                f'<button class=danger onclick="delDs({jsattr(n)})">삭제</button></td></tr>')
+    rows = "".join(_row(d) for d in view)
+    ncol = 10 + (1 if show_all and projects else 0)
+    if rows:
+        empty = ""
+    elif show_all:
+        empty = f'<tr><td colspan={ncol} class=muted>데이터셋이 없습니다 — Collect 탭에서 수집을 시작하세요</td></tr>'
+    else:
+        empty = (f'<tr><td colspan={ncol} class=muted>이 프로젝트에 데이터셋이 없습니다 — Collect 에서 수집하면 자동으로 들어옵니다. '
+                 f'기존 데이터셋은 <a href="/?all=1">전체 보기</a>에서 옮기세요.</td></tr>')
+    if pname:
+        head = (f'<p class=eyebrow>Project · {esc(pname)}</p><h2>Datasets</h2>'
+                f'<p class=muted>{esc(pr["task"]) or "<i>태스크 설명 없음</i>"} · 기준 환경 '
+                f'<span class=mono>{esc(pr["env"] or "지정 안 함")}</span>'
+                + (f' <span class="badge b-warn">지금 환경은 {esc(cur_env)}</span>' if pr["env"] and pr["env"] != cur_env else "")
+                + (f' · <a href="/">이 프로젝트만 보기</a>' if show_all else f' · <a href="/?all=1">전체 보기</a>')
+                + ' · <a href="/projects">프로젝트 목록</a></p>')
+    else:
+        head = ('<p class=eyebrow>All datasets</p><h2>Datasets</h2>'
+                '<p class=muted>프로젝트 구분 없이 모두 보는 중입니다 — <a href="/projects">프로젝트</a>를 열면 그 프로젝트 기준으로 보입니다.</p>')
+    projhead = '<th>프로젝트</th>' if show_all and projects else ''
     return f"""{CSS}{nav_html('ds')}<div class=wrap>
-    <p class=eyebrow>Local datasets</p><h2>Datasets</h2>
+    {head}
     <div class=card><table>
     <tr><th>name</th><th class=num>episodes</th><th class=num>frames</th><th class=num>fps</th>
-    <th>robot</th><th>format</th><th class=num>size</th><th></th></tr>
+    <th>robot</th><th>환경</th>{projhead}<th>format</th><th class=num>size</th><th></th></tr>
     {rows}{empty}</table></div>
     <p class=muted>다운로드는 <b>LeRobotDataset v3.0</b> 폴더를 그대로 tar 로 감싼 것입니다 (압축 없음).
     받은 뒤 <span class=mono>tar xf 이름_v3.0.tar</span> 로 풀면 바로
-    <span class=mono>LeRobotDataset(repo_id, root=풀린폴더)</span> 로 열립니다.</p>
+    <span class=mono>LeRobotDataset(repo_id, root=풀린폴더)</span> 로 열립니다.
+    환경 열은 수집할 때 쓴 환경이고, 흐리게 보이면 지금 환경과 다른 것입니다.</p>
     <p class=muted>삭제는 폴더를 통째로 지웁니다 (복구 불가). 데이터셋 이름을 입력해야 실행됩니다.</p></div>
     <script>
     async function delDs(name){{
@@ -1764,6 +2239,12 @@ def index():
       const r = await fetch('/api/delete_dataset/'+encodeURIComponent(name), {{method:'POST'}});
       const d = await r.json();
       if(d.error) alert(d.error); else location.reload();
+    }}
+    async function moveDs(name, project){{
+      const r = await fetch('/api/projects/assign', {{method:'POST', headers:{{'Content-Type':'application/json'}},
+        body: JSON.stringify({{kind:'datasets', item:name, project:project}})}});
+      const d = await r.json();
+      if(d.error) alert(d.error);
     }}
     </script>"""
 
@@ -1784,6 +2265,10 @@ def api_delete_dataset(ds: str):
     m = load_marks()
     m.pop(ds, None)
     save_marks(m)
+    meta = load_dsmeta()
+    if meta.pop(ds, None) is not None:
+        save_dsmeta(meta)
+    assign_to_project("datasets", ds, "")
     return {"ok": True}
 
 
@@ -1883,90 +2368,132 @@ def api_download_dataset(ds: str):
                  "Cache-Control": "no-store"})
 
 
+def _feature_names(info, key):
+    f = (info.get("features") or {}).get(key) or {}
+    names = f.get("names")
+    if isinstance(names, dict):                      # {"motors": [...]} 형식
+        names = next(iter(names.values()), [])
+    return list(names) if isinstance(names, (list, tuple)) else []
+
+
+def dataset_review_info(ds):
+    root = DATA_ROOT / ds
+    info = load_json(root / "meta/info.json", {})
+    df = episodes_df(ds)
+    fps = float(info.get("fps") or 30)
+    eps = []
+    for _, r in df.iterrows():
+        ep = int(r["episode_index"])
+        segs = [{"cam": sg["cam"], "url": f"/videos/{ds}/{sg['path']}", "from": sg["from"], "to": sg["to"]}
+                for sg in ep_video_segments(df, ep)]
+        length = int(r.get("length", 0) or 0)
+        tasks = r.get("tasks", "")
+        if hasattr(tasks, "tolist"):
+            tasks = tasks.tolist()
+        if isinstance(tasks, (list, tuple)):
+            tasks = " / ".join(str(t) for t in tasks)
+        dur = (segs[0]["to"] - segs[0]["from"]) if segs else (length / fps if fps else 0)
+        eps.append({"ep": ep, "length": length, "dur": round(dur, 2), "task": str(tasks or "")})
+        eps[-1]["segs"] = segs
+    lens = sorted(e["length"] for e in eps if e["length"])
+    med = lens[len(lens) // 2] if lens else 0
+    for e in eps:                                     # 불량 후보 힌트: 중앙값의 절반도 안 되는 에피소드
+        e["short"] = bool(med and e["length"] < med * 0.5)
+    state = _feature_names(info, "observation.state")
+    return {"name": ds, "fps": fps, "robot_type": info.get("robot_type", ""),
+            "version": info.get("codebase_version", ""), "episodes": eps,
+            "state_names": state, "action_names": _feature_names(info, "action"),
+            "bimanual": any(n.startswith("left_") for n in state),
+            "marks": load_marks().get(ds, []), "env": load_dsmeta().get(ds, {}).get("env", ""),
+            "project": project_of("datasets", ds)}
+
+
+@app.get("/api/ds/{ds}/info")
+def api_ds_info(ds: str):
+    if not safe_name(ds) or not (DATA_ROOT / ds / "meta/info.json").exists():
+        return JSONResponse({"error": "데이터셋 없음"}, status_code=404)
+    return dataset_review_info(ds)
+
+
+@app.get("/api/ds/{ds}/ep/{ep}/data")
+def api_ep_data(ds: str, ep: int):
+    """관절 그래프·3D 재생용 — observation.state / action 을 에피소드 하나만."""
+    if not safe_name(ds):
+        return JSONResponse({"error": "잘못된 데이터셋 이름"}, status_code=400)
+    df = episodes_df(ds)
+    row = df[df["episode_index"] == ep] if not df.empty else df
+    if row.empty:
+        return JSONResponse({"error": "에피소드 없음"}, status_code=404)
+    row = row.iloc[0]
+    f = (DATA_ROOT / ds / "data" / f"chunk-{int(row['data/chunk_index']):03d}"
+         / f"file-{int(row['data/file_index']):03d}.parquet")
+    info = load_json(DATA_ROOT / ds / "meta/info.json", {})
+    cols = [c for c in ("episode_index", "frame_index", "timestamp", "observation.state", "action")]
+    try:
+        d = pd.read_parquet(f, columns=cols, filters=[("episode_index", "==", ep)])
+    except Exception:
+        d = pd.read_parquet(f)
+        d = d[d["episode_index"] == ep]
+    d = d.sort_values("frame_index")
+
+    def mat(col):
+        if col not in d:
+            return []
+        return [[round(float(x), 2) for x in v] for v in d[col]]
+    t = [round(float(x), 4) for x in d["timestamp"]] if "timestamp" in d else []
+    t0 = t[0] if t else 0.0
+    return {"fps": float(info.get("fps") or 30), "t": [round(x - t0, 4) for x in t],
+            "state_names": _feature_names(info, "observation.state"),
+            "action_names": _feature_names(info, "action"),
+            "state": mat("observation.state"), "action": mat("action")}
+
+
+@app.post("/api/rename_dataset/{ds}")
+async def api_rename_dataset(ds: str, req: Request):
+    b = await req.json()
+    new = (b.get("new") or "").strip()
+    if not safe_name(ds) or not safe_name(new):
+        return JSONResponse({"error": "데이터셋 이름은 영문/숫자/._- 만"}, status_code=400)
+    src, dst = DATA_ROOT / ds, DATA_ROOT / new
+    if not (src / "meta/info.json").exists():
+        return JSONResponse({"error": "데이터셋 없음"}, status_code=404)
+    if dst.exists():
+        return JSONResponse({"error": f"이미 있는 이름: {new}"}, status_code=400)
+    for j in jobs_index():
+        if j["alive"] and str(src) in j.get("cmd", "") + json.dumps(j.get("spec") or {}):
+            return JSONResponse({"error": f"실행 중인 작업({j['id']})이 이 데이터셋을 사용 중"}, status_code=400)
+    await asyncio.to_thread(shutil.move, str(src), str(dst))
+    m = load_marks()
+    if ds in m:
+        m[new] = m.pop(ds)
+        save_marks(m)
+    meta = load_dsmeta()
+    if ds in meta:
+        meta[new] = meta.pop(ds)
+        save_dsmeta(meta)
+    rename_in_projects("datasets", ds, new)
+    return {"ok": True, "name": new}
+
+
 @app.get("/ds/{ds}", response_class=HTMLResponse)
 def dataset_page(ds: str):
     if not safe_name(ds):
         return HTMLResponse(f"{CSS}{nav_html('ds')}<div class=wrap>잘못된 데이터셋 이름</div>", 400)
-    df = episodes_df(ds)
-    if df.empty:
-        return HTMLResponse(f"{CSS}{nav_html('ds')}<div class=wrap>메타데이터 없음: {esc(ds)}</div>")
-    marks = load_marks().get(ds, [])
-    rows = []
-    for _, r in df.iterrows():
-        ep = int(r["episode_index"])
-        badge = ' <span class="badge b-bad">bad</span>' if ep in marks else ""
-        rows.append(f'<tr><td><a href="/ds/{esc(ds)}/ep/{ep}">episode '
-                    f'<span class=mono>{ep}</span></a>{badge}</td>'
-                    f'<td class=num>{esc(r.get("length", "?"))}</td>'
-                    f'<td>{esc(r.get("tasks", ""))}</td></tr>')
-    markbar = ""
-    if marks:
-        markbar = f"""<div class=markbar>
-        <span>마킹된 에피소드 <b class=mono>{esc(sorted(marks))}</b></span>
-        <button class=danger onclick="delMarked()">웹에서 바로 삭제 실행</button>
-        <span class=muted>결과는 새 폴더로 생성됨 (원본 유지) · Jobs에서 진행 확인</span></div>
-        <script>async function delMarked(){{
-          if(!confirm('마킹된 {len(marks)}개 에피소드를 삭제 실행할까요?'))return;
-          await fetch('/api/delete/'+encodeURIComponent({js(ds)}),{{method:'POST'}}); location.href='/jobs';
-        }}</script>"""
-    return f"""{CSS}{nav_html('ds')}<div class=wrap>
-    <p class=eyebrow>Dataset</p><h2 class=mono style="font-size:17px">{esc(ds)}</h2>
-    {markbar}
-    <div class=card><table>
-    <tr><th>episode</th><th class=num>frames</th><th>task</th></tr>{"".join(rows)}</table></div></div>"""
+    if not (DATA_ROOT / ds / "meta/info.json").exists():
+        return HTMLResponse(f"{CSS}{nav_html('ds')}<div class=wrap>데이터셋 없음: {esc(ds)}</div>", 404)
+    views = {sd: (a.get("view") or {"x": 0.0, "y": 0.0, "yaw_deg": 0.0}) for sd, a in ARM_CFGS.items()}
+    return (CSS + nav_html("ds")
+            + f"<script>const DS={js(ds)}, URDF_OK={js((URDF_DIR / 'so101.urdf').exists())}, "
+              f"VIEWS_CFG={js(views)};</script>"
+            + REVIEW_HTML)
 
 
-@app.get("/ds/{ds}/ep/{ep}", response_class=HTMLResponse)
+@app.get("/ds/{ds}/ep/{ep}")
 def episode_page(ds: str, ep: int):
+    """예전 링크 호환 — 리뷰 화면의 해당 에피소드로 보냅니다."""
     if not safe_name(ds):
-        return HTMLResponse(f"{CSS}{nav_html('ds')}<div class=wrap>잘못된 데이터셋 이름</div>", 400)
-    df = episodes_df(ds)
-    segs = ep_video_segments(df, ep)
-    n_ep = int(df["episode_index"].max()) + 1 if not df.empty else 0
-    marks = load_marks().get(ds, [])
-    if not segs:
-        cols = "<br>".join(esc(c) for c in df.columns) if not df.empty else "(none)"
-        return HTMLResponse(f"{CSS}{nav_html('ds')}<div class=wrap>영상 세그먼트를 못 찾음.<br>"
-                            f"<span class=muted>메타 컬럼: {cols}</span></div>")
-    vids = "".join(
-        f"""<div class=vpanel>
-        <div class=vhead><b>{esc(s['cam'])}</b><span>{s['from']:.1f}s &rarr; {s['to']:.1f}s</span></div>
-        <video src="/videos/{esc(ds)}/{esc(s['path'])}" controls muted
-               data-from="{s['from']}" data-to="{s['to']}"></video></div>"""
-        for s in segs)
-    marked = ep in marks
-    return f"""{CSS}{nav_html('ds')}<div class=wrap>
-    <p class=eyebrow>{esc(ds)}</p>
-    <h2>episode <span class=mono style="font-size:inherit">{ep}</span>
-      <span class="badge {'b-bad' if marked else 'b-ok'}">{'bad' if marked else 'ok'}</span></h2>
-    <div class=toolbar>
-       <a href="/ds/{esc(ds)}/ep/{max(ep - 1, 0)}"><button>&larr; prev</button></a>
-       <a href="/ds/{esc(ds)}/ep/{min(ep + 1, n_ep - 1)}"><button>next &rarr;</button></a>
-       <button class=primary onclick="playAll()">&#9654; 재생</button>
-       <button onclick="mark()">{'마킹 해제' if marked else '불량 마킹'}</button>
-       <a href="/ds/{esc(ds)}"><button>목록</button></a>
-       <span class=muted style="margin-left:auto">episode {ep} / {n_ep - 1} · 단축키 &larr;/&rarr; Space b</span></div>
-    <div class=grid>{vids}</div></div>
-    <script>
-    const DS={js(ds)}, EP={ep}, NEP={n_ep};
-    const vids=[...document.querySelectorAll('video')];
-    vids.forEach(v=>{{
-      v.addEventListener('loadedmetadata',()=>{{v.currentTime=parseFloat(v.dataset.from);}});
-      v.addEventListener('timeupdate',()=>{{
-        if(v.currentTime>=parseFloat(v.dataset.to)){{v.pause();v.currentTime=parseFloat(v.dataset.from);}}
-      }});
-    }});
-    function playAll(){{vids.forEach(v=>{{v.currentTime=parseFloat(v.dataset.from);v.play();}});}}
-    async function mark(){{
-      await fetch('/api/mark/'+encodeURIComponent(DS)+'/'+EP,{{method:'POST'}});location.reload();}}
-    document.addEventListener('keydown',e=>{{
-      if(e.target.tagName==='INPUT')return;
-      if(e.key==='ArrowLeft')location.href='/ds/'+encodeURIComponent(DS)+'/ep/'+Math.max(EP-1,0);
-      if(e.key==='ArrowRight')location.href='/ds/'+encodeURIComponent(DS)+'/ep/'+Math.min(EP+1,NEP-1);
-      if(e.key===' '){{e.preventDefault();playAll();}}
-      if(e.key==='b')mark();
-    }});
-    </script>"""
+        return HTMLResponse("잘못된 데이터셋 이름", 400)
+    return RedirectResponse(f"/ds/{ds}?ep={int(ep)}")
 
 
 @app.post("/api/mark/{ds}/{ep}")
@@ -2008,20 +2535,35 @@ def api_delete(ds: str):
 
 # ----------------------------- 페이지: 수집 (Collect) ------------------------
 @app.get("/collect", response_class=HTMLResponse)
-def collect_page():
+def collect_page(resume: str = ""):
     rec = next((j for j in jobs_index() if j["kind"] == "record" and j["alive"]), None)
     if rec:
         return (CSS + nav_html("co") + f"<script>const JID={js(rec['id'])};</script>" + COLLECT_RUN_HTML)
     busy = exclusive_busy()
     busywarn = (f'<p class="badge b-warn">실행 중: {esc(busy["id"])} — 끝나야 수집을 시작할 수 있습니다</p>'
                 if busy else "") + setup_needed_html()
+    pname, pr = active_project()
+    mine = set(pr["datasets"]) if pr else set()
+    dsets = sorted(list_datasets(), key=lambda d: (d["name"] not in mine, d["name"]))
     resume_opts = "".join(
         f'<option value="{esc(d["name"])}" {"" if d["robot_type"] in ("", robot_name()) else "disabled"}>'
-        f'{esc(d["name"])} ({esc(d["episodes"])}ep{"" if d["robot_type"] in ("", robot_name()) else " · " + esc(d["robot_type"]) + " — 모드 불일치"})</option>'
-        for d in list_datasets())
+        f'{esc(d["name"])} ({esc(d["episodes"])}ep{"" if d["robot_type"] in ("", robot_name()) else " · " + esc(d["robot_type"]) + " — 모드 불일치"})'
+        f'{" · 다른 프로젝트/미분류" if pname and d["name"] not in mine else ""}</option>'
+        for d in dsets)
+    task0 = (pr["task"] if pr and pr["task"] else CFG["default_task"])
+    name_hint = f"{pname}_v{len(mine) + 1}" if pname else "pick_place_v2"
+    if pname:
+        projline = (f'<p class=muted>프로젝트 <b class=mono>{esc(pname)}</b> · 환경 <b class=mono>{esc(env_name())}</b>'
+                    f' — 새 데이터셋은 이 프로젝트에 자동으로 들어갑니다.</p>')
+        if pr["env"] and pr["env"] != env_name():
+            projline += (f'<p class="badge b-warn">이 프로젝트의 기준 환경은 {esc(pr["env"])} 인데 지금은 {esc(env_name())} 입니다 — '
+                         f'<a href="/setup#envcard">Setup 에서 전환</a>하거나 그대로 진행하세요.</p>')
+    else:
+        projline = (f'<p class=muted>환경 <b class=mono>{esc(env_name())}</b> · 프로젝트 없이 수집합니다 — '
+                    f'<a href="/projects">프로젝트</a>를 열면 태스크 설명과 이름이 채워지고 데이터셋이 묶입니다.</p>')
     return f"""{CSS}{nav_html('co')}<div class=wrap>
     <p class=eyebrow>Teleoperation record · {"양팔 bi_so_follower" if BIMANUAL else "한팔 so101_follower"}</p><h2>Collect</h2>
-    {busywarn}
+    {busywarn}{projline}
     <div class=card>
     <div class=formgrid>
       <label class=f>모드
@@ -2030,13 +2572,13 @@ def collect_page():
           <option value=resume>기존에 이어서</option>
         </select></label>
       <label class=f id=f_new>데이터셋 이름
-        <input id=name placeholder="pick_place_v2" size=22></label>
+        <input id=name placeholder="{esc(name_hint)}" value="{esc(name_hint) if pname else ''}" size=22></label>
       <label class=f id=f_resume style="display:none">이어서 수집할 데이터셋
         <select id=resume_ds>{resume_opts}</select></label>
       <label class=f>목표 에피소드 수 <input id=neps value=50 size=5></label>
       <label class=f>에피소드 최대(초) <input id=ept value=30 size=5></label>
       <label class=f style="flex:1;min-width:260px">태스크 설명
-        <input id=task value="{esc(CFG['default_task'])}"></label>
+        <input id=task value="{esc(task0)}"></label>
       <button class=primary id=bstart onclick="startRec(this)">수집 시작</button>
     </div>
     <p class=muted><b>자동으로 녹화되지 않습니다.</b> 시작하면 <b>대기</b> 상태로 들어가고,
@@ -2046,6 +2588,13 @@ def collect_page():
     카메라: <span class=mono>{esc(", ".join(CAM_SPECS) or "없음 — Setup 탭에서 등록")}</span></p>
     </div></div>
     <script>
+    const RESUME={js(resume if safe_name(resume) else "")};
+    if(RESUME){{
+      addEventListener('DOMContentLoaded',()=>{{
+        document.getElementById('mode').value='resume'; modeSw();
+        const sel=document.getElementById('resume_ds'); sel.value=RESUME;
+      }});
+    }}
     function modeSw(){{
       const m=document.getElementById('mode').value;
       document.getElementById('f_new').style.display = m==='new'?'':'none';
@@ -2153,6 +2702,13 @@ async def api_record(req: Request):
                         spec=spec)
     except JobStartError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    if not resume:
+        meta = load_dsmeta()
+        meta[name] = {"env": env_name(), "created": time.strftime("%Y-%m-%d %H:%M")}
+        save_dsmeta(meta)
+        pname, _ = active_project()
+        if pname:
+            assign_to_project("datasets", name, pname)
     return {"ok": True, "job": jid}
 
 
@@ -2184,8 +2740,14 @@ def api_joblog(jid: str):
 # ----------------------------- 페이지: 학습 ----------------------------------
 @app.get("/train", response_class=HTMLResponse)
 def train_page():
-    ds_opts = "".join(f'<option value="{esc(d["name"])}">{esc(d["name"])} ({esc(d["episodes"])}ep)</option>'
-                      for d in list_datasets())
+    pname, pr = active_project()
+    mine = set(pr["datasets"]) if pr else set()
+    dsets = sorted(list_datasets(), key=lambda d: (d["name"] not in mine, d["name"]))
+    ds_opts = "".join(f'<option value="{esc(d["name"])}">{esc(d["name"])} ({esc(d["episodes"])}ep)'
+                      f'{" · 다른 프로젝트/미분류" if pname and d["name"] not in mine else ""}</option>'
+                      for d in dsets)
+    projline = (f'<p class=muted>프로젝트 <b class=mono>{esc(pname)}</b> — 이 프로젝트의 데이터셋이 위에 오고, '
+                f'학습 출력은 이 프로젝트의 모델로 들어갑니다.</p>' if pname else "")
     running = [j for j in jobs_index() if j["kind"] == "train" and j["alive"]]
     run_html = "".join(
         f'<div class=runbar><span class="badge b-run">running</span> '
@@ -2194,7 +2756,7 @@ def train_page():
         for j in running)
     return f"""{CSS}{nav_html('tr')}<div class=wrap>
     <p class=eyebrow>ACT policy</p><h2>Training</h2>
-    {run_html}
+    {projline}{run_html}
     <form class=row onsubmit="startTrain(event)">
       <select id=ds>{ds_opts}</select>
       <input id=name placeholder="출력 이름 (예: act_pick_place_v2)" size=26>
@@ -2278,6 +2840,9 @@ async def api_train(req: Request):
         jid = start_job("train", argv)
     except JobStartError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    pname, _ = active_project()
+    if pname:
+        assign_to_project("models", name, pname)
     return {"ok": True, "job": jid, "name": name}
 
 
@@ -2349,24 +2914,28 @@ def rollout_page():
     busy = exclusive_busy()
     busywarn = (f'<p class="badge b-warn">실행 중: {esc(busy["id"])} — 끝나야 추론을 시작할 수 있습니다</p>'
                 if busy else "") + setup_needed_html()
-    ckpts = list_checkpoints()
+    pname, pr = active_project()
+    mine = set(pr["models"]) if pr else set()
+    ckpts = sorted(list_checkpoints(), key=lambda c: c.split("/checkpoints/")[0] not in mine)   # 안정 정렬
     ck_opts = ""
     for c in ckpts:
         rt = checkpoint_robot_type(c)
         bad = bool(rt) and rt != robot_name()
+        other = pname and c.split("/checkpoints/")[0] not in mine
         ck_opts += (f'<option value="{esc(c)}" {"disabled" if bad else ""}>{esc(c)}'
-                    f'{" · " + esc(rt) + " — 모드 불일치" if bad else (" · " + esc(rt) if rt else "")}</option>')
+                    f'{" · " + esc(rt) + " — 모드 불일치" if bad else (" · " + esc(rt) if rt else "")}'
+                    f'{" · 다른 프로젝트/미분류" if other else ""}</option>')
     empty = "" if ckpts else '<p class=muted>체크포인트가 없습니다 — Training에서 학습을 먼저 완료하세요</p>'
     return f"""{CSS}{nav_html('ro')}<div class=wrap>
     <p class=eyebrow>Autonomous run · {"양팔 bi_so_follower" if BIMANUAL else "한팔 so101_follower"}</p><h2>Rollout</h2>
-    {busywarn}{empty}
+    {busywarn}{empty}{f'<p class=muted>프로젝트 <b class=mono>{esc(pname)}</b> — 이 프로젝트의 모델이 위에 옵니다.</p>' if pname else ''}
     <div class=card>
     <div class=formgrid>
       <label class=f style="min-width:380px">체크포인트
         <select id=ckpt>{ck_opts}</select></label>
       <label class=f>실행 시간(초, 0=무한) <input id=dur value=60 size=6></label>
       <label class=f style="flex:1;min-width:260px">태스크 설명
-        <input id=task value="{esc(CFG['default_task'])}"></label>
+        <input id=task value="{esc(pr["task"] if pr and pr["task"] else CFG['default_task'])}"></label>
       <button class=primary onclick="startRo()" {'disabled' if not ckpts else ''}>추론 시작</button>
     </div>
     <p class=muted>시작 즉시 팔이 움직입니다 — 팔 주변을 비우고, 물체를 시연 위치에 놓으세요.
@@ -2455,6 +3024,8 @@ async def api_delete_checkpoint(req: Request):
     if target.is_symlink():
         return JSONResponse({"error": "심볼릭 링크는 삭제하지 않음"}, status_code=400)
     shutil.rmtree(target)
+    if scope == "run":
+        assign_to_project("models", run, "")
     return {"ok": True}
 
 
@@ -2465,7 +3036,8 @@ def control_page():
         {"id": "port-watch (Setup 탭)"} if WATCH.on else None) or (
         {"id": "calibration (Calib 탭)"} if CALIB.active else None) or (
         {"id": "motor-id-setup (Setup 탭)"} if MOTORSETUP.active else None) or (
-        {"id": "arm-check (Setup 탭)"} if ARMCHECK.active else None)
+        {"id": "arm-check (Setup 탭)"} if ARMCHECK.active else None) or (
+        {"id": "verify (셋업 마법사)"} if VERIFY.active else None)
     if busy:
         return f"""{CSS}{nav_html('ct')}<div class=wrap>
         <p class=eyebrow>Manual control</p><h2>Control</h2>
@@ -2819,7 +3391,8 @@ async def ws_control(sock: WebSocket):
         await sock.send_text(json.dumps({"type": "init", "error": "인증 필요 — 페이지를 새로고침하세요"}))
         await sock.close()
         return
-    if busy_with(("record", "rollout")) or WATCH.on or CALIB.active or MOTORSETUP.active or ARMCHECK.active:
+    if (busy_with(("record", "rollout")) or WATCH.on or CALIB.active or MOTORSETUP.active
+            or ARMCHECK.active or VERIFY.active):
         await sock.send_text(json.dumps({"type": "init", "error": "record/rollout/Setup/Calib 사용 중 — 제어 불가"}))
         await sock.close()
         return
@@ -3286,6 +3859,150 @@ async def api_armcheck_cancel():
     return {"ok": True, "state": ARMCHECK.state()}
 
 
+# ----------------------------- 셋업 마법사 ------------------------------------
+WIZARD_FILE = PROJ / "lrweb_wizard.json"     # {환경: {"side|role": {verified, verified_ts, port}}}
+
+
+def _wiz_load():
+    d = load_json(WIZARD_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def _stable_port(pinfo):
+    """Setup 탭 stableOf 와 같은 규칙 — 보드에 USB 시리얼이 있으면 by-id, 없으면 by-path."""
+    has_sn = bool((pinfo.get("usb") or {}).get("serial"))
+    return ((pinfo.get("by_id") or pinfo.get("by_path")) if has_sn
+            else (pinfo.get("by_path") or pinfo.get("by_id"))) or pinfo["dev"]
+
+
+def _port_entry(ports, path):
+    if not path:
+        return None
+    real = os.path.realpath(path)
+    for pe in ports:
+        if path in (pe["dev"], pe.get("by_id"), pe.get("by_path")) or real == pe["dev"]:
+            return pe
+    return None
+
+
+def wizard_state():
+    ports = list_serial_ports()
+    w = _wiz_load().get(env_name(), {})
+    cal = calib_status()
+    slots = []
+    for side, arm in ARM_CFGS.items():
+        for role in ("follower", "leader"):
+            port = arm.get(f"{role}_port") or ""
+            pe = _port_entry(ports, port)
+            c = cal[side][role]
+            mtime = Path(c["path"]).stat().st_mtime if c["ok"] else 0
+            v = w.get(f"{side}|{role}", {})
+            fresh = bool(v.get("verified")) and v.get("verified_ts", 0) >= mtime and v.get("port") == port
+            slots.append({
+                "side": side, "role": role, "port": port, "dev": pe["dev"] if pe else "",
+                "port_ok": pe is not None, "usb": (pe or {}).get("usb") or {},
+                "calib": {"ok": c["ok"], "id": c["id"], "path": c["path"],
+                          "when": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)) if mtime else ""},
+                "diag": ARMCHECK.history.get(port),
+                "verified": v.get("verified") if fresh else None,
+                "verified_stale": bool(v.get("verified")) and not fresh})
+    busy = exclusive_busy()
+    return {"mode": CFG["mode"], "env": env_name(), "slots": slots, "ports": ports,
+            "cameras": list(CAM_SPECS), "urdf": (URDF_DIR / "so101.urdf").exists(),
+            "views": {sd: a.get("view") for sd, a in ARM_CFGS.items()},
+            "busy": busy["id"] if busy else ""}
+
+
+@app.get("/api/wizard/state")
+def api_wizard_state():
+    return wizard_state()
+
+
+@app.post("/api/wizard/assign")
+async def api_wizard_assign(req: Request):
+    b = await req.json()
+    side, role, dev = b.get("side"), b.get("role"), (b.get("dev") or "").strip()
+    if side not in ARM_CFGS or role not in ("follower", "leader"):
+        return JSONResponse({"error": "side/role 이 잘못됨"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 끝난 뒤 지정하세요"}, status_code=400)
+    pe = _port_entry(list_serial_ports(), dev)
+    if pe is None:
+        return JSONResponse({"error": f"포트를 찾을 수 없습니다: {dev} — 다시 스캔하세요"}, status_code=400)
+    stable = _stable_port(pe)
+    cfg = json.loads(json.dumps(CFG))
+    for a in cfg["arms"]:                       # 같은 보드가 다른 칸에 지정돼 있으면 비웁니다
+        for r in ("follower", "leader"):
+            if a.get(f"{r}_port") and os.path.realpath(a[f"{r}_port"]) == pe["dev"]:
+                a[f"{r}_port"] = ""
+    next(a for a in cfg["arms"] if a["side"] == side)[f"{role}_port"] = stable
+    err = validate_config(cfg)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    _write_active_config(cfg)
+    sync_active_env()
+    return wizard_state()
+
+
+@app.post("/api/wizard/verify/start")
+async def api_wizard_verify_start(req: Request):
+    b = await req.json()
+    side, role = b.get("side"), b.get("role")
+    if side not in ARM_CFGS or role not in ("follower", "leader"):
+        return JSONResponse({"error": "side/role 이 잘못됨"}, status_code=400)
+    await asyncio.to_thread(VERIFY.stop)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중"}, status_code=400)
+    try:
+        await asyncio.to_thread(VERIFY.start, side, role)
+    except Exception as e:
+        await asyncio.to_thread(VERIFY.stop)
+        return JSONResponse({"error": f"{e}"}, status_code=400)
+    return VERIFY.state()
+
+
+@app.get("/api/wizard/verify")
+def api_wizard_verify():
+    return VERIFY.state()
+
+
+@app.post("/api/wizard/verify/stop")
+async def api_wizard_verify_stop():
+    await asyncio.to_thread(VERIFY.stop)
+    return VERIFY.state()
+
+
+@app.post("/api/wizard/verify/torque_off")
+async def api_wizard_verify_torque_off():
+    try:
+        await asyncio.to_thread(VERIFY.torque_off)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return VERIFY.state()
+
+
+@app.post("/api/wizard/verified")
+async def api_wizard_verified(req: Request):
+    b = await req.json()
+    side, role = b.get("side"), b.get("role")
+    if side not in ARM_CFGS or role not in ("follower", "leader"):
+        return JSONResponse({"error": "side/role 이 잘못됨"}, status_code=400)
+    await asyncio.to_thread(VERIFY.stop)
+    d = _wiz_load()
+    d.setdefault(env_name(), {})[f"{side}|{role}"] = {
+        "verified": time.strftime("%Y-%m-%d %H:%M"), "verified_ts": time.time(),
+        "port": ARM_CFGS[side].get(f"{role}_port") or ""}
+    save_json(WIZARD_FILE, d)
+    return wizard_state()
+
+
+@app.get("/setup/wizard", response_class=HTMLResponse)
+def wizard_page():
+    return CSS + nav_html("st") + WIZARD_HTML
+
+
 @app.post("/api/setup/config")
 async def api_setup_config(req: Request):
     busy = exclusive_busy()
@@ -3296,12 +4013,837 @@ async def api_setup_config(req: Request):
     err = validate_config(cfg)
     if err:
         return JSONResponse({"error": err}, status_code=400)
-    merged = json.loads(json.dumps(DEFAULT_CONFIG))
-    merged.update(cfg)
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
-    _rebind(load_config())
+    cfg["env_name"] = env_name()          # Setup 은 언제나 '지금 환경' 을 고칩니다
+    _write_active_config(cfg)
+    sync_active_env()
     return {"ok": True, "config": CFG}
+
+
+# ----------------------------- 환경 API --------------------------------------
+@app.get("/api/envs")
+def api_envs():
+    return {"active": env_name(), "envs": list_envs()}
+
+
+async def _env_op(fn, *args, needs_idle=True):
+    if needs_idle:
+        busy = exclusive_busy()
+        if busy:
+            return JSONResponse({"error": f"{busy['id']} 실행 중 — 끝난 뒤 하세요"}, status_code=400)
+    try:
+        await asyncio.to_thread(fn, *args)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "active": env_name(), "envs": list_envs()}
+
+
+@app.post("/api/envs/activate")
+async def api_env_activate(req: Request):
+    b = await req.json()
+    return await _env_op(activate_env, (b.get("name") or "").strip())
+
+
+@app.post("/api/envs/save_as")
+async def api_env_save_as(req: Request):
+    b = await req.json()
+    return await _env_op(save_env_as, (b.get("name") or "").strip())
+
+
+@app.post("/api/envs/rename")
+async def api_env_rename(req: Request):
+    b = await req.json()
+    return await _env_op(rename_env, (b.get("name") or "").strip(), (b.get("new") or "").strip())
+
+
+@app.post("/api/envs/delete")
+async def api_env_delete(req: Request):
+    b = await req.json()
+    return await _env_op(delete_env, (b.get("name") or "").strip(), needs_idle=False)
+
+
+# 영상 한 프레임을 캔버스에 그려 썸네일로 씁니다. 서버에서 디코딩하지 않으므로
+# 코덱(AV1 등)과 무관하게 브라우저가 재생할 수 있으면 됩니다. 동시에 2개까지만.
+VTHUMB_JS = """
+const _TQ=[]; let _TB=0;
+function vthumb(cv, url, t){ _TQ.push([cv,url,t||0]); _tnext(); }
+function _tnext(){
+  if(_TB>=2 || !_TQ.length) return;
+  const it=_TQ.shift(), cv=it[0], url=it[1], t=it[2]; _TB++;
+  const v=document.createElement('video'); v.muted=true; v.preload='auto'; v.src=url;
+  let done=false;
+  const fin=()=>{ if(done) return; done=true; _TB--; v.removeAttribute('src'); try{v.load();}catch(e){} _tnext(); };
+  v.addEventListener('loadedmetadata',()=>{ try{ v.currentTime=Math.max(0, Math.min(t+0.05, (v.duration||t+1)-0.05)); }catch(e){ fin(); } });
+  v.addEventListener('seeked',()=>{ try{ cv.getContext('2d').drawImage(v,0,0,cv.width,cv.height); cv.classList.add('ok'); }catch(e){} fin(); });
+  v.addEventListener('error',fin);
+  setTimeout(fin,10000);
+}
+"""
+
+
+PROJECTS_HTML = """
+<style>
+.pgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:14px}
+.pcard{display:flex;background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden;min-height:128px}
+.pcard.on{border-color:var(--accent)}
+.pcard canvas{width:170px;height:128px;background:#0b0e12;flex:none;display:block}
+.pcard .pb{padding:12px 14px;flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+.pcard h3{margin:0;font-size:16px;display:flex;gap:8px;align-items:center}
+.pcard .meta{font-size:12px;color:var(--muted)}
+.pcard .acts{margin-top:auto;display:flex;gap:6px;flex-wrap:wrap}
+.pcard .acts button{padding:5px 10px;font-size:12px}
+.padd{border:1px dashed var(--line);background:transparent;align-items:center;justify-content:center;cursor:pointer;color:var(--muted)}
+.padd:hover{border-color:var(--accent);color:var(--text)}
+.pform{background:var(--surface);border:1px solid var(--accent);border-radius:10px;padding:16px 18px;margin-bottom:14px}
+</style>
+<div class=wrap>
+<p class=eyebrow>Projects</p><h2>Projects</h2>
+<p class=muted style="max-width:860px">프로젝트는 태스크 하나의 묶음입니다 — 데이터셋, 학습된 모델, 기본 태스크 설명, 기준 환경.
+프로젝트를 <b>열면</b> Datasets · Collect · Training · Rollout 이 그 프로젝트 기준으로 보이고,
+새로 수집한 데이터셋과 새로 학습한 모델이 자동으로 들어갑니다. <b>전체</b>를 열면 프로젝트 없이 지금처럼 모두 보입니다.</p>
+<div id=pform></div>
+<div class=pgrid id=pgrid></div>
+<div id=unassigned style="margin-top:22px"></div>
+</div>
+<script>
+""" + VTHUMB_JS + """
+const $=id=>document.getElementById(id);
+const E=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function jget(u){ return (await fetch(u)).json(); }
+async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); return r.json(); }
+const NAME_RE=/^[A-Za-z0-9._-]+$/;
+let V=null;
+function mk(tag,cls,html){ const e=document.createElement(tag); if(cls) e.className=cls; if(html!=null) e.innerHTML=html; return e; }
+function b(label,fn,cls){ const x=mk('button',cls||''); x.textContent=label; x.onclick=fn; return x; }
+function paint(v){
+  if(v.error){ alert(v.error); return; }
+  V=v; const g=$('pgrid'); g.innerHTML='';
+  const add=mk('div','pcard padd','<div style="text-align:center"><div style="font-size:30px;line-height:1">+</div><div>새 프로젝트</div></div>');
+  add.onclick=()=>form(null); g.appendChild(add);
+  const all=mk('div','pcard'+(v.active===''?' on':''));
+  all.innerHTML='<canvas width=170 height=128></canvas><div class=pb><h3>전체'+(v.active===''?' <span class="badge b-ok">열림</span>':'')+'</h3>'
+    +'<div class=meta>프로젝트 구분 없이 모두</div><div class=meta>데이터셋 '+v.all.datasets+' · 에피소드 '+v.all.episodes+' · 학습 출력 '+v.all.models+'</div>'
+    +'<div class=acts></div></div>';
+  all.querySelector('.acts').appendChild(b('열기',()=>open_(''),'primary'));
+  g.appendChild(all);
+  v.projects.forEach(p=>{
+    const on=v.active===p.name;
+    const c=mk('div','pcard'+(on?' on':''));
+    const envWarn = p.env && p.env!==v.env ? ' <span class="badge b-warn" title="지금 환경: '+E(v.env)+'">환경 다름</span>' : '';
+    c.innerHTML='<canvas width=170 height=128></canvas><div class=pb>'
+      +'<h3><span class=mono>'+E(p.name)+'</span>'+(on?' <span class="badge b-ok">열림</span>':'')+'</h3>'
+      +'<div class=meta>'+(p.task?E(p.task):'<i>태스크 설명 없음</i>')+'</div>'
+      +'<div class=meta>환경 <span class=mono>'+E(p.env||'지정 안 함')+'</span>'+envWarn+'</div>'
+      +'<div class=meta>데이터셋 '+p.datasets.length+' · 에피소드 '+p.episodes+' · 모델 '+p.models.length
+      +(p.updated?' · 수정 '+E(p.updated):'')+'</div><div class=acts></div></div>';
+    const a=c.querySelector('.acts');
+    a.appendChild(b('열기',()=>open_(p.name),'primary'));
+    a.appendChild(b('편집',()=>form(p)));
+    a.appendChild(b('삭제',()=>del(p),'danger'));
+    g.appendChild(c);
+    if(p.thumb) vthumb(c.querySelector('canvas'), p.thumb.url, p.thumb.t);
+  });
+  const u=$('unassigned');
+  if(!v.unassigned.length || !v.projects.length){ u.innerHTML=''; return; }
+  u.innerHTML='<p class=eyebrow>프로젝트에 안 들어간 데이터셋</p><div class=card><table id=utbl></table></div>';
+  const t=$('utbl');
+  t.innerHTML='<tr><th>데이터셋</th><th class=num>에피소드</th><th>프로젝트로 옮기기</th></tr>';
+  v.unassigned.forEach(d=>{
+    const tr=mk('tr','','<td class=mono>'+E(d.name)+'</td><td class=num>'+E(d.episodes)+'</td><td></td>');
+    const sel=mk('select'); sel.innerHTML='<option value="">— 선택 —</option>'+v.projects.map(p=>'<option>'+E(p.name)+'</option>').join('');
+    sel.onchange=async()=>{ if(sel.value) paint(await jpost('/api/projects/assign',{kind:'datasets',item:d.name,project:sel.value})); };
+    tr.lastChild.appendChild(sel); t.appendChild(tr);
+  });
+}
+function form(p){
+  const f=$('pform');
+  const envOpts='<option value="">지정 안 함</option>'+V.envs.map(e=>'<option'+((p?p.env:V.env)===e?' selected':'')+'>'+E(e)+'</option>').join('');
+  f.innerHTML='<div class=pform><h3 style="margin:0 0 10px">'+(p?'프로젝트 편집':'새 프로젝트')+'</h3><div class=formgrid>'
+    +'<label class=f>이름 <input id=pf_name size=20 placeholder="dice_cleanup"></label>'
+    +'<label class=f style="flex:1;min-width:300px">기본 태스크 설명 (수집·추론에 쓰임) <input id=pf_task placeholder="Move the dice into the cup"></label>'
+    +'<label class=f>기준 환경 <select id=pf_env>'+envOpts+'</select></label></div>'
+    +'<div class=toolbar style="margin-top:12px"><button class=primary id=pf_ok>'+(p?'저장':'만들고 열기')+'</button><button id=pf_no>취소</button></div></div>';
+  $('pf_name').value=p?p.name:''; $('pf_task').value=p?p.task:'';
+  $('pf_no').onclick=()=>{ f.innerHTML=''; };
+  $('pf_ok').onclick=async()=>{
+    const name=$('pf_name').value.trim();
+    if(!NAME_RE.test(name)){ alert('이름은 영문/숫자/._- 만'); return; }
+    const r=await jpost('/api/projects/save',{name:name,old:p?p.name:'',task:$('pf_task').value,env:$('pf_env').value,activate:!p});
+    if(r.error){ alert(r.error); return; }
+    f.innerHTML=''; paint(r);
+  };
+  $('pf_name').focus(); window.scrollTo(0,0);
+}
+async function open_(name){
+  const r=await jpost('/api/projects/activate',{name:name});
+  if(r.error){ alert(r.error); return; }
+  location.href='/';
+}
+async function del(p){
+  if(!confirm('프로젝트 "'+p.name+'" 를 지웁니다. 데이터셋과 모델 파일은 그대로 남고 미분류가 됩니다.')) return;
+  paint(await jpost('/api/projects/delete',{name:p.name}));
+}
+jget('/api/projects').then(paint);
+</script>"""
+
+
+IMPORTMAP_HTML = """<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+"three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+"three/examples/jsm/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+"urdf-loader":"https://cdn.jsdelivr.net/npm/urdf-loader@0.12.6/src/URDFLoader.js"}}
+</script>"""
+
+# 읽기 전용 3D 뷰어 (리뷰 재생 · 셋업 마법사 확인 단계). Control 탭과 같은 좌표·색 규칙.
+# <script type="module"> 안에 넣어 쓰고 window.mountArm3D(el, sides, views) 로 부릅니다.
+ARM3D_JS = """
+window.mountArm3D = async function(el, sides, views){
+  const THREE=await import('three');
+  const {OrbitControls}=await import('three/addons/controls/OrbitControls.js');
+  const URDFLoader=(await import('urdf-loader')).default;
+  const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0a0d10);
+  const cam=new THREE.PerspectiveCamera(50,1,0.01,10);
+  const zoom=sides.length>1?1.7:1.0;
+  cam.position.set(0.4*zoom,0.35*zoom,0.4*zoom);
+  const ren=new THREE.WebGLRenderer({antialias:true}); el.appendChild(ren.domElement);
+  const ctl=new OrbitControls(cam,ren.domElement); ctl.target.set(0,0.12,0);
+  scene.add(new THREE.HemisphereLight(0xffffff,0x223344,1.1));
+  const dl=new THREE.DirectionalLight(0xffffff,1.2); dl.position.set(1,2,1); scene.add(dl);
+  scene.add(new THREE.GridHelper(sides.length>1?1.6:1, sides.length>1?32:20, 0x28303a, 0x1b222a));
+  function resize(){ const w=el.clientWidth||320, h=el.clientHeight||240; ren.setSize(w,h); cam.aspect=w/h; cam.updateProjectionMatrix(); }
+  new ResizeObserver(resize).observe(el); resize();
+  let color='#ffffff'; try{ color=localStorage.getItem('armColor2')||'#ffffff'; }catch(e){}
+  const robots={};
+  function paint(r){
+    r.traverse(o=>{
+      if(!o.isMesh) return;
+      if(!o.userData.rc){ o.userData.m=(o.material&&o.material.name)||''; o.material=new THREE.MeshStandardMaterial({metalness:0.15,roughness:0.55}); o.userData.rc=1; }
+      if(o.userData.m==='sts3215'){ o.material.color.set('#1a1a1a'); o.material.roughness=0.35; } else o.material.color.set(color);
+    });
+  }
+  const mgr=new THREE.LoadingManager(); mgr.onLoad=()=>Object.values(robots).forEach(paint);
+  await Promise.all(sides.map(side=>new Promise(res=>{
+    const loader=new URDFLoader(mgr); loader.workingPath='/urdf/'; loader.packages='/urdf';
+    loader.load('/urdf/so101.urdf', r=>{
+      const v=views[side]||{x:0,y:0,yaw_deg:0};
+      r.rotation.set(-Math.PI/2, 0, (v.yaw_deg||0)*Math.PI/180);
+      r.position.set(v.x||0, 0, -(v.y||0));
+      robots[side]=r; scene.add(r); res();
+    }, undefined, e=>{ console.error(e); res(); });
+  })));
+  (function anim(){ requestAnimationFrame(anim); ctl.update(); ren.render(scene,cam); })();
+  return {
+    update(side, joints){
+      const r=robots[side]; if(!r) return;
+      for(const j in joints){
+        const jt=r.joints&&r.joints[j], v=joints[j];
+        if(!jt || v==null) continue;
+        if(j==='gripper'){ const lo=jt.limit?jt.limit.lower:0, hi=jt.limit?jt.limit.upper:1; jt.setJointValue(lo+(hi-lo)*(v/100)); }
+        else jt.setJointValue(v*Math.PI/180);
+      }
+    }
+  };
+};
+"""
+
+
+REVIEW_HTML = """
+<style>
+.rvwrap{padding:14px 18px 30px}
+.rvhead{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.rvhead h2{margin:0;font-family:var(--mono);font-size:18px}
+.rv{display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:14px;align-items:start}
+.player{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.pline{display:flex;gap:10px;align-items:center;padding:9px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.eb{font-family:var(--mono);font-size:11px;background:#e5c07b;color:#111;border-radius:4px;padding:1px 6px;font-weight:600}
+.vgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1px;background:var(--line)}
+.vcell{position:relative;background:#000}
+.vcell video{width:100%;display:block;aspect-ratio:4/3;object-fit:contain;background:#000}
+.vcell .cl{position:absolute;top:6px;left:10px;font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:#cfd8e3;text-shadow:0 0 4px #000}
+#v3d{height:270px;position:relative;background:#0a0d10;border-top:1px solid var(--line)}
+#v3d canvas{display:block}
+.tl{padding:10px 12px 12px;border-top:1px solid var(--line)}
+.tl .ctr{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.tl input[type=range]{flex:1;min-width:160px;accent-color:var(--accent)}
+.chart{margin-top:10px}
+.chart canvas{width:100%;height:140px;display:block;cursor:crosshair;background:#0d1116;border-radius:6px}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--muted);margin:0 0 4px}
+.legend i{display:inline-block;width:10px;height:3px;margin-right:4px;vertical-align:middle}
+.eplist{display:flex;flex-direction:column;gap:10px;max-height:calc(100vh - 130px);overflow-y:auto;padding-right:4px}
+.epc{background:var(--surface);border:1px solid var(--line);border-radius:8px;overflow:hidden;cursor:pointer;flex:none}
+.epc.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.epc.bad canvas{opacity:.4}
+.epc canvas{width:100%;aspect-ratio:4/3;display:block;background:#0b0e12}
+.epc .row{display:flex;gap:8px;align-items:center;padding:6px 8px;font-size:12px}
+@media(max-width:900px){ .rv{grid-template-columns:1fr} .eplist{max-height:none;flex-direction:row;overflow-x:auto} .epc{width:190px} }
+</style>
+<div class=rvwrap>
+<div class=rvhead>
+  <a href="/" class=tiny>&larr; Datasets</a>
+  <h2 id=dsname></h2>
+  <span id=chips></span>
+  <span style="flex:1"></span>
+  <button id=b_add title="이 데이터셋에 이어서 수집">에피소드 추가</button>
+  <button id=b_ren>이름 변경</button>
+  <a class=btnlink id=b_dl title="LeRobotDataset v3.0 폴더를 그대로 tar 로">다운로드</a>
+  <button class=danger id=b_delm style="display:none"></button>
+</div>
+<div class=rv>
+  <div class=player>
+    <div class=pline>
+      <span class=eb id=epb>E-</span><span class=mono id=epdur></span>
+      <span id=eptask class=muted></span><span id=epflags></span>
+      <label class=tiny style="margin-left:auto;display:flex;gap:6px;align-items:center;cursor:pointer">
+        <input type=checkbox id=epbad> 불량 (X)</label>
+    </div>
+    <div class=vgrid id=vgrid></div>
+    <div id=v3d style="display:none"></div>
+    <div class=tl>
+      <div class=ctr>
+        <button id=b_play style="min-width:46px">&#9654;</button>
+        <span class=mono id=tnow>0.0 / 0.0 s</span>
+        <input type=range id=scrub min=0 max=1000 value=0>
+        <label class=tiny style="display:flex;gap:5px;align-items:center"><input type=checkbox id=showact> 명령(action) 겹쳐 보기</label>
+      </div>
+      <div id=charts></div>
+    </div>
+  </div>
+  <div class=eplist id=eplist></div>
+</div>
+<p class=muted style="margin-top:12px">&larr; / &rarr; 이전·다음 에피소드 · Space 재생/정지 · X 불량 표시.
+불량으로 표시한 에피소드는 위의 <b>삭제 실행</b>으로 한 번에 지웁니다 (결과는 새 폴더, 원본 유지).
+그래프는 observation.state(실측)입니다 — 한 관절이 평평하게 멈춰 있거나 갑자기 튀면 그 에피소드를 의심하세요.
+<b>짧음</b>은 길이가 중앙값의 절반도 안 되는 에피소드입니다.</p>
+</div>
+""" + IMPORTMAP_HTML + """
+<script type="module">
+""" + ARM3D_JS + VTHUMB_JS + """
+const $=id=>document.getElementById(id);
+const E=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const COLORS=['#5d9dd6','#e07a3f','#6cc070','#c792ea','#e5c07b','#56b6c2'];
+async function jget(u){ const r=await fetch(u); return r.json(); }
+async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); return r.json(); }
+const fmt=t=>{ t=Math.max(0,t||0); const m=Math.floor(t/60), s=Math.floor(t%60); return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0'); };
+let INFO=null, IDX=-1, DATA=null, VIDS=[], T=0, DUR=0, PLAYING=false, ARM=null, raf=0, clock0=0, scrubbing=false, CH=[];
+
+function isBad(ep){ return INFO.marks.indexOf(ep)>=0; }
+function paintDel(){
+  const b=$('b_delm'), n=INFO.marks.length;
+  b.style.display=n?'':'none'; b.textContent='불량 '+n+'개 삭제 실행';
+}
+const io=new IntersectionObserver(ents=>ents.forEach(en=>{
+  if(!en.isIntersecting) return;
+  const i=+en.target.dataset.i, e=INFO.episodes[i];
+  vthumb(en.target.querySelector('canvas'), e.segs[0].url, e.segs[0].from);
+  io.unobserve(en.target);
+}),{rootMargin:'300px'});
+function buildList(){
+  const L=$('eplist'); L.innerHTML='';
+  INFO.episodes.forEach((e,i)=>{
+    const c=document.createElement('div'); c.className='epc'+(isBad(e.ep)?' bad':''); c.dataset.i=i;
+    c.innerHTML='<canvas width=240 height=180></canvas><div class=row><span class=eb>E'+e.ep+'</span>'
+      +'<span class=mono>'+fmt(e.dur)+'</span>'+(e.short?'<span class="badge b-warn">짧음</span>':'')
+      +'<span class="tiny badtag" style="margin-left:auto;color:var(--bad)">'+(isBad(e.ep)?'불량':'')+'</span></div>';
+    c.onclick=()=>select(i);
+    L.appendChild(c);
+    if(e.segs.length) io.observe(c);
+  });
+}
+function paintCard(i){
+  const c=document.querySelector('.epc[data-i="'+i+'"]'); if(!c) return;
+  const e=INFO.episodes[i];
+  c.classList.toggle('bad', isBad(e.ep));
+  c.querySelector('.badtag').textContent=isBad(e.ep)?'불량':'';
+}
+
+async function select(i){
+  if(i<0 || i>=INFO.episodes.length) return;
+  pause(); IDX=i; const e=INFO.episodes[i];
+  history.replaceState(null,'','?ep='+e.ep);
+  document.querySelectorAll('.epc.on').forEach(x=>x.classList.remove('on'));
+  const card=document.querySelector('.epc[data-i="'+i+'"]');
+  if(card){ card.classList.add('on'); card.scrollIntoView({block:'nearest',inline:'nearest'}); }
+  $('epb').textContent='E'+e.ep; $('epdur').textContent=fmt(e.dur)+' · '+e.length+' frames';
+  $('eptask').textContent=e.task||''; $('epflags').innerHTML=e.short?'<span class="badge b-warn">짧음</span>':'';
+  $('epbad').checked=isBad(e.ep);
+  const g=$('vgrid'); g.innerHTML=''; VIDS=[];
+  e.segs.forEach(sg=>{
+    const cell=document.createElement('div'); cell.className='vcell';
+    cell.innerHTML='<span class=cl></span><video muted playsinline preload=auto></video>';
+    cell.querySelector('.cl').textContent=sg.cam;
+    const v=cell.querySelector('video'); v.dataset.from=sg.from; v.src=sg.url;
+    v.addEventListener('loadedmetadata',()=>{ v.currentTime=vpos(v,T); });
+    g.appendChild(cell); VIDS.push(v);
+  });
+  if(!e.segs.length) g.innerHTML='<p class=muted style="padding:14px;margin:0;background:var(--surface)">영상 없음</p>';
+  DUR=e.dur; T=0; DATA=null; $('charts').innerHTML='<p class=muted>관절 데이터 불러오는 중…</p>';
+  render();
+  const d=await jget('/api/ds/'+encodeURIComponent(DS)+'/ep/'+e.ep+'/data');
+  if(IDX!==i) return;
+  if(d.error){ $('charts').innerHTML='<p class="badge b-bad"></p>'; $('charts').firstChild.textContent=d.error; return; }
+  DATA=d; if(!DUR && d.t.length) DUR=d.t[d.t.length-1];
+  buildCharts(); render();
+}
+
+/* ---------- 재생 ---------- */
+function vfrom(v){ return parseFloat(v.dataset.from)||0; }
+/* v3.0 은 에피소드들이 mp4 하나에 이어 붙어 있어서, from+DUR 은 정확히 다음 에피소드의 첫 프레임입니다.
+   영상은 끝에서 반 프레임 앞까지만 보냅니다. */
+function vpos(v,t){ return vfrom(v)+Math.max(0, Math.min(t, DUR-0.5/(INFO.fps||30))); }
+function curT(){ if(VIDS.length) return VIDS[0].currentTime-vfrom(VIDS[0]); return PLAYING?(performance.now()-clock0)/1000:T; }
+function play(){
+  if(T>=DUR-0.05) seek(0);
+  PLAYING=true; clock0=performance.now()-T*1000;
+  VIDS.forEach(v=>{ const p=v.play(); if(p&&p.catch) p.catch(()=>{}); });
+  $('b_play').innerHTML='&#10074;&#10074;'; tick();
+}
+function pause(){ PLAYING=false; VIDS.forEach(v=>v.pause()); $('b_play').innerHTML='&#9654;'; cancelAnimationFrame(raf); }
+function seek(t){ T=Math.max(0,Math.min(DUR,t)); VIDS.forEach(v=>{ v.currentTime=vpos(v,T); }); clock0=performance.now()-T*1000; render(); }
+function tick(){
+  if(!PLAYING) return;
+  T=Math.max(0,curT());
+  if(T>=DUR-0.5/(INFO.fps||30)){ T=DUR; pause(); VIDS.forEach(v=>{ v.currentTime=vpos(v,T); }); render(); return; }
+  VIDS.slice(1).forEach(v=>{ if(Math.abs((v.currentTime-vfrom(v))-T)>0.15) v.currentTime=vpos(v,T); });
+  render(); raf=requestAnimationFrame(tick);
+}
+function frameAt(t){
+  if(!DATA||!DATA.t.length) return -1;
+  let k=Math.min(DATA.t.length-1, Math.max(0, Math.round(t*DATA.fps)));
+  while(k>0 && DATA.t[k]>t) k--;
+  while(k<DATA.t.length-1 && DATA.t[k+1]<=t) k++;
+  return k;
+}
+function render(){
+  $('tnow').textContent=T.toFixed(1)+' / '+(DUR||0).toFixed(1)+' s';
+  if(!scrubbing) $('scrub').value=DUR?Math.round(T/DUR*1000):0;
+  CH.forEach(drawCursor);
+  const k=frameAt(T);
+  if(ARM && k>=0){
+    groups().forEach(gr=>{
+      const j={}; gr.idx.forEach((ix,n)=>{ j[gr.names[n]]=DATA.state[k][ix]; });
+      ARM.update(gr.side||'main', j);
+    });
+  }
+}
+
+/* ---------- 관절 그래프 ---------- */
+function groups(){
+  const names=DATA.state_names.length?DATA.state_names:(DATA.state[0]||[]).map((_,k)=>'j'+k);
+  const sides=INFO.bimanual?['left','right']:[''];
+  return sides.map(sd=>{
+    const idx=[]; names.forEach((n,k)=>{ if(!sd || n.indexOf(sd+'_')===0) idx.push(k); });
+    return {side:sd, idx:idx, names:idx.map(k=>names[k].replace(sd?sd+'_':'','').replace(/[.]pos$/,''))};
+  });
+}
+function buildCharts(){
+  const box=$('charts'); box.innerHTML=''; CH=[];
+  if(!DATA.t.length){ box.innerHTML='<p class=muted>관절 데이터 없음</p>'; return; }
+  groups().forEach(gr=>{
+    const w=document.createElement('div'); w.className='chart';
+    w.innerHTML='<div class=legend>'+(gr.side?'<b style="color:var(--text)">'+E(gr.side)+'</b>':'')
+      +gr.names.map((n,k)=>'<span><i style="background:'+COLORS[k%6]+'"></i>'+E(n)+'</span>').join('')+'</div><canvas></canvas>';
+    box.appendChild(w);
+    const cv=w.querySelector('canvas');
+    const c={gr:gr, cv:cv, base:document.createElement('canvas')};
+    cv.addEventListener('click',ev=>{ const r=cv.getBoundingClientRect(); seek((ev.clientX-r.left-c.padL)/(r.width-c.padL-4)*DUR); });
+    CH.push(c); drawBase(c);
+  });
+}
+function drawBase(c){
+  const dpr=window.devicePixelRatio||1, W=c.cv.clientWidth||600, H=c.cv.clientHeight||140;
+  c.cv.width=W*dpr; c.cv.height=H*dpr; c.base.width=W*dpr; c.base.height=H*dpr;
+  const g=c.base.getContext('2d'); g.scale(dpr,dpr);
+  const act=$('showact').checked && DATA.action.length;
+  let lo=Infinity, hi=-Infinity;
+  const scan=m=>c.gr.idx.forEach(ix=>m.forEach(row=>{ const v=row[ix]; if(v<lo) lo=v; if(v>hi) hi=v; }));
+  scan(DATA.state); if(act) scan(DATA.action);
+  if(!isFinite(lo)){ lo=-1; hi=1; }
+  if(hi-lo<1){ lo-=0.5; hi+=0.5; }
+  const pad=(hi-lo)*0.06; lo-=pad; hi+=pad;
+  c.padL=40; const X=t=>c.padL+t/(DUR||1)*(W-c.padL-4), Y=v=>4+(hi-v)/(hi-lo)*(H-8);
+  c.X=X; c.W=W; c.H=H;
+  g.fillStyle='#0d1116'; g.fillRect(0,0,W,H);
+  g.strokeStyle='#1f2730'; g.lineWidth=1; g.font='10px IBM Plex Mono, monospace'; g.fillStyle='#6b7785';
+  [hi-pad, (hi+lo)/2, lo+pad].forEach(v=>{ const y=Y(v); g.beginPath(); g.moveTo(c.padL,y); g.lineTo(W,y); g.stroke(); g.fillText(v.toFixed(0),2,y+3); });
+  const line=(m,ix,col,dash,alpha)=>{
+    g.beginPath(); g.setLineDash(dash); g.globalAlpha=alpha; g.strokeStyle=col; g.lineWidth=dash.length?1:1.5;
+    DATA.t.forEach((t,k)=>{ const x=X(t), y=Y(m[k][ix]); if(k) g.lineTo(x,y); else g.moveTo(x,y); });
+    g.stroke(); g.setLineDash([]); g.globalAlpha=1;
+  };
+  c.gr.idx.forEach((ix,n)=>{ if(act) line(DATA.action,ix,COLORS[n%6],[4,3],0.55); line(DATA.state,ix,COLORS[n%6],[],1); });
+  drawCursor(c);
+}
+function drawCursor(c){
+  if(!c.base.width) return;
+  const g=c.cv.getContext('2d'), dpr=window.devicePixelRatio||1;
+  g.setTransform(1,0,0,1,0,0); g.drawImage(c.base,0,0);
+  g.scale(dpr,dpr); const x=c.X(T);
+  g.strokeStyle='#ffffff'; g.globalAlpha=0.85; g.lineWidth=1; g.beginPath(); g.moveTo(x,0); g.lineTo(x,c.H); g.stroke(); g.globalAlpha=1;
+  g.setTransform(1,0,0,1,0,0);
+}
+
+/* ---------- 동작 ---------- */
+async function toggleBad(){
+  const e=INFO.episodes[IDX]; if(!e) return;
+  const r=await jpost('/api/mark/'+encodeURIComponent(DS)+'/'+e.ep);
+  if(r.error){ alert(r.error); return; }
+  INFO.marks=r.marks; $('epbad').checked=isBad(e.ep); paintCard(IDX); paintDel();
+}
+$('epbad').addEventListener('change',toggleBad);
+$('b_play').onclick=()=>PLAYING?pause():play();
+$('showact').onchange=()=>{ if(DATA) CH.forEach(drawBase); };
+$('scrub').addEventListener('input',()=>{ scrubbing=true; seek($('scrub').value/1000*DUR); });
+$('scrub').addEventListener('change',()=>{ scrubbing=false; });
+$('b_add').onclick=()=>{ location.href='/collect?resume='+encodeURIComponent(DS); };
+$('b_ren').onclick=async()=>{
+  const nw=(prompt('새 데이터셋 이름 (영문/숫자/._-)', DS)||'').trim();
+  if(!nw || nw===DS) return;
+  if(!/^[A-Za-z0-9._-]+$/.test(nw)){ alert('영문/숫자/._- 만'); return; }
+  const r=await jpost('/api/rename_dataset/'+encodeURIComponent(DS),{new:nw});
+  if(r.error){ alert(r.error); return; }
+  location.href='/ds/'+encodeURIComponent(r.name);
+};
+$('b_delm').onclick=async()=>{
+  const n=INFO.marks.length;
+  if(!confirm('불량으로 표시한 '+n+'개 에피소드를 지웁니다. 결과는 새 폴더로 만들어지고 원본은 남습니다. 진행할까요?')) return;
+  const r=await jpost('/api/delete/'+encodeURIComponent(DS));
+  if(r.error){ alert(r.error); return; }
+  location.href='/jobs';
+};
+window.addEventListener('resize',()=>{ if(DATA) CH.forEach(drawBase); });
+document.addEventListener('keydown',ev=>{
+  if(ev.target.tagName==='INPUT' && ev.target.type!=='checkbox' && ev.target.type!=='range') return;
+  if(ev.key==='ArrowLeft'){ ev.preventDefault(); select(IDX-1); }
+  else if(ev.key==='ArrowRight'){ ev.preventDefault(); select(IDX+1); }
+  else if(ev.key===' '){ ev.preventDefault(); PLAYING?pause():play(); }
+  else if(ev.key==='x'||ev.key==='X'){ toggleBad(); }
+});
+
+(async()=>{
+  INFO=await jget('/api/ds/'+encodeURIComponent(DS)+'/info');
+  if(INFO.error){ document.querySelector('.rv').innerHTML='<p class="badge b-bad"></p>'; document.querySelector('.rv p').textContent=INFO.error; return; }
+  $('dsname').textContent=DS;
+  $('b_dl').href='/api/download/'+encodeURIComponent(DS);
+  const chip=(t,cls)=>'<span class="badge '+(cls||'')+'" style="margin-right:4px">'+E(t)+'</span>';
+  $('chips').innerHTML=chip(INFO.episodes.length+' 에피소드')+chip(INFO.fps+' fps')+chip(INFO.robot_type||'robot ?')
+    +(INFO.version?chip(INFO.version, INFO.version==='v3.0'?'':'b-warn'):'')
+    +(INFO.env?chip('환경 '+INFO.env):'')+(INFO.project?'<a href="/projects">'+chip('프로젝트 '+INFO.project,'b-run')+'</a>':'');
+  paintDel(); buildList();
+  if(!INFO.episodes.length){ $('vgrid').innerHTML='<p class=muted style="padding:14px;margin:0">에피소드가 없습니다</p>'; return; }
+  const want=parseInt(new URLSearchParams(location.search).get('ep'));
+  const i0=Math.max(0, INFO.episodes.findIndex(e=>e.ep===want));
+  if(URDF_OK){
+    const sides=INFO.bimanual?['left','right']:['main'];
+    const views={}; sides.forEach(s=>{ views[s]=VIEWS_CFG[s]||{x:0, y:(s==='left'?0.12:s==='right'?-0.12:0), yaw_deg:0}; });
+    $('v3d').style.display='';
+    try{ ARM=await window.mountArm3D($('v3d'), sides, views); }
+    catch(e){ console.error(e); $('v3d').style.display='none'; ARM=null; }
+  }
+  select(i0);
+})();
+</script>"""
+
+
+WIZARD_HTML = """
+<style>
+.wgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin-bottom:16px}
+.wcard{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:8px}
+.wcard.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.wcard h3{margin:0;font-family:var(--mono);font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+.wrow{display:flex;gap:8px;align-items:center;font-size:12.5px}
+.wrow .k{width:74px;color:var(--muted);font-family:var(--mono);font-size:11.5px}
+.stepper{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 14px}
+.stepper .st{display:flex;gap:7px;align-items:center;padding:6px 10px;border-radius:8px;cursor:pointer;color:var(--muted);font-size:13px}
+.stepper .st.cur{background:var(--surface2);color:var(--text)}
+.stepper .st i{font-style:normal;width:22px;height:22px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;
+  font-size:12px;background:var(--surface2);border:1px solid var(--line)}
+.stepper .st.done i{background:#2e7d4f;border-color:#2e7d4f;color:#fff}
+.stepper .st.cur i{background:var(--accent-dim);border-color:var(--accent);color:#fff}
+.stepper .sep{width:22px;height:1px;background:var(--line)}
+.wbody{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+.wbody.one{grid-template-columns:1fr}
+.wpanel{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.wpanel .note{border-left:3px solid var(--accent);background:rgba(93,157,214,.08);padding:9px 12px;border-radius:0 6px 6px 0;margin:0 0 12px;line-height:1.7}
+.wpanel .note.ok{border-color:var(--ok);background:rgba(76,175,110,.08)}
+.wpanel .note.bad{border-color:var(--bad);background:rgba(201,96,96,.08)}
+#w3d{height:420px;background:#0a0d10;border:1px solid var(--line);border-radius:10px;position:relative;overflow:hidden}
+#w3d canvas{display:block}
+.tbar{height:8px;background:var(--surface2);border-radius:4px;overflow:hidden;min-width:120px}
+.tbar i{display:block;height:100%;background:var(--warn);width:0}
+tr.best td{background:rgba(76,175,110,.10)}
+@media(max-width:900px){ .wbody{grid-template-columns:1fr} }
+</style>
+<div class=wrap>
+<p class=eyebrow>Setup wizard</p><h2>셋업 마법사</h2>
+<p class=muted style="max-width:900px">팔(보드) 하나씩 <b>포트 찾기 → 진단 → 캘리브레이션 → 확인</b> 순서로 안내합니다.
+모터를 구동하는 단계는 없습니다 — 손으로 움직여서 확인합니다. 한팔/양팔 전환과 카메라는 <a href="/setup">Setup</a> 에서 합니다.</p>
+<div id=busy></div>
+<div class=wgrid id=over></div>
+<div id=wiz></div>
+<div id=after></div>
+</div>
+""" + IMPORTMAP_HTML + """
+<script type="module">
+""" + ARM3D_JS + """
+const $=id=>document.getElementById(id);
+const E=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function jget(u){ const r=await fetch(u); return r.json(); }
+async function jpost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); return r.json(); }
+const STEPS=[['port','포트 찾기'],['diag','진단'],['calib','캘리브레이션'],['verify','확인']];
+const RL={follower:'팔로워',leader:'리더'};
+let W=null, SLOT=null, STEP=null, T1=null, T2=null, ARM=null, ARMSIDE=null, WATCHING=false;
+const tail=p=>{ if(!p) return ''; const t=p.split('/').pop(); return t.length>26?'…'+t.slice(-24):t; };
+const badge=(t,c)=>'<span class="badge '+(c||'')+'">'+E(t)+'</span>';
+function slotOf(side,role){ return W.slots.find(x=>x.side===side&&x.role===role); }
+function doneOf(s){ return {port:s.port_ok, diag:!!(s.diag&&s.diag.code<2&&!s.diag.missing.length), calib:s.calib.ok, verify:!!s.verified}; }
+function firstTodo(s){ const d=doneOf(s); return (STEPS.find(x=>!d[x[0]])||['verify'])[0]; }
+function stopTimers(){ clearTimeout(T1); clearTimeout(T2); T1=T2=null; }
+
+async function load(){ W=await jget('/api/wizard/state'); paintOver(); paintAfter(); }
+function paintOver(){
+  $('busy').innerHTML=W.busy?'<p class="badge b-warn">실행 중: '+E(W.busy)+'</p>':'';
+  const g=$('over'); g.innerHTML='';
+  W.slots.forEach(s=>{
+    const c=document.createElement('div');
+    c.className='wcard'+(SLOT&&SLOT.side===s.side&&SLOT.role===s.role?' on':'');
+    const port=s.port_ok?badge('연결됨','b-ok')+' <span class=mono>'+E(tail(s.port))+'</span>'
+      :(s.port?badge('연결 안 됨','b-bad')+' <span class=mono>'+E(tail(s.port))+'</span>':badge('미지정','b-warn'));
+    const dg=s.diag?badge(s.diag.verdict, s.diag.code===0?'b-ok':s.diag.code===1?'b-warn':'b-bad')+(s.diag.power&&s.diag.power.system?' <span class=tiny>'+E(s.diag.power.system)+' · '+E(s.diag.when)+'</span>':''):'<span class=tiny>-</span>';
+    const cb=s.calib.ok?badge('있음','b-ok')+' <span class=tiny>'+E(s.calib.when)+'</span>':badge('없음','b-warn');
+    const vf=s.verified?badge('확인됨','b-ok')+' <span class=tiny>'+E(s.verified)+'</span>':(s.verified_stale?badge('다시 확인 필요','b-warn'):'<span class=tiny>-</span>');
+    const all=doneOf(s), complete=all.port&&all.diag&&all.calib&&all.verify;
+    c.innerHTML='<h3>'+E(s.side)+' · '+RL[s.role]+'</h3>'
+      +'<div class=wrow><span class=k>포트</span>'+port+'</div>'
+      +'<div class=wrow><span class=k>진단</span>'+dg+'</div>'
+      +'<div class=wrow><span class=k>캘리브</span>'+cb+'</div>'
+      +'<div class=wrow><span class=k>확인</span>'+vf+'</div>';
+    const b=document.createElement('button'); b.className=complete?'':'primary'; b.style.marginTop='4px';
+    b.textContent=complete?'다시 보기':(all.port||all.calib?'이어서 하기':'설정하기');
+    b.onclick=()=>openSlot(s.side,s.role,complete?'port':firstTodo(s));
+    c.appendChild(b); g.appendChild(c);
+  });
+}
+function paintAfter(){
+  const all=W.slots.every(s=>{ const d=doneOf(s); return d.port&&d.calib&&d.verify; });
+  $('after').innerHTML='<div class=card style="margin-top:16px">'
+    +(all?'<p class="badge b-ok" style="margin-top:0">모든 팔 준비 완료</p>':'')
+    +'<p style="margin-top:0"><b>카메라</b> — '+(W.cameras.length?W.cameras.length+'대 등록 ('+E(W.cameras.join(', '))+')':'아직 없음')
+    +' · <a href="/setup#cameras">Setup 3 · 카메라</a>에서 화면으로 확인하고 추가하세요.</p>'
+    +'<p style="margin-bottom:0"><b>환경</b> — 지금 구성은 <span class=mono>'+E(W.env)+'</span> 환경에 저장돼 있습니다 · '
+    +'<a href="/setup#envcard">환경 관리</a> (작업대가 여러 개면 이름을 나눠 두세요)</p></div>';
+}
+
+async function openSlot(side,role,step){
+  await leave();
+  SLOT={side:side,role:role}; paintOver();
+  go(step||firstTodo(slotOf(side,role)));
+  $('wiz').scrollIntoView({behavior:'smooth',block:'start'});
+}
+async function leave(){
+  stopTimers();
+  if(WATCHING){ WATCHING=false; await jpost('/api/setup/watch/stop'); }
+  if(STEP==='verify'){ await jpost('/api/wizard/verify/stop'); }
+}
+async function go(step){
+  await leave(); STEP=step;
+  const s=slotOf(SLOT.side,SLOT.role), d=doneOf(s);
+  history.replaceState(null,'','?slot='+SLOT.side+'|'+SLOT.role+'&step='+step);
+  let h='<div class=stepper>';
+  STEPS.forEach((x,i)=>{ if(i) h+='<span class=sep></span>';
+    h+='<span class="st'+(x[0]===step?' cur':'')+(d[x[0]]?' done':'')+'" data-step="'+x[0]+'"><i>'+(d[x[0]]&&x[0]!==step?'&#10003;':(i+1))+'</i>'+x[1]+'</span>'; });
+  h+='<span style="flex:1"></span><span class=mono style="color:var(--accent)">'+E(SLOT.side)+' · '+RL[SLOT.role]+'</span></div><div id=wstep></div>';
+  $('wiz').innerHTML=h;
+  document.querySelectorAll('.stepper .st').forEach(el=>el.onclick=()=>go(el.dataset.step));
+  ({port:stepPort,diag:stepDiag,calib:stepCalib,verify:stepVerify})[step](s);
+}
+async function refreshSlot(){ W=await jget('/api/wizard/state'); paintOver(); paintAfter(); return slotOf(SLOT.side,SLOT.role); }
+
+/* ---------- ① 포트 찾기 ---------- */
+function stepPort(s){
+  const who=E(SLOT.side)+' '+RL[SLOT.role];
+  $('wstep').innerHTML='<div class="wbody one"><div class=wpanel>'
+    +'<p class=note><b>'+who+'</b> 팔만 손으로 이리저리 움직이세요. 움직인 팔의 포트가 초록으로 표시됩니다.<br>'
+    +'감시를 켜면 <b>모든 포트의 토크가 꺼집니다</b> — 팔로워가 들려 있으면 주저앉으니 받치거나 내려놓으세요.</p>'
+    +'<div class=toolbar><button class=primary id=wwatch>포트 감시 시작</button>'
+    +(s.port_ok?'<button id=wkeep>지금 포트 그대로 — 다음</button>':'')
+    +'<span class=muted id=wsug></span></div>'
+    +'<table id=wtbl style="margin-top:10px"></table>'
+    +'<p class=tiny style="margin-top:8px">travel = 감시 시작 뒤 엔코더가 움직인 폭 (tick, 4096 = 한 바퀴). 보드를 못 찾으면 USB 를 다시 꽂고 새로고침하세요.</p>'
+    +'</div></div>';
+  $('wwatch').onclick=watchToggle;
+  if($('wkeep')) $('wkeep').onclick=()=>go('diag');
+  paintPorts(null);
+}
+function whoHas(dev){
+  const s=W.slots.find(x=>x.dev===dev); return s?s.side+' · '+RL[s.role]:'';
+}
+function paintPorts(st){
+  const t=$('wtbl'); if(!t) return;
+  const trav={}; let best=null, second=0;
+  W.ports.forEach(p=>{ const w=st&&st[p.dev]; const sp=w&&w.span?Object.values(w.span):[]; trav[p.dev]=sp.length?Math.max.apply(null,sp):null; });
+  const vals=Object.entries(trav).filter(x=>x[1]!=null).sort((a,b)=>b[1]-a[1]);
+  if(vals.length && vals[0][1]>60){ second=vals[1]?vals[1][1]:0; if(vals[0][1]>=second*3) best=vals[0][0]; }
+  let h='<tr><th>포트</th><th>보드</th><th>지금 지정</th><th>travel</th><th></th></tr>';
+  W.ports.forEach(p=>{
+    const tv=trav[p.dev], pct=tv==null?0:Math.min(100,tv/400*100);
+    h+='<tr'+(best===p.dev?' class=best':'')+'><td class=mono>'+E(p.dev)+'</td>'
+      +'<td class=tiny>'+E((p.usb&&p.usb.product)||'')+(p.usb&&p.usb.serial?' · sn '+E(p.usb.serial):'')+'</td>'
+      +'<td class=tiny>'+E(whoHas(p.dev))+'</td>'
+      +'<td><div style="display:flex;gap:8px;align-items:center"><div class=tbar><i style="width:'+pct+'%;background:'+(best===p.dev?'var(--ok)':'var(--warn)')+'"></i></div><span class=mono>'+(tv==null?'-':tv)+'</span></div>'
+      +(st&&st[p.dev]&&st[p.dev].err?'<span class=tiny style="color:var(--bad)">'+E(st[p.dev].err)+'</span>':'')+'</td>'
+      +'<td style="text-align:right"><button data-dev="'+E(p.dev)+'" class="'+(best===p.dev?'primary':'')+'">이 포트로 지정</button></td></tr>';
+  });
+  if(!W.ports.length) h+='<tr><td colspan=5 class=muted>시리얼 포트가 없습니다 — USB 와 dialout 권한을 확인하세요</td></tr>';
+  t.innerHTML=h;
+  t.querySelectorAll('button[data-dev]').forEach(b=>b.onclick=()=>assign(b.dataset.dev,b));
+  $('wsug').innerHTML=best?'<b style="color:var(--ok)">'+E(best)+'</b> 가 움직였습니다 — 맞으면 지정하세요':(WATCHING?'팔을 움직이는 중… ':'');
+}
+async function watchToggle(){
+  if(WATCHING){ WATCHING=false; stopTimers(); await jpost('/api/setup/watch/stop'); $('wwatch').textContent='포트 감시 시작'; return; }
+  const r=await jpost('/api/setup/watch',{ports:W.ports.map(p=>p.dev)});
+  if(r.error){ alert(r.error); return; }
+  WATCHING=true; $('wwatch').textContent='감시 중지';
+  const poll=async()=>{ if(!WATCHING) return; const st=await jget('/api/setup/watch'); if(st.on) paintPorts(st.state); T1=setTimeout(poll,400); };
+  poll();
+}
+async function assign(dev,btn){
+  if(btn) btn.disabled=true;
+  if(WATCHING){ WATCHING=false; stopTimers(); await jpost('/api/setup/watch/stop'); }
+  const r=await jpost('/api/wizard/assign',{side:SLOT.side,role:SLOT.role,dev:dev});
+  if(r.error){ alert(r.error); if(btn) btn.disabled=false; return; }
+  W=r; paintOver(); paintAfter(); go('diag');
+}
+
+/* ---------- ② 진단 ---------- */
+async function stepDiag(s){
+  if(!s.port_ok){ $('wstep').innerHTML='<div class=wpanel><p class="note bad">포트가 지정되지 않았거나 연결돼 있지 않습니다.</p><button class=primary id=wback>포트 찾기로</button></div>'; $('wback').onclick=()=>go('port'); return; }
+  $('wstep').innerHTML='<div class=wpanel><p class=muted>진단 중… 서보에 아무것도 쓰지 않습니다 (몇 초)</p></div>';
+  const r=await jpost('/api/setup/armcheck/start',{port:s.port, role:SLOT.role, sweep:false});
+  if(STEP!=='diag') return;
+  const st=r.state||{};
+  if(r.error || st.stage==='error'){ $('wstep').innerHTML='<div class=wpanel><p class="note bad"></p><button id=wre>다시 진단</button></div>'; $('wstep').querySelector('.note').textContent='진단 실패 — '+(r.error||st.err); $('wre').onclick=()=>go('diag'); return; }
+  const rep=st.report; s=await refreshSlot();
+  const missing=Object.keys(rep.motors).filter(j=>rep.motors[j].model==null);
+  const powerFail=rep.findings.some(f=>f.check==='전원'&&f.level==='FAIL');
+  const cls=rep.code===0?'ok':rep.code===2?'bad':'';
+  let h='<div class="wbody one"><div class=wpanel>'
+    +'<p class="note '+cls+'">판정: <b>'+E(rep.verdict)+'</b>'+(rep.power&&rep.power.system?' · 전원 '+E(rep.power.system)+' 계통 (중앙값 '+rep.power.median_v+' V)':'')+'</p>'
+    +'<table><tr><th>ID</th><th>관절</th><th class=num>전압</th><th class=num>온도</th><th class=num>흔들림</th><th>결과</th></tr>';
+  Object.keys(rep.motors).forEach(j=>{ const m=rep.motors[j];
+    h+='<tr><td class=mono>'+m.id+'</td><td class=mono>'+E(j)+'</td><td class=num>'+(m.voltage_v==null?'-':m.voltage_v.toFixed(1)+' V')+'</td>'
+      +'<td class=num>'+(m.temp_c==null?'-':m.temp_c+'°')+'</td><td class=num>'+(m.noise_ticks==null?'-':m.noise_ticks)+'</td>'
+      +'<td>'+badge(m.model==null?'응답 없음':({OK:'정상',INFO:'정상',WARN:'주의',FAIL:'불량'})[m.level], m.level==='FAIL'||m.model==null?'b-bad':m.level==='WARN'?'b-warn':'')+'</td></tr>'; });
+  h+='</table>'+rep.findings.filter(f=>f.level==='WARN'||f.level==='FAIL').map(f=>'<p style="margin:5px 0">'+badge(f.level,f.level==='FAIL'?'b-bad':'b-warn')+' <span class=mono>'+E(f.joint||'팔 전체')+'</span> · '+E(f.message)+'</p>').join('');
+  if(missing.length){
+    h+='<div class=stagebox style="margin-top:14px" id=wms><h3>모터 ID 세팅이 필요합니다</h3>'
+      +'<p class=inst>응답하지 않는 모터: <b>'+E(missing.join(', '))+'</b>. 새 모터는 전부 ID 1 이라 한 개씩만 보드에 꽂아 ID 를 써야 합니다.</p>'
+      +'<div id=wmsbody><button class=primary id=wmsgo>모터 ID 세팅 시작</button></div></div>';
+  }
+  h+='<div class=toolbar style="margin-top:14px"><button id=wre>다시 진단</button>'
+    +'<button class=primary id=wnext '+(powerFail||missing.length?'disabled':'')+'>다음: 캘리브레이션</button>'
+    +(powerFail?'<span class="badge b-bad">전원을 먼저 바로잡으세요</span>':'')+'</div></div></div>';
+  $('wstep').innerHTML=h;
+  $('wre').onclick=()=>go('diag'); $('wnext').onclick=()=>go('calib');
+  if($('wmsgo')) $('wmsgo').onclick=()=>msStart(s);
+}
+async function msStart(s){
+  if(!confirm('모터를 한 개씩만 보드에 연결한 상태여야 합니다. 시작할까요?')) return;
+  const r=await jpost('/api/setup/motors/start',{port:s.dev||s.port});
+  if(r.error){ alert(r.error); return; }
+  msPoll();
+}
+async function msPoll(){
+  const m=await jget('/api/setup/motors'); const b=$('wmsbody'); if(!b||STEP!=='diag') return;
+  if(m.stage==='running'){
+    b.innerHTML='<p>지금 연결할 모터: <b class=mono>'+E(m.current)+'</b> → ID <b>'+E(m.current_id)+'</b> · 완료 '+m.done.length+'/'+m.order.length+'</p>'
+      +(m.err?'<p class="badge b-bad"></p>':'')+(m.last?'<p class=tiny>'+E(m.last)+'</p>':'')
+      +'<div class=toolbar><button class=primary id=wmsw>ID 쓰기</button><button id=wmsc>취소</button></div>';
+    if(m.err) b.querySelector('.b-bad').textContent=m.err;
+    $('wmsw').onclick=async()=>{ $('wmsw').disabled=true; await jpost('/api/setup/motors/write'); msPoll(); };
+    $('wmsc').onclick=async()=>{ await jpost('/api/setup/motors/cancel'); go('diag'); };
+  }else if(m.stage==='done'){
+    b.innerHTML='<p class="badge b-ok">6개 모두 ID 기록 완료 — 모터를 전부 다시 연결하고 다시 진단하세요</p>';
+  }else if(m.stage==='error'){
+    b.innerHTML='<p class="badge b-bad"></p>'; b.firstChild.textContent=m.err;
+  }
+}
+
+/* ---------- ③ 캘리브레이션 ---------- */
+function stepCalib(s){
+  const back='/setup/wizard?slot='+SLOT.side+'|'+SLOT.role+'&step=verify';
+  const link='/calib?side='+encodeURIComponent(SLOT.side)+'&role='+SLOT.role+'&next='+encodeURIComponent(back);
+  $('wstep').innerHTML='<div class="wbody one"><div class=wpanel>'
+    +(s.calib.ok
+      ?'<p class="note ok">캘리브레이션 파일이 있습니다 — <span class=mono>'+E(s.calib.id)+'.json</span> ('+E(s.calib.when)+')</p>'
+       +'<p class=muted>같은 팔이면 그대로 쓰고 다음 단계에서 3D 로 확인하세요. 다른 팔의 파일이면 다시 하세요 — 엔코더 값이 팔마다 다릅니다.</p>'
+       +'<div class=toolbar><button class=primary id=wnext>그대로 쓰고 다음: 확인</button><a class=btnlink href="'+E(link)+'">다시 캘리브레이션 &rarr;</a></div>'
+      :'<p class="note">캘리브레이션 파일이 없습니다 — <span class=mono>'+E(s.calib.id)+'.json</span></p>'
+       +'<p class=muted>Calib 탭에서 관절마다 양 끝까지 한 번씩 쓸면 됩니다. 저장하면 이 마법사로 돌아오는 버튼이 나옵니다.<br>'
+       +'Calib 는 토크를 끕니다 — 팔로워는 받치세요.</p>'
+       +'<div class=toolbar><a class=btnlink href="'+E(link)+'"><b>캘리브레이션 하러 가기 &rarr;</b></a></div>')
+    +'</div></div>';
+  if($('wnext')) $('wnext').onclick=()=>go('verify');
+}
+
+/* ---------- ④ 확인 ---------- */
+async function stepVerify(s){
+  if(!s.calib.ok){ $('wstep').innerHTML='<div class=wpanel><p class=note>캘리브레이션이 먼저 필요합니다.</p><button class=primary id=wb>캘리브레이션으로</button></div>'; $('wb').onclick=()=>go('calib'); return; }
+  $('wstep').innerHTML='<div class=wbody><div class=wpanel>'
+    +'<p class=note>팔을 손으로 움직여 보세요. <b>오른쪽 3D 가 실물과 같은 방향·같은 각도로 움직이면</b> 완료를 누르세요.</p>'
+    +'<div id=wvwarn></div><table id=wvtbl></table>'
+    +'<div class=toolbar style="margin-top:14px"><button class=primary id=wok disabled title="관절값이 들어와야 누를 수 있습니다">일치함 — 완료</button>'
+    +'<button id=wcal>다시 캘리브레이션</button></div>'
+    +'<p class=tiny style="margin-top:8px">읽기만 합니다. 방향이 반대거나 각도가 어긋나면 다른 팔의 캘리브레이션 파일이거나 캘리브 때 자세가 틀린 것입니다.</p>'
+    +'</div><div id=w3d><p class=muted style="padding:14px">3D 불러오는 중…</p></div></div>';
+  $('wcal').onclick=()=>go('calib');
+  $('wok').onclick=async()=>{ const r=await jpost('/api/wizard/verified',{side:SLOT.side,role:SLOT.role}); if(r.error){ alert(r.error); return; } W=r; STEP=null; paintOver(); paintAfter();
+    const nx=W.slots.find(x=>{ const d=doneOf(x); return !(d.port&&d.calib&&d.verify); });
+    $('wiz').innerHTML='<div class=wpanel><p class="note ok"><b>'+E(SLOT.side)+' · '+RL[SLOT.role]+'</b> 확인 완료</p>'
+      +(nx?'<button class=primary id=wnx>다음 팔: '+E(nx.side)+' · '+RL[nx.role]+'</button>':'<p>모든 팔이 준비됐습니다. 아래에서 카메라와 환경을 확인하세요.</p>')+'</div>';
+    if(nx) $('wnx').onclick=()=>openSlot(nx.side,nx.role); };
+  const r=await jpost('/api/wizard/verify/start',{side:SLOT.side,role:SLOT.role});
+  if(STEP!=='verify') { jpost('/api/wizard/verify/stop'); return; }
+  if(r.error){ $('wvwarn').innerHTML='<p class="note bad"></p>'; $('wvwarn').firstChild.textContent='읽기 시작 실패 — '+r.error;
+    $('w3d').innerHTML='<p class=muted style="padding:14px">관절값을 못 읽어 3D 를 표시하지 않습니다.</p>'; return; }
+  mount3D();
+  vpoll();
+}
+async function mount3D(){
+  const el=$('w3d'); if(!el) return;
+  if(!W.urdf){ el.innerHTML='<p class=muted style="padding:14px">urdf/so101.urdf 가 없어 3D 를 못 그립니다 — 아래 숫자로 확인하세요.</p>'; ARM=null; return; }
+  el.innerHTML='';
+  try{ ARMSIDE=SLOT.side; const v={}; v[SLOT.side]={x:0,y:0,yaw_deg:0}; ARM=await window.mountArm3D(el,[SLOT.side],v); }
+  catch(e){ console.error(e); ARM=null; el.innerHTML='<p class=muted style="padding:14px">3D 를 불러오지 못했습니다 (인터넷 연결 필요) — 아래 숫자로 확인하세요.</p>'; }
+}
+async function vpoll(){
+  if(STEP!=='verify') return;
+  const v=await jget('/api/wizard/verify');
+  if(STEP!=='verify') return;
+  const t=$('wvtbl');
+  if(t){
+    let h='<tr><th>관절</th><th class=num>값</th></tr>';
+    Object.keys(v.joints).forEach(j=>{ h+='<tr><td class=mono>'+E(j)+'</td><td class="num mono">'+v.joints[j].toFixed(1)+(j==='gripper'?' %':'°')+'</td></tr>'; });
+    t.innerHTML=h;
+  }
+  if($('wok')) $('wok').disabled=!(v.on && Object.keys(v.joints).length && !v.err);
+  let w='';
+  if(v.torque_on.length) w+='<p class="note bad">토크가 켜져 있어 손으로 안 움직입니다 ('+E(v.torque_on.join(', '))+') '
+    +'<button id=wtq class=danger style="margin-left:8px">토크 끄기 — 팔을 받치세요</button></p>';
+  v.warn.forEach(x=>{ w+='<p class=note>'+E(x)+'</p>'; });
+  if(v.err) w+='<p class="note bad">'+E(v.err)+'</p>';
+  if($('wvwarn') && $('wvwarn').innerHTML!==w){ $('wvwarn').innerHTML=w;
+    if($('wtq')) $('wtq').onclick=async()=>{ const r=await jpost('/api/wizard/verify/torque_off'); if(r.error) alert(r.error); }; }
+  if(ARM) ARM.update(ARMSIDE, v.joints);
+  T2=setTimeout(vpoll,100);
+}
+
+addEventListener('pagehide',()=>{ if(STEP==='verify') navigator.sendBeacon('/api/wizard/verify/stop'); if(WATCHING) navigator.sendBeacon('/api/setup/watch/stop'); });
+(async()=>{
+  await load();
+  const q=new URLSearchParams(location.search), slot=(q.get('slot')||'').split('|');
+  if(slot.length===2 && slotOf(slot[0],slot[1])) openSlot(slot[0],slot[1],q.get('step')||null);
+})();
+</script>"""
 
 
 SETUP_HTML = """
@@ -3326,6 +4868,21 @@ SETUP_HTML = """
 <div class=wrap>
 <p class=eyebrow>Hardware setup</p><h2>Setup</h2>
 <div id=busywarn></div>
+<div class=toolbar style="margin-bottom:6px">
+  <a class=btnlink href="/setup/wizard"><b>셋업 마법사</b> — 팔 하나씩 단계별로 (포트 찾기 → 진단 → 캘리브 → 3D 확인)</a>
+</div>
+
+<p class=eyebrow id=envcard>0 · 환경</p>
+<div class=card>
+  <p class=muted style="margin-top:0">환경은 하드웨어 구성 한 벌입니다 — 한팔/양팔, 포트, 캘리브 id, 카메라, fps.
+  아래에서 <b>설정 저장</b>을 누르면 <b>사용 중인 환경</b>에 반영됩니다. 작업대나 팔 세트가 여러 개면 환경을 나눠 두고 전환하세요.
+  수집한 데이터셋에는 어느 환경으로 찍었는지 기록됩니다.</p>
+  <table id=envtbl></table>
+  <div class=toolbar style="margin-top:10px">
+    <button onclick="envSaveAs()">저장된 지금 구성을 새 환경으로 복사</button>
+    <span class=muted id=envmsg></span>
+  </div>
+</div>
 
 <p class=eyebrow>1 · 모드</p>
 <div class=toolbar>
@@ -3391,7 +4948,7 @@ SETUP_HTML = """
   <div id=acbox></div>
 </div>
 
-<p class=eyebrow>3 · 카메라</p>
+<p class=eyebrow id=cameras>3 · 카메라</p>
 <div class=card>
   <div class=toolbar>
     <button onclick="withBusy(this,loadCams)">카메라 스캔</button>
@@ -3459,7 +5016,7 @@ async function boot(){
   $('mrt').value=(CFG.max_relative_target==null?'':CFG.max_relative_target);
   $('task').value=CFG.default_task||'';
   renderArms(); renderPorts(); renderCurCams(); renderCalib(s.calib); dump();
-  fillMsPorts(); msRefresh(); fillAcPorts(); acLoad();
+  fillMsPorts(); msRefresh(); fillAcPorts(); acLoad(); envLoad();
 }
 function dump(){ $('cfgdump').textContent=JSON.stringify(CFG,null,2); }
 
@@ -3747,6 +5304,58 @@ async function msRefresh(){
   box.innerHTML=h;
 }
 addEventListener('pagehide',()=>{ if(MS&&MS.stage==='running') navigator.sendBeacon('/api/setup/motors/cancel'); });
+
+/* ---------- 환경 ---------- */
+function portTail(p){ if(!p) return '-'; const t=p.split('/').pop(); return t.length>24?'…'+t.slice(-22):t; }
+async function envLoad(){ envPaint(await jget('/api/envs')); }
+function envPaint(d){
+  const t=$('envtbl'); if(!t||!d||!d.envs) return;
+  let h='<tr><th>환경</th><th>모드</th><th>팔 — 팔로워 / 리더 포트</th><th>카메라</th><th>수정</th><th></th></tr>';
+  d.envs.forEach((e,i)=>{
+    const arms=e.arms.map(a=>'<span class=mono>'+E(a.side)+'</span> '+E(portTail(a.follower_port))+' / '+E(portTail(a.leader_port))).join('<br>');
+    const cams=[].concat.apply([], e.arms.map(a=>a.cameras.map(c=>(e.mode==='bimanual'?a.side+'_':'')+c))).concat(e.cameras);
+    h+='<tr><td class=mono>'+E(e.name)+(e.active?' <span class="badge b-ok">사용 중</span>':'')+'</td>'
+      +'<td>'+(e.mode==='bimanual'?'양팔':'한팔')+'</td><td style="font-size:12px">'+arms+'</td>'
+      +'<td class=mono style="font-size:12px">'+E(cams.join(', ')||'-')+'</td><td class=tiny>'+E(e.updated)+'</td>'
+      +'<td style="text-align:right;white-space:nowrap" id="envact'+i+'"></td></tr>';
+  });
+  t.innerHTML=h;
+  d.envs.forEach((e,i)=>{
+    const td=$('envact'+i);
+    if(!e.active) td.appendChild(btn('전환',()=>envActivate(e.name),'primary'));
+    td.appendChild(btn('이름 변경',()=>envRename(e.name)));
+    if(!e.active) td.appendChild(btn('삭제',()=>envDelete(e.name),'danger'));
+  });
+}
+const ENV_RE=/^[A-Za-z0-9._-]+$/;
+async function envActivate(name){
+  if(!confirm('환경을 "'+name+'" 로 전환합니다. 저장하지 않은 Setup 변경은 사라집니다.')) return;
+  const r=await jpost('/api/envs/activate',{name:name});
+  if(r.error){ alert(r.error); return; }
+  location.reload();
+}
+async function envSaveAs(){
+  const name=(prompt('새 환경 이름 (영문/숫자/._-)\\n저장된 지금 구성이 복사되고, 새 환경이 사용 중이 됩니다.')||'').trim();
+  if(!name) return;
+  if(!ENV_RE.test(name)){ alert('영문/숫자/._- 만 쓸 수 있습니다'); return; }
+  const r=await jpost('/api/envs/save_as',{name:name});
+  if(r.error){ alert(r.error); return; }
+  location.reload();
+}
+async function envRename(name){
+  const nw=(prompt('"'+name+'" 의 새 이름',name)||'').trim();
+  if(!nw||nw===name) return;
+  if(!ENV_RE.test(nw)){ alert('영문/숫자/._- 만 쓸 수 있습니다'); return; }
+  const r=await jpost('/api/envs/rename',{name:name,new:nw});
+  if(r.error){ alert(r.error); return; }
+  location.reload();
+}
+async function envDelete(name){
+  if(!confirm('환경 "'+name+'" 를 지웁니다. 데이터셋과 캘리브레이션 파일은 그대로입니다.')) return;
+  const r=await jpost('/api/envs/delete',{name:name});
+  if(r.error){ alert(r.error); return; }
+  envPaint(r);
+}
 
 /* ---------- 팔 불량 점검 ---------- */
 let AC=null, acTimer=null;
@@ -4225,8 +5834,11 @@ CALIB = CalibSession()
 
 
 @app.get("/calib", response_class=HTMLResponse)
-def calib_page():
-    return CSS + nav_html("cb") + CALIB_HTML
+def calib_page(side: str = "", role: str = "", next: str = ""):
+    wiz = {"side": side if side in ARM_CFGS else "",
+           "role": role if role in ("follower", "leader") else "",
+           "next": next if next.startswith("/setup/wizard") and "//" not in next else ""}
+    return CSS + nav_html("cb") + f"<script>const WIZ={js(wiz)};</script>" + CALIB_HTML
 
 
 @app.get("/api/calib/state")
@@ -4324,6 +5936,11 @@ function renderPicker(s){
     });
   });
   h+='</div>';
+  if(WIZ.side && WIZ.role && s.stage!=='homing' && s.stage!=='ranging'){
+    h='<div class=stagebox style="margin-bottom:14px"><h3>셋업 마법사 — '+E(WIZ.side)+' · '+E(WIZ.role)+'</h3>'
+      +'<p class=inst>아래 <b>'+E(WIZ.side)+' · '+E(WIZ.role)+'</b> 카드에서 캘리브레이션을 하세요. 저장하면 마법사로 돌아가는 버튼이 나옵니다.</p>'
+      +(WIZ.next?'<a href="'+E(WIZ.next)+'"><button>캘리브레이션 없이 마법사로 돌아가기</button></a>':'')+'</div>'+h;
+  }
   $('picker').innerHTML=h;
 }
 
@@ -4423,7 +6040,9 @@ function renderStage(s){
       +'<p class="badge b-ok">저장됨</p><p class="mono" style="font-size:12px;color:var(--muted)">'+E(s.saved_path)+'</p>'
       +rows(s,true)
       +'<pre style="margin-top:12px">'+E(JSON.stringify(s.saved,null,2))+'</pre>'
-      +'<div class=toolbar style="margin-top:14px"><button class=primary onclick="closeDone()">닫기</button>'
+      +'<div class=toolbar style="margin-top:14px">'
+      +(WIZ.next?'<a href="'+E(WIZ.next)+'"><button class=primary>셋업 마법사로 돌아가기</button></a>':'')
+      +'<button class=primary onclick="closeDone()">닫기</button>'
       +'<a href="/control"><button>Control 탭에서 확인</button></a></div></div>';
   }else if(s.stage==='error'){
     box.innerHTML='<div class=stagebox>'+head+'<p class="badge b-bad">'+E(s.err)+'</p>'

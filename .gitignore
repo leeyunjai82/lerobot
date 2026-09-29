@@ -14,6 +14,10 @@ outputs/
 lrweb_jobs/
 lrweb_run/
 lrweb_marks.json
+lrweb_envs/
+lrweb_projects.json
+lrweb_dsmeta.json
+lrweb_wizard.json
 *.log
 *.pid
 
