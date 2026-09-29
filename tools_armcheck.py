@@ -4,8 +4,9 @@
     python tools_armcheck.py                                  # 포트가 하나면 자동 선택
     python tools_armcheck.py --port /dev/serial/by-id/usb-... --role follower
     python tools_armcheck.py --port ... --role leader --sweep # + 손으로 관절 쓸기 (엔코더)
-    python tools_armcheck.py --port ... --role follower --move # + 모터 구동 시험 (팔이 움직임)
     python tools_armcheck.py --port ... --json                # 결과를 JSON 으로
+
+lrweb 의 Setup 탭 '팔 불량 점검' 도 이 모듈을 그대로 씁니다.
 
 종료 코드: 0 정상 / 1 주의 / 2 불량 의심 / 3 실행 실패 — 여러 대를 연달아 검사할 때 씁니다.
 
@@ -14,14 +15,11 @@
               ID 1~6 응답 · 모델(STS3215) · 보호 플래그(Status 레지스터 + 응답 에러 바이트) ·
               전원 계통(5V/12V) 과 전압 범위 · 모터 간 전압 편차 · 온도 · 펌웨어 ·
               정지 상태 엔코더 흔들림 · 통신 누락
-  --sweep     토크를 끄고, 관절마다 손으로 양 끝까지 움직이게 합니다.
+  --sweep     토크를 끄고(Torque_Enable=0), 손으로 관절을 양 끝까지 움직이게 합니다.
               움직인 범위 · 엔코더 튐(한 샘플 사이 비정상 점프) · 읽기 실패
-  --move      모든 모터의 Goal_Position 을 현재 위치로 먼저 쓰고 토크를 켠 뒤,
-              관절을 하나씩 약 13° 움직였다 되돌립니다. 목표 도달 여부 · 소요 시간 ·
-              최대 전류 · 보호 플래그. 팔로워용입니다 (리더는 --sweep 으로).
 
-EEPROM 은 어떤 단계에서도 쓰지 않습니다. 쓰는 레지스터는 --move 의 Goal_Position /
-Torque_Enable, --sweep 의 Torque_Enable 뿐입니다 (둘 다 SRAM).
+모터를 구동하는 시험은 넣지 않습니다. 쓰는 레지스터는 --sweep 의 Torque_Enable=0 하나뿐이고,
+EEPROM 은 어떤 경우에도 쓰지 않습니다.
 
 판정 근거 — 출처가 있는 값만 씁니다
   [SDK]   Feetech scservo_sdk/protocol_packet_handler.py 의 ERRBIT_* (보호 비트 정의)
@@ -31,11 +29,10 @@ Torque_Enable, --sweep 의 Torque_Enable 뿐입니다 (둘 다 SRAM).
               5V 계통 4.5~5.5 V, 12V 계통 10.5~13.5 V, 7.0 V 미만이면 5V 계통으로 판정
               SAFE_TEMPERATURE_MAX = 60 °C
             src/gui/factory_calibration_tool.py
-              Status 레지스터(주소 65)를 ERRBIT 로 해석
-              전류 1 단위 ≈ 6.5 mA, 과열 보호 70 °C 초과 시 토크 차단,
+              Status 레지스터(주소 65)를 ERRBIT 로 해석, 과열 보호 70 °C 초과 시 토크 차단,
               과부하·과전류 보호는 위치 명령을 다시 보내면 해제
   [lerobot] motors/feetech/tables.py — 레지스터 주소, STS3215 모델 번호 777
-  [경험값]  엔코더 흔들림·점프·도착 허용오차·온도 편차 — 데이터시트 값이 아닙니다. 옵션으로 조정.
+  [경험값]  엔코더 흔들림·점프·온도 편차·쓸기 최소 범위 — 데이터시트 값이 아닙니다. 옵션으로 조정.
 """
 from __future__ import annotations
 
@@ -65,15 +62,11 @@ ERR_HINT = {                                                                    
 VOLT_SYSTEM_SPLIT = 7.0                              # [Seeed] V
 VOLT_RANGE = {"5V": (4.5, 5.5), "12V": (10.5, 13.5)}  # [Seeed] V
 TEMP_WARN_C = 60.0                                   # [Seeed] SAFE_TEMPERATURE_MAX
-CURRENT_MA_PER_UNIT = 6.5                            # [Seeed] ≈
 
 TEMP_REL_WARN = 8            # [경험값] 같은 팔 중앙값보다 이만큼(°C) 높으면
 VOLT_SPREAD_WARN = 0.5       # [경험값] 같은 팔 모터 간 전압 편차 (V)
 NOISE_WARN, NOISE_FAIL = 3, 10   # [경험값] 정지 중 엔코더 흔들림 (tick p-p)
-JUMP_TICKS = 400             # [경험값] 쓸기 중 한 샘플(~20 ms) 사이 허용 최대 이동 (≈35°)
-MOVE_TICKS = 150             # 구동 시험 이동량 (≈13°)
-MOVE_TIMEOUT = 1.5           # [경험값] 목표 도달 제한 시간 (s)
-MOVE_TOL = 30                # [경험값] 도착 판정 허용 오차 (tick, ≈2.6°)
+JUMP_TICKS = 400             # [경험값] 쓸기 중 한 샘플 사이 허용 최대 이동 (≈35°)
 SWEEP_MIN_DEG = {j: 60 for j in JOINTS} | {"gripper": 30, "wrist_roll": 90}   # [경험값]
 
 OK, INFO, WARN, FAIL = "OK", "INFO", "WARN", "FAIL"
@@ -134,9 +127,6 @@ class BusIO:
         v, comm, err = self.bus._read(addr, n, id_, raise_on_error=False)
         if not self.bus._is_comm_success(comm):
             return None, 0
-        if name == "Present_Current":
-            # lerobot 인코딩 표에는 없지만 Seeed SDK(ReadCurrent)는 bit15 를 부호로 봅니다
-            return (-(v & 0x7FFF) if v & 0x8000 else v), err
         return self.bus._decode_sign(name, {id_: v})[id_], err
 
     def write(self, id_, name, value):
@@ -168,6 +158,16 @@ class Report:
     def joint_level(self, joint):
         levels = [f[0] for f in self.findings if f[1] == joint]
         return max(levels, key=lambda l: RANK[l], default=OK)
+
+    def as_dict(self):
+        verdict, worst = self.verdict()
+        motors = {}
+        for j, m in self.motors.items():
+            motors[j] = dict(m)
+            motors[j]["level"] = self.joint_level(j)
+        return {"verdict": verdict, "code": worst, "power": self.power, "motors": motors,
+                "findings": [{"level": l, "joint": j, "check": c, "message": msg}
+                             for l, j, c, msg in sorted(self.findings, key=lambda f: -RANK[f[0]])]}
 
 
 def _read(io, rep, joint, name):
@@ -296,128 +296,59 @@ def check_static(io, rep, present, *, role=None, samples=50, noise_warn=NOISE_WA
                         "쉬는 중인데 혼자 뜨거우면 내부 쇼트·기어 걸림 의심")
 
 
+def finalize(rep):
+    """누적된 보호 비트를 판정에 넣습니다. 모든 점검이 끝난 뒤 한 번만 부르세요."""
+    for j in JOINTS:
+        e = rep.err[j]
+        rep.motors[j]["protect"] = errbit_names(e)
+        for bit in ERRBITS:
+            if e & bit:
+                rep.add(FAIL, j, "보호", f"{ERRBITS[bit]} — {ERR_HINT[bit]}")
+
+
 # --------------------------------------------------------------------------- 쓸기
-def _stdin_enter():
-    r, _, _ = select.select([sys.stdin], [], [], 0)
-    if r:
-        sys.stdin.readline()
-        return True
-    return False
+class SweepTracker:
+    """손으로 쓸 때의 위치 표본을 관절별로 누적합니다. CLI 와 lrweb 가 같이 씁니다."""
 
+    def __init__(self, joints, jump_ticks=JUMP_TICKS):
+        self.jump = jump_ticks
+        self.s = {j: {"prev": None, "acc": 0, "lo": 0, "hi": 0, "jumps": 0, "fails": 0, "n": 0}
+                  for j in joints}
 
-def check_sweep(io, rep, present, *, min_deg, jump_ticks, max_s=25.0, ask=input, enter_pressed=None):
-    """손으로 쓸기. enter_pressed() 가 True 를 돌려주면 그 관절을 끝냅니다."""
-    enter_pressed = enter_pressed or _stdin_enter
-    if any(rep.motors[j].get("torque") for j in present):
-        ask("\n  토크가 켜진 모터가 있습니다. 끄면 팔이 처집니다 — 팔을 받치거나 내려놓고 Enter ")
-    for j in present:
-        io.write(IDS[j], "Torque_Enable", 0)
-    for j in present:
-        ask(f"\n  [{j}] Enter 를 누른 뒤 양 끝까지 천천히 움직이고, 다 했으면 다시 Enter ")
-        prev, acc, lo, hi, jumps, fails, n = None, 0, 0, 0, 0, 0, 0
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < max_s:
-            v = _read(io, rep, j, "Present_Position")
-            n += 1
-            if v is None:
-                fails += 1
+    def feed(self, joint, value):
+        s = self.s[joint]
+        s["n"] += 1
+        if value is None:
+            s["fails"] += 1
+            return
+        if s["prev"] is not None:
+            d = unwrap_step(s["prev"], value)
+            if abs(d) > self.jump:
+                s["jumps"] += 1          # 사람 손으로는 한 샘플 사이에 못 가는 거리
             else:
-                if prev is not None:
-                    d = unwrap_step(prev, v)
-                    if abs(d) > jump_ticks:
-                        jumps += 1          # 사람 손으로는 한 샘플(~20 ms) 사이에 못 가는 거리
-                    else:
-                        acc += d
-                        lo, hi = min(lo, acc), max(hi, acc)
-                prev = v
-            print(f"\r    움직인 범위 {(hi - lo) * 360 / RES:6.1f}°   튐 {jumps}   실패 {fails}   ", end="", flush=True)
-            if enter_pressed():
-                break
-            time.sleep(0.02)
-        print()
-        deg = rep.motors[j]["sweep_deg"] = round((hi - lo) * 360 / RES, 1)
-        need = min_deg.get(j, 60)
-        if jumps:
-            rep.add(FAIL, j, "쓸기", f"엔코더 값이 {jumps} 번 튐 (한 샘플에 {jump_ticks} tick 초과) — 각도 센서·자석 불량 의심")
-        if fails > max(2, n * 0.05):
-            rep.add(WARN, j, "쓸기", f"쓰는 동안 읽기 {fails}/{n} 회 실패 — 움직일 때 끊기면 케이블 단선 의심")
-        if deg < need:
-            rep.add(WARN, j, "쓸기", f"{deg}° 만 움직였습니다 (기준 {need}°) — 덜 움직였거나 걸림/뻑뻑함")
+                s["acc"] += d
+                s["lo"], s["hi"] = min(s["lo"], s["acc"]), max(s["hi"], s["acc"])
+        s["prev"] = value
 
+    def deg(self, joint):
+        s = self.s[joint]
+        return round((s["hi"] - s["lo"]) * 360 / RES, 1)
 
-# --------------------------------------------------------------------------- 구동
-def check_move(io, rep, present, *, ticks, timeout, tol, margin=20):
-    """관절을 하나씩 조금 움직였다 되돌립니다. 호출 전에 사용자 확인을 받아야 합니다."""
-    targets = {}
-    for j in present:
-        m = rep.motors[j]
-        if m.get("mode") != 0:
-            rep.add(WARN, j, "구동", f"Operating_Mode={m.get('mode')} 라 구동 시험 건너뜀 (연속 회전할 위험)")
-            continue
-        p0 = _read(io, rep, j, "Present_Position")
-        if p0 is None:
-            rep.add(FAIL, j, "구동", "현재 위치를 못 읽어 건너뜀")
-            continue
-        targets[j] = p0
-    # 1) 목표를 현재 위치로 먼저 — Goal_Position 에는 이전 세션 값이 남아 있을 수 있습니다.
-    #    그 상태로 토크만 켜면 그 목표로 전속 이동합니다.
-    for j in list(targets):
-        ok, err = io.write(IDS[j], "Goal_Position", targets[j])
-        rep.note_err(j, err)
-        if not ok:
-            rep.add(FAIL, j, "구동", "Goal_Position 쓰기 실패 — 이 관절은 토크를 켜지 않습니다")
-            del targets[j]
-    if not targets:
-        return
-    # 2) 그다음 토크 ON (전 관절 — 중력으로 처지지 않게)
-    for j in targets:
-        ok, err = io.write(IDS[j], "Torque_Enable", 1)
-        rep.note_err(j, err)
-    time.sleep(0.2)
+    def live(self, min_deg=SWEEP_MIN_DEG):
+        return {j: {"deg": self.deg(j), "need": min_deg.get(j, 60), "jumps": s["jumps"],
+                    "fails": s["fails"], "n": s["n"]} for j, s in self.s.items()}
 
-    def go(j, goal):
-        io.write(IDS[j], "Goal_Position", goal)
-        t0 = time.monotonic()
-        reached, pk_cur, last = None, 0, None
-        while time.monotonic() - t0 < timeout:
-            pos = _read(io, rep, j, "Present_Position")
-            cur = _read(io, rep, j, "Present_Current")
-            if cur is not None:
-                pk_cur = max(pk_cur, abs(cur))
-            if pos is not None:
-                last = pos
-                if abs(pos - goal) <= tol:
-                    reached = time.monotonic() - t0
-                    break
-            time.sleep(0.01)
-        return reached, (None if last is None else last - goal), pk_cur
-
-    for j, p0 in targets.items():
-        m = rep.motors[j]
-        lo, hi = m.get("min_lim"), m.get("max_lim")
-        if lo is None or hi is None or lo >= hi:
-            lo, hi = 0, RES - 1
-        if not (lo <= p0 <= hi):
-            rep.add(WARN, j, "구동", f"현재 위치 {p0} 가 서보 한계 [{lo}, {hi}] 밖 — 캘리브레이션 이상, 건너뜀")
-            continue
-        step = ticks if p0 < (lo + hi) / 2 else -ticks        # 가동범위 중앙 쪽으로
-        goal = max(lo + margin, min(hi - margin, p0 + step))
-        if abs(goal - p0) < ticks // 3:
-            rep.add(WARN, j, "구동", "가동 범위가 너무 좁아 건너뜀")
-            continue
-        print(f"    {j:14s} {p0} → {goal} → {p0}", end="", flush=True)
-        r1, e1, c1 = go(j, goal)
-        r2, e2, c2 = go(j, p0)
-        pk = max(c1, c2)
-        m["move"] = {"out_s": None if r1 is None else round(r1, 2),
-                     "back_s": None if r2 is None else round(r2, 2),
-                     "out_err": e1, "back_err": e2,
-                     "peak_current_raw": pk, "peak_current_ma": round(pk * CURRENT_MA_PER_UNIT)}
-        print(f"   {m['move']['out_s']}s / {m['move']['back_s']}s   최대 {m['move']['peak_current_ma']} mA")
-        for label, r, e in (("가는 쪽", r1, e1), ("돌아오는 쪽", r2, e2)):
-            if r is None:
-                rep.add(FAIL, j, "구동", f"{label} 목표에 {timeout}s 안에 못 감 (오차 {e} tick) — "
-                        "기어 파손·모터 불량·기계적 걸림 의심")
+    def judge(self, rep, min_deg=SWEEP_MIN_DEG):
+        for j, s in self.s.items():
+            deg = rep.motors[j]["sweep_deg"] = self.deg(j)
+            need = min_deg.get(j, 60)
+            if s["jumps"]:
+                rep.add(FAIL, j, "쓸기", f"엔코더 값이 {s['jumps']} 번 튐 (한 샘플에 {self.jump} tick 초과) "
+                        "— 각도 센서·자석 불량 의심")
+            if s["fails"] > max(2, s["n"] * 0.05):
+                rep.add(WARN, j, "쓸기", f"쓰는 동안 읽기 {s['fails']}/{s['n']} 회 실패 — 움직일 때 끊기면 케이블 단선 의심")
+            if deg < need:
+                rep.add(WARN, j, "쓸기", f"{deg}° 만 움직였습니다 (기준 {need}°) — 덜 움직였거나 걸림/뻑뻑함")
 
 
 def torque_off(io, joints):
@@ -428,8 +359,38 @@ def torque_off(io, joints):
             pass
 
 
+def _stdin_enter():
+    r, _, _ = select.select([sys.stdin], [], [], 0)
+    if r:
+        sys.stdin.readline()
+        return True
+    return False
+
+
+def check_sweep(io, rep, present, *, min_deg=SWEEP_MIN_DEG, jump_ticks=JUMP_TICKS, max_s=25.0,
+                ask=input, enter_pressed=None):
+    """CLI 용 — 관절 하나씩 Enter 로 시작/끝. enter_pressed() 가 True 면 그 관절을 끝냅니다."""
+    enter_pressed = enter_pressed or _stdin_enter
+    if any(rep.motors[j].get("torque") for j in present):
+        ask("\n  토크가 켜진 모터가 있습니다. 끄면 팔이 처집니다 — 팔을 받치거나 내려놓고 Enter ")
+    torque_off(io, present)
+    tr = SweepTracker(present, jump_ticks)
+    for j in present:
+        ask(f"\n  [{j}] Enter 를 누른 뒤 양 끝까지 천천히 움직이고, 다 했으면 다시 Enter ")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < max_s:
+            tr.feed(j, _read(io, rep, j, "Present_Position"))
+            s = tr.s[j]
+            print(f"\r    움직인 범위 {tr.deg(j):6.1f}°   튐 {s['jumps']}   실패 {s['fails']}   ", end="", flush=True)
+            if enter_pressed():
+                break
+            time.sleep(0.02)
+        print()
+    tr.judge(rep, min_deg)
+
+
 # --------------------------------------------------------------------------- 실행
-def run(io, *, role=None, sweep=False, move=False, assume_yes=False, opts=None, ask=input):
+def run(io, *, role=None, sweep=False, opts=None, ask=input):
     o = opts or {}
     rep = Report()
     present = check_presence(io, rep)
@@ -438,34 +399,7 @@ def run(io, *, role=None, sweep=False, move=False, assume_yes=False, opts=None, 
     if sweep and present:
         check_sweep(io, rep, present, min_deg=o.get("min_deg", SWEEP_MIN_DEG),
                     jump_ticks=o.get("jump_ticks", JUMP_TICKS), ask=ask, enter_pressed=o.get("enter_pressed"))
-    if move and present:
-        if role == "leader":
-            rep.add(INFO, None, "구동", "리더는 구동 시험을 하지 않습니다 (--sweep 으로 점검)")
-        elif any(f[0] == FAIL and f[2] == "전원" for f in rep.findings):
-            rep.add(INFO, None, "구동", "전원 이상이 있어 구동 시험을 건너뜁니다")
-        else:
-            if not assume_yes:
-                ask("\n  구동 시험: 모든 관절에 토크가 켜지고 한 관절씩 약 13° 움직입니다.\n"
-                    "  주변에 걸릴 것이 없는지 확인하고 Enter (중단: Ctrl+C) ")
-            try:
-                check_move(io, rep, present, ticks=o.get("move_ticks", MOVE_TICKS),
-                           timeout=o.get("move_timeout", MOVE_TIMEOUT), tol=o.get("move_tol", MOVE_TOL))
-            except BaseException:
-                torque_off(io, present)               # 예외·Ctrl+C 면 즉시 토크 OFF
-                raise
-            if not assume_yes:
-                ask("  시험 끝. 팔을 받치고 Enter → 토크 OFF ")
-            else:
-                print("  3초 후 토크 OFF — 팔을 받치세요")
-                time.sleep(3)
-            torque_off(io, present)
-
-    for j in JOINTS:
-        e = rep.err[j]
-        rep.motors[j]["protect"] = errbit_names(e)
-        for bit in ERRBITS:
-            if e & bit:
-                rep.add(FAIL, j, "보호", f"{ERRBITS[bit]} — {ERR_HINT[bit]}")
+    finalize(rep)
     return rep
 
 
@@ -505,14 +439,9 @@ def main(argv=None):
     ap.add_argument("--role", choices=("leader", "follower"),
                     help="리더/팔로워 — 주면 5V/12V 계통이 맞는지 같이 판정합니다")
     ap.add_argument("--sweep", action="store_true", help="손으로 관절 쓸기 시험 (토크 OFF)")
-    ap.add_argument("--move", action="store_true", help="모터 구동 시험 (팔이 움직임, 팔로워용)")
-    ap.add_argument("--yes", action="store_true", help="확인 질문 생략")
     ap.add_argument("--json", action="store_true", help="결과를 JSON 으로 출력")
     ap.add_argument("--noise-warn", type=int, default=NOISE_WARN, help="정지 흔들림 주의 기준 (tick)")
     ap.add_argument("--noise-fail", type=int, default=NOISE_FAIL, help="정지 흔들림 불량 기준 (tick)")
-    ap.add_argument("--move-ticks", type=int, default=MOVE_TICKS)
-    ap.add_argument("--move-timeout", type=float, default=MOVE_TIMEOUT)
-    ap.add_argument("--move-tol", type=int, default=MOVE_TOL)
     a = ap.parse_args(argv)
 
     port = a.port
@@ -533,24 +462,19 @@ def main(argv=None):
         return 3
     try:
         if not a.json:
-            print(f"점검 중… ({port})" + ("" if (a.sweep or a.move) else "  — 서보에 아무것도 쓰지 않습니다"))
-        rep = run(io, role=a.role, sweep=a.sweep, move=a.move, assume_yes=a.yes,
-                  opts={"noise_warn": a.noise_warn, "noise_fail": a.noise_fail,
-                        "move_ticks": a.move_ticks, "move_timeout": a.move_timeout, "move_tol": a.move_tol})
+            print(f"점검 중… ({port})" + ("" if a.sweep else "  — 서보에 아무것도 쓰지 않습니다"))
+        rep = run(io, role=a.role, sweep=a.sweep,
+                  opts={"noise_warn": a.noise_warn, "noise_fail": a.noise_fail})
     except KeyboardInterrupt:
         print("\n중단됨", file=sys.stderr)
         return 3
     finally:
         io.close()
-    verdict, worst = rep.verdict()
     if a.json:
-        print(json.dumps({"port": port, "role": a.role, "verdict": verdict, "power": rep.power,
-                          "motors": rep.motors,
-                          "findings": [{"level": l, "joint": j, "check": c, "message": m}
-                                       for l, j, c, m in rep.findings]}, ensure_ascii=False, indent=1))
+        print(json.dumps({"port": port, "role": a.role, **rep.as_dict()}, ensure_ascii=False, indent=1))
     else:
         print_report(rep, port)
-    return worst
+    return rep.verdict()[1]
 
 
 if __name__ == "__main__":

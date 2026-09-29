@@ -1359,6 +1359,117 @@ class MotorSetupSession:
 MOTORSETUP = MotorSetupSession()
 
 
+class ArmCheckSession:
+    """Setup 탭 '팔 불량 점검'. 판정 로직은 tools_armcheck 를 그대로 씁니다.
+
+    기본 점검은 서보에 아무것도 쓰지 않습니다. 쓸기를 고르면 Torque_Enable=0 만 씁니다.
+    모터를 구동하는 시험은 없습니다."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._reset()
+
+    def _reset(self):
+        self.io = None
+        self.port = ""
+        self.role = ""
+        self.stage = "idle"      # idle | checking | sweeping | done | error
+        self.rep = None
+        self.tracker = None
+        self.present = []
+        self.err = ""
+        self._run = False
+        self._th = None
+
+    @property
+    def active(self):
+        return self.stage in ("checking", "sweeping")
+
+    def start(self, port, role, sweep):
+        import tools_armcheck as AC
+        if self.active:
+            raise RuntimeError("이미 점검 중")
+        self._close()
+        self._reset()
+        self.port, self.role, self.stage = port, role, "checking"
+        try:
+            self.io = AC.BusIO(port)
+        except Exception as e:
+            raise RuntimeError(f"포트를 열 수 없습니다 ({type(e).__name__}: {e})")
+        rep = AC.Report()
+        present = AC.check_presence(self.io, rep)
+        AC.check_static(self.io, rep, present, role=role or None)
+        self.rep, self.present = rep, present
+        if sweep and present:
+            AC.torque_off(self.io, present)
+            self.tracker = AC.SweepTracker(present)
+            self.stage = "sweeping"
+            self._run = True
+            self._th = threading.Thread(target=self._sample, daemon=True)
+            self._th.start()
+        else:
+            AC.finalize(rep)
+            self._close()
+            self.stage = "done"
+
+    def _sample(self):
+        import tools_armcheck as AC
+        while self._run:
+            for j in self.present:
+                if not self._run:
+                    break
+                with self.lock:
+                    v, err = self.io.read(AC.IDS[j], "Present_Position")
+                self.rep.note_err(j, err)
+                self.tracker.feed(j, v)
+            time.sleep(0.01)
+
+    def _stop_sampler(self):
+        self._run = False
+        th, self._th = self._th, None
+        if th is not None:
+            th.join(timeout=2)
+
+    def finish(self):
+        import tools_armcheck as AC
+        if self.stage != "sweeping":
+            raise RuntimeError("쓸기 중이 아닙니다")
+        self._stop_sampler()
+        self.tracker.judge(self.rep)
+        AC.finalize(self.rep)
+        self._close()
+        self.stage = "done"
+
+    def fail(self, e):
+        self._stop_sampler()
+        self._close()
+        self.stage = "error"
+        self.err = str(e)
+
+    def _close(self):
+        io, self.io = self.io, None
+        if io is not None:
+            with self.lock:
+                io.close()
+
+    def cancel(self):
+        self._stop_sampler()
+        self._close()
+        self._reset()
+
+    def state(self):
+        d = {"stage": self.stage, "port": self.port, "role": self.role, "err": self.err}
+        if self.rep is not None and self.stage in ("sweeping", "done"):
+            d["report"] = self.rep.as_dict()
+            d["partial"] = self.stage != "done"
+        if self.stage == "sweeping" and self.tracker is not None:
+            d["live"] = self.tracker.live()
+        return d
+
+
+ARMCHECK = ArmCheckSession()
+
+
 def busy_with(kinds):
     for j in jobs_index():
         if j["alive"] and j["kind"] in kinds:
@@ -1376,6 +1487,8 @@ def robot_busy():
         return {"id": "calibration (Calib 탭)", "kind": "calib", "alive": True}
     if MOTORSETUP.active:
         return {"id": "motor-id-setup (Setup 탭)", "kind": "setup", "alive": True}
+    if ARMCHECK.active:
+        return {"id": "arm-check (Setup 탭)", "kind": "setup", "alive": True}
     return busy_with(("record", "rollout"))
 
 
@@ -1393,6 +1506,8 @@ def exclusive_busy():
         return {"id": "calibration (Calib 탭)", "kind": "calib", "alive": True}
     if MOTORSETUP.active:
         return {"id": "motor-id-setup (Setup 탭)", "kind": "setup", "alive": True}
+    if ARMCHECK.active:
+        return {"id": "arm-check (Setup 탭)", "kind": "setup", "alive": True}
     return busy_with(("record", "rollout", "train"))
 
 
@@ -2349,7 +2464,8 @@ def control_page():
     busy = busy_with(("record", "rollout")) or (
         {"id": "port-watch (Setup 탭)"} if WATCH.on else None) or (
         {"id": "calibration (Calib 탭)"} if CALIB.active else None) or (
-        {"id": "motor-id-setup (Setup 탭)"} if MOTORSETUP.active else None)
+        {"id": "motor-id-setup (Setup 탭)"} if MOTORSETUP.active else None) or (
+        {"id": "arm-check (Setup 탭)"} if ARMCHECK.active else None)
     if busy:
         return f"""{CSS}{nav_html('ct')}<div class=wrap>
         <p class=eyebrow>Manual control</p><h2>Control</h2>
@@ -2703,7 +2819,7 @@ async def ws_control(sock: WebSocket):
         await sock.send_text(json.dumps({"type": "init", "error": "인증 필요 — 페이지를 새로고침하세요"}))
         await sock.close()
         return
-    if busy_with(("record", "rollout")) or WATCH.on or CALIB.active or MOTORSETUP.active:
+    if busy_with(("record", "rollout")) or WATCH.on or CALIB.active or MOTORSETUP.active or ARMCHECK.active:
         await sock.send_text(json.dumps({"type": "init", "error": "record/rollout/Setup/Calib 사용 중 — 제어 불가"}))
         await sock.close()
         return
@@ -3132,6 +3248,44 @@ async def api_motors_cancel():
     return {"ok": True}
 
 
+@app.get("/api/setup/armcheck")
+def api_armcheck_state():
+    return ARMCHECK.state()
+
+
+@app.post("/api/setup/armcheck/start")
+async def api_armcheck_start(req: Request):
+    b = await req.json()
+    port = (b.get("port") or "").strip()
+    if not port.startswith("/dev/"):
+        return JSONResponse({"error": "포트는 /dev/ 로 시작해야 합니다"}, status_code=400)
+    role = b.get("role") if b.get("role") in ("leader", "follower") else ""
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중"}, status_code=400)
+    try:
+        await asyncio.to_thread(ARMCHECK.start, port, role, bool(b.get("sweep")))
+    except Exception as e:
+        ARMCHECK.fail(e)
+        return JSONResponse({"error": str(e), "state": ARMCHECK.state()}, status_code=400)
+    return {"ok": True, "state": ARMCHECK.state()}
+
+
+@app.post("/api/setup/armcheck/finish")
+async def api_armcheck_finish():
+    try:
+        await asyncio.to_thread(ARMCHECK.finish)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "state": ARMCHECK.state()}
+
+
+@app.post("/api/setup/armcheck/cancel")
+async def api_armcheck_cancel():
+    await asyncio.to_thread(ARMCHECK.cancel)
+    return {"ok": True, "state": ARMCHECK.state()}
+
+
 @app.post("/api/setup/config")
 async def api_setup_config(req: Request):
     busy = exclusive_busy()
@@ -3216,6 +3370,27 @@ SETUP_HTML = """
   <div id=msbox></div>
 </div>
 
+<p class=eyebrow>2c · 팔 불량 점검</p>
+<div class=card>
+  <p class=muted style="margin-top:0">팔 하나(보드 하나)씩 점검합니다. 기본 점검은 서보에 <b>아무것도 쓰지 않습니다</b> —
+  모터 응답·모델, 보호 플래그(과열·과부하·과전류·전압·각도센서), 전원 계통(5V/12V)과 전압, 온도,
+  가만히 있을 때 엔코더 흔들림, 통신 누락을 봅니다.
+  <b>손으로 쓸기</b>를 켜면 토크를 끄고(팔이 처짐) 관절을 손으로 끝까지 움직여 엔코더 튐과 걸림을 봅니다.
+  모터를 구동하는 시험은 없습니다.</p>
+  <div class=toolbar>
+    <select id=acport onchange="acRoleFromPort()"></select>
+    <select id=acrole>
+      <option value="">역할 모름 (전원 계통 판정 생략)</option>
+      <option value=follower>팔로워</option>
+      <option value=leader>리더 — 12V 로 읽히면 즉시 경고</option>
+    </select>
+    <label class=tiny style="display:flex;gap:6px;align-items:center">
+      <input type=checkbox id=acsweep> 손으로 쓸기 포함</label>
+    <button id=acstart class=primary onclick="withBusy(this,acStart)">점검 시작</button>
+  </div>
+  <div id=acbox></div>
+</div>
+
 <p class=eyebrow>3 · 카메라</p>
 <div class=card>
   <div class=toolbar>
@@ -3284,7 +3459,7 @@ async function boot(){
   $('mrt').value=(CFG.max_relative_target==null?'':CFG.max_relative_target);
   $('task').value=CFG.default_task||'';
   renderArms(); renderPorts(); renderCurCams(); renderCalib(s.calib); dump();
-  fillMsPorts(); msRefresh();
+  fillMsPorts(); msRefresh(); fillAcPorts(); acLoad();
 }
 function dump(){ $('cfgdump').textContent=JSON.stringify(CFG,null,2); }
 
@@ -3487,7 +3662,7 @@ function thumb(dev, ts, failText){
   return img;
 }
 
-async function loadPorts(){ PORTS=(await jget('/api/setup/ports')).ports; PROBE={}; renderPorts(); fillMsPorts(); }
+async function loadPorts(){ PORTS=(await jget('/api/setup/ports')).ports; PROBE={}; renderPorts(); fillMsPorts(); fillAcPorts(); }
 
 async function doProbe(dev,full){
   const r=ROWS[dev]; if(!r) return;
@@ -3572,6 +3747,117 @@ async function msRefresh(){
   box.innerHTML=h;
 }
 addEventListener('pagehide',()=>{ if(MS&&MS.stage==='running') navigator.sendBeacon('/api/setup/motors/cancel'); });
+
+/* ---------- 팔 불량 점검 ---------- */
+let AC=null, acTimer=null;
+const AC_LV={OK:'',INFO:'',WARN:'b-warn',FAIL:'b-bad'};
+const AC_MARK={OK:'정상',INFO:'정상',WARN:'주의',FAIL:'불량'};
+function fillAcPorts(){
+  const sel=$('acport'); if(!sel) return;
+  const cur=sel.value; sel.innerHTML='';
+  PORTS.forEach(p=>{
+    const o=document.createElement('option'); o.value=p.dev;
+    const slot=slotOf(p.dev);
+    o.textContent=(slot?slot.replace('|',' / ')+' — ':'')+p.dev+(p.usb&&p.usb.product?'  ('+p.usb.product+')':'');
+    sel.appendChild(o);
+  });
+  if(cur) sel.value=cur;
+  acRoleFromPort();
+}
+function acRoleFromPort(){
+  const slot=slotOf($('acport').value||'');
+  if(slot) $('acrole').value=slot.split('|')[1];
+}
+async function acStart(){
+  const port=$('acport').value;
+  if(!port){ alert('포트가 없습니다 — 위 2번에서 다시 스캔하세요'); return; }
+  const sweep=$('acsweep').checked;
+  if(sweep && !confirm('쓸기를 하면 토크가 꺼져 팔이 처집니다. 팔을 받치거나 내려놓았나요?')) return;
+  $('acbox').innerHTML='<p class=muted>점검 중… 몇 초 걸립니다</p>';
+  const r=await jpost('/api/setup/armcheck/start',{port:port, role:$('acrole').value, sweep:sweep});
+  acPaint(r.state||{stage:'error', err:r.error});
+}
+async function acFinish(el){
+  await withBusy(el, async()=>{ const r=await jpost('/api/setup/armcheck/finish'); acPaint(r.state||{stage:'error',err:r.error}); });
+}
+async function acCancel(){
+  const r=await jpost('/api/setup/armcheck/cancel'); acPaint(r.state);
+}
+async function acLoad(){ acPaint(await jget('/api/setup/armcheck')); }
+function acTable(rep, sweeping){
+  const J=Object.keys(rep.motors);
+  let h='<table><tr><th>ID</th><th>관절</th><th>모델</th><th>FW</th><th class=num>전압</th><th class=num>온도</th>'
+       +'<th class=num>흔들림</th><th class=num>통신</th>'+(sweeping?'':'<th class=num>쓸기</th><th>보호</th>')
+       +'<th>결과</th></tr>';
+  J.forEach(j=>{
+    const m=rep.motors[j];
+    const f=v=>v==null?'-':E(v);
+    h+='<tr><td class=mono>'+m.id+'</td><td class=mono>'+E(j)+'</td><td class=mono>'+f(m.model)+'</td><td class=mono>'+f(m.fw)+'</td>'
+      +'<td class=num>'+(m.voltage_v==null?'-':m.voltage_v.toFixed(1)+' V')+'</td>'
+      +'<td class=num>'+(m.temp_c==null?'-':m.temp_c+'°')+'</td>'
+      +'<td class=num>'+f(m.noise_ticks)+'</td><td class=num>'+f(m.comm)+'</td>'
+      +(sweeping?'':'<td class=num>'+(m.sweep_deg==null?'-':m.sweep_deg+'°')+'</td><td>'+E((m.protect||[]).join(', ')||'-')+'</td>')
+      +'<td><span class="badge '+(AC_LV[m.level]||'')+'">'+(sweeping&&m.level!=='FAIL'&&m.level!=='WARN'?'…':AC_MARK[m.level])+'</span></td></tr>';
+  });
+  return h+'</table>';
+}
+function acFindings(rep){
+  if(!rep.findings.length) return '';
+  return '<div style="margin-top:10px">'+rep.findings.filter(x=>x.level!=='OK').map(x=>
+    '<p style="margin:4px 0"><span class="badge '+(AC_LV[x.level]||'')+'">'+E(x.level)+'</span> '
+    +'<span class=mono>'+E(x.joint||'팔 전체')+'</span> · '+E(x.check)+' — '+E(x.message)+'</p>').join('')+'</div>';
+}
+function acPaint(st){
+  AC=st; const box=$('acbox'); if(!box) return;
+  clearTimeout(acTimer); acTimer=null;
+  if(!st || st.stage==='idle'){ box.innerHTML=''; return; }
+  if(st.stage==='error'){
+    box.innerHTML='<p class="badge b-bad" style="margin-top:10px"></p>';
+    box.firstChild.textContent='점검 실패 — '+(st.err||'알 수 없는 오류'); return;
+  }
+  if(st.stage==='checking'){
+    box.innerHTML='<p class=muted>점검 중… ('+E(st.port)+')</p>';
+    acTimer=setTimeout(acLoad,500); return;
+  }
+  const rep=st.report;
+  const pw=rep&&rep.power&&rep.power.system
+    ? '<p class=mono style="margin:10px 0 6px">전원: '+E(rep.power.system)+' 계통 · 중앙값 '+rep.power.median_v+' V (정상 '
+      +rep.power.range_v[0]+'~'+rep.power.range_v[1]+' V)</p>' : '';
+  if(st.stage==='sweeping'){
+    if(!document.getElementById('acsw')){
+      const J=Object.keys(st.live);
+      box.innerHTML='<div class=stagebox style="margin-top:12px" id=acsw>'
+        +'<h3>손으로 쓸기 — '+E(st.port)+'</h3>'
+        +'<p class=inst>토크가 꺼졌습니다. 관절을 하나씩 <b>천천히</b> 양 끝까지 움직이세요 (순서 무관). '
+        +'막대가 초록이 되면 충분합니다. 끝나면 <b>완료</b>.</p>'
+        +'<table><tr><th>관절</th><th>움직인 범위</th><th class=num>°</th><th class=num>튐</th><th class=num>읽기 실패</th></tr>'
+        +J.map(j=>'<tr><td class=mono>'+E(j)+'</td><td style="min-width:180px"><div class=pbar style="height:8px;background:var(--surface2);border-radius:4px;overflow:hidden">'
+          +'<i id="acb_'+j+'" style="display:block;height:100%;width:0;background:var(--warn)"></i></div></td>'
+          +'<td class=num id="acd_'+j+'">0</td><td class=num id="acj_'+j+'">0</td><td class=num id="acf_'+j+'">0</td></tr>').join('')
+        +'</table><div class=toolbar style="margin-top:12px">'
+        +'<button class=primary onclick="acFinish(this)">완료 — 판정 보기</button>'
+        +'<button onclick="acCancel()">취소</button></div>'
+        +'<div id=acpart></div></div>';
+    }
+    Object.keys(st.live).forEach(j=>{
+      const l=st.live[j], pct=Math.min(100, l.deg/l.need*100);
+      const b=document.getElementById('acb_'+j);
+      if(b){ b.style.width=pct+'%'; b.style.background=l.jumps?'var(--bad)':(pct>=100?'var(--ok)':'var(--warn)'); }
+      const set=(id,v)=>{ const e=document.getElementById(id); if(e) e.textContent=v; };
+      set('acd_'+j, l.deg.toFixed(1)); set('acj_'+j, l.jumps); set('acf_'+j, l.fails);
+    });
+    const part=document.getElementById('acpart');
+    if(part && rep) part.innerHTML='<p class=eyebrow style="margin-top:14px">기본 점검 결과 (쓸기 전)</p>'+pw+acTable(rep,true)+acFindings(rep);
+    acTimer=setTimeout(acLoad,300);
+    return;
+  }
+  // done
+  const cls={'정상':'b-ok','주의':'b-warn','불량 의심':'b-bad'}[rep.verdict]||'';
+  box.innerHTML='<div style="margin-top:12px"><span class="badge '+cls+'" style="font-size:15px;padding:6px 14px">판정: '
+    +E(rep.verdict)+'</span> <span class="mono muted">'+E(st.port)+(st.role?' · '+E(st.role):'')+'</span></div>'
+    +pw+acTable(rep,false)+acFindings(rep);
+}
+addEventListener('pagehide',()=>{ if(AC&&AC.stage==='sweeping') navigator.sendBeacon('/api/setup/armcheck/cancel'); });
 
 /* ---------- 카메라 ---------- */
 async function loadCams(){

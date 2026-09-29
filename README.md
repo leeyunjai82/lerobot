@@ -14,7 +14,7 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 | `urdf/` | SO-101 URDF/STL (Control 탭 3D 뷰용) |
 | `lerobot_conda.sh` | 새 기기 셋업 (conda env, PyTorch, lerobot 핀 커밋, 의존성) |
 | `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
-| `tools_armcheck.py` | 팔 한 개(보드 1개)의 불량 점검 — 응답·보호 플래그·전원·엔코더·구동 |
+| `tools_armcheck.py` | 팔 한 개(보드 1개)의 불량 점검 — Setup 탭과 같은 판정 (CLI) |
 
 실행하면 `~/project/lerobot/` 아래에 자동 생성되는 것:
 
@@ -41,6 +41,7 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 기반 SO-101 로�
 - **Setup**: USB 시리얼 포트 스캔·probe(모터 ID 확인)·**포트 감시로 leader/follower 판별**,
   **새 팔 모터 ID 세팅**(`lerobot-setup-motors` 의 웹 버전 — 모터 한 개씩 꽂고 gripper=6 → shoulder_pan=1),
   **카메라 스캔 시 썸네일 촬영**(어느 `/dev/videoN` 이 어느 카메라인지 눈으로 확인)·등록,
+  **팔 불량 점검**(응답·보호 플래그·전원 계통·엔코더),
   한팔/양팔 모드 전환, 캘리브레이션 파일 상태 — 전부 웹에서
 - **Calib**: 팔로워/리더 캘리브레이션을 웹에서 — 중앙 자세 기록 → 라이브 min/max 표시 → 저장.
   `lerobot-calibrate` 와 같은 버스 호출 순서, 같은 파일 경로·포맷
@@ -246,27 +247,33 @@ CLI(`lerobot-record`)는 연결이 끝나면 곧바로 episode 0 을 찍고, `re
 반드시 `record_loop` 바깥에서 읽어야 합니다. 대기가 길어지면 서보는 계속 토크를 물고
 리더를 따라가므로 발열이 쌓입니다 (STS3215 는 토크를 끄면 팔이 처져서 끌 수도 없습니다).
 
-## 팔 불량 점검 — `tools_armcheck.py`
+## 팔 불량 점검 — Setup 탭 / `tools_armcheck.py`
 
-lrweb 없이 단독으로 돕니다 (lerobot conda env 안에서). 포트 하나 = 팔 하나.
-lrweb 가 그 포트를 잡고 있으면(Control·Collect·Setup 포트 감시) 먼저 끄세요.
+**Setup 탭 → 2c · 팔 불량 점검**: 포트와 역할을 고르고 `점검 시작`. 포트 목록에는 이미 지정한
+역할(`left / follower` 등)이 붙어 있고, 고르면 역할도 자동으로 맞춰집니다. 점검 중에는
+Control / Collect / Calib / 포트 감시가 막힙니다.
+
+같은 판정을 터미널에서도 돌릴 수 있습니다 (lerobot conda env, lrweb 가 그 포트를 잡고 있지 않을 때):
 
 ```bash
-python tools_armcheck.py --port /dev/serial/by-id/usb-... --role follower          # 기본: 서보에 아무것도 안 씀
-python tools_armcheck.py --port ... --role leader   --sweep                        # + 손으로 관절 쓸기
-python tools_armcheck.py --port ... --role follower --move                         # + 관절마다 13° 구동
+python tools_armcheck.py --port /dev/serial/by-id/usb-... --role follower          # 서보에 아무것도 안 씀
+python tools_armcheck.py --port ... --role leader --sweep                          # + 손으로 관절 쓸기
 ```
 
 | 단계 | 서보에 쓰는 것 | 보는 것 |
 |---|---|---|
 | 기본 | 없음 | ID 1~6 응답, 모델(STS3215), 보호 플래그(Status 레지스터 + 응답 에러 바이트), 5V/12V 계통과 전압 범위, 모터 간 전압 편차, 온도, 정지 중 엔코더 흔들림, 통신 누락 |
-| `--sweep` | `Torque_Enable=0` | 관절마다 손으로 양 끝까지 → 움직인 범위, 엔코더 튐, 읽기 실패 |
-| `--move` | `Goal_Position`(현재 위치 먼저) → `Torque_Enable=1` | 관절 하나씩 가동범위 중앙 쪽으로 150 tick(≈13°) 갔다 오기 → 도달 여부·시간·최대 전류 |
+| 손으로 쓸기 | `Torque_Enable=0` | 관절을 손으로 양 끝까지 → 움직인 범위, 엔코더 튐, 읽기 실패 |
 
-EEPROM 은 쓰지 않습니다. 종료 코드 `0 정상 / 1 주의 / 2 불량 의심 / 3 실행 실패`, `--json` 으로 기록용 출력.
+모터를 구동하는 시험은 넣지 않았습니다. EEPROM 은 쓰지 않습니다.
+CLI 종료 코드 `0 정상 / 1 주의 / 2 불량 의심 / 3 실행 실패`, `--json` 으로 기록용 출력.
 
-**`--role` 을 꼭 주세요.** 리더(7.4V 모터)가 12V 계통으로 읽히면 즉시 전원 분리를 요구하고
-구동 시험을 막습니다. 리더에는 `--move` 를 하지 않습니다.
+**역할을 꼭 고르세요.** 리더(7.4V 모터)가 12V 계통으로 읽히면 즉시 전원 분리를 요구합니다.
+
+구동 시험이 없어서 못 잡는 것: **모터 권선 단선·기어 이 빠짐처럼 힘을 줘야 드러나는 불량.**
+쓸기 중 손에 걸리는 느낌(뻑뻑함, 헛도는 느낌, 갈리는 소리)으로 확인하고,
+의심되면 Control 탭에서 그 관절만 토크 ON 해서 슬라이더로 조금 움직여 보세요 —
+Control 은 목표를 현재 위치로 먼저 쓰고 토크를 켭니다.
 
 판정 기준의 출처:
 
@@ -275,8 +282,8 @@ EEPROM 은 쓰지 않습니다. 종료 코드 `0 정상 / 1 주의 / 2 불량 �
 | 보호 비트: 1 전압 · 2 각도센서 · 4 과열 · 8 과전류 · 32 과부하 | Feetech SDK `protocol_packet_handler.py` `ERRBIT_*` |
 | 전압 = `Present_Voltage / 10` V, 5V 계통 4.5~5.5 V / 12V 계통 10.5~13.5 V (7.0 V 미만이면 5V) | [Seeed_RoboController](https://github.com/Seeed-Projects/Seeed_RoboController) `servo_middle_calibration.py` |
 | 온도 60 °C 초과 주의, 70 °C 초과 서보가 토크 차단 | 같은 저장소 `servo_middle_calibration.py`, `factory_calibration_tool.py` |
-| 전류 1 단위 ≈ 6.5 mA, Status 레지스터(65)를 보호 비트로 해석 | 같은 저장소 `factory_calibration_tool.py` |
-| 엔코더 흔들림 3/10 tick, 튐 400 tick, 도착 허용 30 tick, 1.5 s, 온도 편차 8 °C | 경험값 — 옵션으로 조정 |
+| Status 레지스터(65)를 보호 비트로 해석 | 같은 저장소 `factory_calibration_tool.py` |
+| 엔코더 흔들림 3/10 tick, 튐 400 tick, 쓸기 최소 범위, 온도 편차 8 °C | 경험값 — CLI 옵션으로 조정 |
 
 Seeed 저장소의 `servo_register_diag.py --move` 는 **조립된 팔에 쓰지 마세요.**
 목표 위치를 먼저 쓰지 않고 토크를 켠 뒤 절대 위치(1500 → 2600 → 2048)로 보내서,
