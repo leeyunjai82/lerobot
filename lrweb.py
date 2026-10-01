@@ -1663,6 +1663,28 @@ def _alias_map(dirname):
     return out
 
 
+SIM_FILE = Path(__file__).resolve().parent / "lrweb_sim.json"     # tools_simarms.py 가 켜져 있을 때만 있음
+SIM_DIR = Path(__file__).resolve().parent / "lrweb_sim"
+
+
+def serial_path_ok(p):
+    """포트 경로 검사 — /dev/… 또는 가상 팔(tools_simarms) 의 lrweb_sim/<이름> 링크."""
+    return isinstance(p, str) and (p.startswith("/dev/") or p.startswith(str(SIM_DIR) + os.sep))
+
+
+def _sim_ports():
+    """가상 팔 도구가 켜져 있으면 그 보드들. 꺼져 있거나 죽었으면 빈 목록."""
+    d = load_json(SIM_FILE, {})
+    pid = d.get("pid") if isinstance(d, dict) else None
+    if not pid:
+        return []
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError):
+        return []
+    return [p for p in d.get("ports", []) if os.path.exists(p.get("path", ""))]
+
+
 def list_serial_ports():
     """시리얼 후보 나열. udev 심볼릭 링크가 전혀 없어도 동작합니다."""
     by_id = _alias_map("/dev/serial/by-id")
@@ -1691,6 +1713,13 @@ def list_serial_ports():
                       or os.path.basename(dev)),
             "used_by": used.get(dev, []),
         })
+    # 가상 팔 — 경로가 고정된 lrweb_sim/<이름> 링크를 by_path 로 둬서 지정한 포트가 재시작해도 유지됩니다
+    for sp in _sim_ports():
+        dev = os.path.realpath(sp["path"])
+        out.append({"dev": dev, "by_id": "", "by_path": sp["path"],
+                    "usb": {"product": sp.get("label", "가상 팔"), "serial": ""},
+                    "label": sp.get("label", "가상 팔"), "sim": True,
+                    "used_by": used.get(dev, [])})
     return out
 
 
@@ -4181,8 +4210,8 @@ def validate_config(cfg):
             port = (arm.get(f"{role}_port") or "").strip()
             if not port:
                 continue
-            if not port.startswith("/dev/"):
-                return f"{side}/{role} 포트는 /dev/ 로 시작해야 합니다: {port}"
+            if not serial_path_ok(port):
+                return f"{side}/{role} 포트는 /dev/… (또는 가상 팔 lrweb_sim/…) 경로여야 합니다: {port}"
             real = os.path.realpath(port)
             if real in seen_ports:
                 return f"같은 포트를 두 곳에 지정했습니다: {port} ({seen_ports[real]} 와 중복)"
@@ -4253,8 +4282,8 @@ def api_setup_cameras():
 async def api_setup_probe(req: Request):
     b = await req.json()
     port = (b.get("port") or "").strip()
-    if not port.startswith("/dev/"):
-        return JSONResponse({"error": "포트는 /dev/ 로 시작해야 합니다"}, status_code=400)
+    if not serial_path_ok(port):
+        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 lrweb_sim/…) 경로여야 합니다"}, status_code=400)
     if WATCH.on:
         return JSONResponse({"error": "포트 감시 중에는 probe 불가 — 감시를 먼저 중지하세요"}, status_code=400)
     busy = exclusive_busy()
@@ -4269,7 +4298,7 @@ async def api_setup_probe(req: Request):
 @app.post("/api/setup/watch")
 async def api_setup_watch_start(req: Request):
     b = await req.json()
-    ports = [p for p in (b.get("ports") or []) if isinstance(p, str) and p.startswith("/dev/")]
+    ports = [p for p in (b.get("ports") or []) if serial_path_ok(p)]
     if not ports:
         return JSONResponse({"error": "감시할 포트가 없습니다"}, status_code=400)
     busy = exclusive_busy()
@@ -4308,8 +4337,8 @@ def api_motors_state():
 async def api_motors_start(req: Request):
     b = await req.json()
     port = (b.get("port") or "").strip()
-    if not port.startswith("/dev/"):
-        return JSONResponse({"error": "포트는 /dev/ 로 시작해야 합니다"}, status_code=400)
+    if not serial_path_ok(port):
+        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 lrweb_sim/…) 경로여야 합니다"}, status_code=400)
     busy = exclusive_busy()
     if busy:
         return JSONResponse({"error": f"{busy['id']} 실행 중"}, status_code=400)
@@ -4349,8 +4378,8 @@ def api_armcheck_state():
 async def api_armcheck_start(req: Request):
     b = await req.json()
     port = (b.get("port") or "").strip()
-    if not port.startswith("/dev/"):
-        return JSONResponse({"error": "포트는 /dev/ 로 시작해야 합니다"}, status_code=400)
+    if not serial_path_ok(port):
+        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 lrweb_sim/…) 경로여야 합니다"}, status_code=400)
     role = b.get("role") if b.get("role") in ("leader", "follower") else ""
     busy = exclusive_busy()
     if busy:

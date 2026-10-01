@@ -170,6 +170,24 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 
 수집·학습·추론 같은 백그라운드 작업 목록과 로그. 여기서 중지할 수 있습니다.
 
+## 팔 없이 시험하기 — 가상 팔
+
+실제 팔이 없어도 셋업 마법사·Calib·Control·Collect 를 끝까지 돌려 볼 수 있습니다. lrweb 와 **별도 터미널**에서 켭니다.
+
+```bash
+source ~/project/lerobot/activate.sh
+python tools_simarms.py --robot so101 --mode bimanual    # SO-ARM101 양팔 (보드 4개)
+python tools_simarms.py --robot omx   --mode single      # OMX 한팔 (보드 2개)
+```
+
+- 켜 두는 동안 포트 목록에 **가상 …** 보드로 나타나고, 끄면(`q` 또는 Ctrl+C) 사라집니다. lrweb 재시작은 필요 없습니다
+- 모터는 실제 프로토콜(Feetech / Dynamixel)로 lerobot 과 통신합니다. 처음엔 캘리브레이션 안 된 공장 상태입니다
+- 손으로 움직이는 대신 콘솔 명령을 씁니다: `w <번호>` 그 보드 관절 쓸기 (포트 찾기·캘리브레이션·확인), `a` 리더 자동 움직임 (리더 팔로우·수집), `l` 목록
+- 포트 경로는 `lrweb_sim/<이름>` 으로 고정이라 껐다 켜도 다시 지정할 필요가 없습니다
+- Setup 기종·구성을 가상 팔과 같게 맞추세요 (환경을 하나 복사해서 쓰면 실제 팔 설정이 안 지워집니다)
+- 모터 ID 세팅은 흉내내지 않습니다. Collect 는 카메라가 하나 이상 등록돼 있어야 시작됩니다
+- 실제 팔을 쓸 때는 이 도구를 켜지 않으면 됩니다 — 실제 팔 동작과는 관계가 없습니다
+
 ## 팔 불량 점검 (터미널)
 
 Setup 탭의 팔 불량 점검과 같은 판정을 터미널에서도 돌릴 수 있습니다 (lrweb 가 그 포트를 잡고 있지 않을 때).

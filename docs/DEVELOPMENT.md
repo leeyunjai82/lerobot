@@ -24,6 +24,7 @@
 | `tools_armcheck.py` | SO-ARM101(STS3215) 팔 점검 — Setup 탭·마법사 진단과 CLI 공용 |
 | `tools_dxlcheck.py` | OMX(Dynamixel X) 팔 점검 — 같은 함수 이름·결과 형식 |
 | `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
+| `tools_simarms.py` | 가상 팔 — PTY 위에서 STS3215 / Dynamixel X 를 흉내. 켜 있으면 `lrweb_sim.json` 에 포트를 알리고 lrweb 포트 목록에 추가됨 |
 | `plugins/lerobot_robot_bi_omx/` | 양팔 OMX 팔로워 `bi_omx_follower` (lerobot 플러그인) |
 | `plugins/lerobot_teleoperator_bi_omx/` | 양팔 OMX 리더 `bi_omx_leader` |
 | `urdf/` | 3D 용 URDF·STL — SO-101 (TheRobotStudio), OMX-F (ROBOTIS) |
