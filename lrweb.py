@@ -6302,7 +6302,7 @@ function envPaint(d){
     const arms=e.arms.map(a=>'<span class=mono>'+E(a.side)+'</span> '+E(portTail(a.follower_port))+' / '+E(portTail(a.leader_port))).join('<br>');
     const cams=[].concat.apply([], e.arms.map(a=>a.cameras.map(c=>(e.mode==='bimanual'?a.side+'_':'')+c))).concat(e.cameras);
     h+='<tr><td class=mono>'+E(e.name)+(e.active?' <span class="badge b-ok">사용 중</span>':'')+'</td>'
-      +'<td>'+(e.robot==='omx'?'OMX':'SO-ARM101')+' · '+(e.mode==='bimanual'?'양팔':'한팔')+'</td><td style="font-size:12px">'+arms+'</td>'
+      +'<td style="white-space:nowrap">'+(e.robot==='omx'?'OMX':'SO-ARM101')+' · '+(e.mode==='bimanual'?'양팔':'한팔')+'</td><td style="font-size:12px">'+arms+'</td>'
       +'<td class=mono style="font-size:12px">'+E(cams.join(', ')||'-')+'</td><td class=tiny>'+E(e.updated)+'</td>'
       +'<td style="text-align:right;white-space:nowrap" id="envact'+i+'"></td></tr>';
   });
