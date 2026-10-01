@@ -149,7 +149,7 @@ git -C "${LEROBOT_SRC}" checkout -q "${LEROBOT_COMMIT}" \
   || die "lerobot commit ${LEROBOT_COMMIT} 체크아웃 실패"
 cd "${LEROBOT_SRC}"
 
-log "4-1. lerobot[feetech,training] 설치 (torch 는 위 휠 유지)"
+log "4-1. lerobot[feetech,dynamixel,training] 설치 (torch 는 위 휠 유지)"
 # torch 를 pip 기본 인덱스 것으로 덮어쓰지 않도록 현재 버전으로 핀
 python - <<'PY' > /tmp/torch-constraint.txt
 import torch, torchvision
@@ -157,7 +157,8 @@ print(f"torch=={torch.__version__}")
 print(f"torchvision=={torchvision.__version__}")
 PY
 cat /tmp/torch-constraint.txt
-PIP_CONSTRAINT=/tmp/torch-constraint.txt pip install -e ".[feetech,training]" \
+# feetech = SO-ARM101 (STS3215), dynamixel = ROBOTIS OMX (XL430/XL330)
+PIP_CONSTRAINT=/tmp/torch-constraint.txt pip install -e ".[feetech,dynamixel,training]" \
   || die "lerobot 설치 실패 (로그 확인)"
 
 # torchcodec 은 Jetson 에서 문제를 일으켜 pyav 디코딩으로 통일합니다 (README 와 동일)
@@ -167,7 +168,14 @@ pip install "av>=15.0.0,<16.0.0"
 log "4-2. lrweb 의존성"
 pip install "fastapi<1.0" uvicorn
 
-log "4-3. torch 가 덮어써지지 않았는지 재확인"
+log "4-3. 양팔 OMX 플러그인 (bi_omx_follower / bi_omx_leader)"
+# lerobot 에 양팔 OMX 가 없어서 이 레포의 plugins/ 를 설치합니다. 설치된 패키지 이름이
+# lerobot_robot_* / lerobot_teleoperator_* 이면 lerobot-record/rollout/train 이 자동으로 읽습니다.
+PIP_CONSTRAINT=/tmp/torch-constraint.txt pip install --no-deps \
+  -e "${WORKDIR}/plugins/lerobot_robot_bi_omx" -e "${WORKDIR}/plugins/lerobot_teleoperator_bi_omx" \
+  || die "양팔 OMX 플러그인 설치 실패"
+
+log "4-4. torch 가 덮어써지지 않았는지 재확인"
 check_cuda || die "lerobot 설치 과정에서 torch 가 CPU 휠로 바뀌었습니다. pip uninstall -y torch torchvision 후 3단계 인덱스로 재설치"
 
 # ----------------------------------------------------------------- 5. 임포트 검증
@@ -179,9 +187,13 @@ import lerobot
 from lerobot.robots.so_follower import SOFollower
 from lerobot.robots.bi_so_follower import BiSOFollower
 from lerobot.motors.feetech import FeetechMotorsBus
+from lerobot.robots.omx_follower import OmxFollower
+from lerobot.motors.dynamixel import DynamixelMotorsBus
+import dynamixel_sdk  # noqa: F401
+import lerobot_robot_bi_omx, lerobot_teleoperator_bi_omx  # noqa: F401
 from lerobot.scripts.lerobot_record import record_loop
 import fastapi, uvicorn, cv2, av
-print("lerobot :", "OK (so_follower / bi_so_follower / feetech / record_loop)")
+print("lerobot :", "OK (so_follower / bi_so_follower / feetech / omx / bi_omx / dynamixel / record_loop)")
 print("fastapi :", fastapi.__version__, "| cv2:", cv2.__version__, "| av:", av.__version__)
 PY
 

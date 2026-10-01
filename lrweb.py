@@ -93,6 +93,7 @@ RUN_DIR = Path("/dev/shm/lrweb") if Path("/dev/shm").is_dir() else PROJ / "lrweb
 # arms 는 처음부터 리스트입니다. 한팔이면 원소 1개(side="main"),
 # 양팔이면 side="left"/"right" 2개 — 스키마를 바꾸지 않고 확장합니다.
 DEFAULT_CONFIG = {
+    "robot": "so101",          # 기종: so101 (SO-ARM101, Feetech) | omx (ROBOTIS OMX, Dynamixel)
     "mode": "single",
     "robot_id": "so101",
     "fps": 30,
@@ -162,6 +163,9 @@ def load_config():
         if (vl["x"], vl["y"], vl["yaw_deg"]) == (vr["x"], vr["y"], vr["yaw_deg"]):
             vl["y"], vr["y"] = 0.12, -0.12
     cfg.setdefault("cameras", {})
+    # 예전 설정 파일에는 robot 이 없습니다 → SO-ARM101 (지금까지 동작 그대로)
+    if cfg.get("robot") not in ("so101", "omx"):
+        cfg["robot"] = "so101"
     return cfg
 
 
@@ -284,7 +288,8 @@ def _same_origin(headers):
 _START_PATHS = {"/api/record", "/api/rollout", "/api/train", "/api/setup/probe", "/api/setup/watch",
                 "/api/setup/motors/start", "/api/setup/armcheck/start", "/api/wizard/assign",
                 "/api/wizard/verify/start", "/api/wizard/import_calib", "/api/wizard/mode",
-                "/api/setup/config", "/api/calib/start", "/api/envs/activate", "/api/envs/save_as",
+                "/api/setup/config", "/api/calib/start", "/api/calib/factory", "/api/wizard/robot",
+                "/api/envs/activate", "/api/envs/save_as",
                 "/api/envs/rename", "/api/envs/delete"}
 _START_GATE = asyncio.Lock()
 
@@ -384,7 +389,7 @@ def _env_summary(name, cfg, mtime=None):
              "follower_id": a.get("follower_id", ""), "leader_id": a.get("leader_id", ""),
              "cameras": sorted((a.get("cameras") or {}).keys())}
             for a in (cfg.get("arms") or []) if isinstance(a, dict)]
-    return {"name": name, "mode": cfg.get("mode", "single"), "arms": arms,
+    return {"name": name, "robot": cfg.get("robot") or "so101", "mode": cfg.get("mode", "single"), "arms": arms,
             "cameras": sorted((cfg.get("cameras") or {}).keys()), "fps": cfg.get("fps"),
             "updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)) if mtime else "",
             "active": name == env_name()}
@@ -730,21 +735,172 @@ def _cam_cli(specs):
     return "{" + ", ".join(items) + "}"
 
 
+# ----------------------------- 기종 (SO-ARM101 / OMX) -------------------------
+# 기종마다 다른 것은 전부 이 표에 둡니다. 나머지 코드는 kind() 로 꺼내 씁니다.
+# 한팔/양팔(mode) 과는 독립 — 두 기종 모두 한팔·양팔을 지원합니다.
+ROBOT_KINDS = {
+    "so101": {
+        "label": "SO-ARM101",
+        "follower": ("lerobot.robots.so_follower", "SOFollower", "SOFollowerRobotConfig"),
+        "leader": ("lerobot.teleoperators.so_leader", "SOLeader", "SOLeaderTeleopConfig"),
+        "bi_follower": ("lerobot.robots.bi_so_follower", "BiSOFollower", "BiSOFollowerConfig"),
+        "bi_leader": ("lerobot.teleoperators.bi_so_leader", "BiSOLeader", "BiSOLeaderConfig"),
+        "arm_cfg": ("lerobot.robots.so_follower", "SOFollowerConfig"),
+        "leader_arm_cfg": ("lerobot.teleoperators.so_leader", "SOLeaderConfig"),
+        "cli": {"follower": "so101_follower", "leader": "so101_leader",
+                "bi_follower": "bi_so_follower", "bi_leader": "bi_so_leader"},
+        "calib_dir": {"follower": "robots/so_follower", "leader": "teleoperators/so_leader"},
+        "robot_type": {"single": "so_follower", "bi": "bi_so_follower"},
+        "types": {"single": {"so_follower", "so101_follower", "so100_follower"},
+                  "bi": {"bi_so_follower", "bi_so101_follower", "bi_so100_follower"}},
+        "use_degrees": True,          # 관절값 단위: ° (그리퍼만 0~100)
+        "deg_per_unit": 1.0,
+        "unit": "°",
+        "bus": ("lerobot.motors.feetech", "FeetechMotorsBus"),
+        "homing_sign": 1,             # Feetech: Present = Actual - Homing_Offset
+        "leader_torque": False,       # SO 리더는 토크를 쓰지 않습니다
+        "calib": "range",             # 관절 범위를 손으로 기록
+        "urdf": "so101.urdf",
+        "plugin": None,
+    },
+    "omx": {
+        "label": "OMX",
+        "follower": ("lerobot.robots.omx_follower", "OmxFollower", "OmxFollowerConfig"),
+        "leader": ("lerobot.teleoperators.omx_leader", "OmxLeader", "OmxLeaderConfig"),
+        # 양팔은 lerobot 에 없어서 이 레포의 plugins/ (lerobot_conda.sh 가 설치)
+        "bi_follower": ("lerobot_robot_bi_omx", "BiOmxFollower", "BiOmxFollowerConfig"),
+        "bi_leader": ("lerobot_teleoperator_bi_omx", "BiOmxLeader", "BiOmxLeaderConfig"),
+        "arm_cfg": ("lerobot_robot_bi_omx", "OmxArmConfig"),
+        "leader_arm_cfg": ("lerobot_teleoperator_bi_omx", "OmxLeaderArmConfig"),
+        "cli": {"follower": "omx_follower", "leader": "omx_leader",
+                "bi_follower": "bi_omx_follower", "bi_leader": "bi_omx_leader"},
+        "calib_dir": {"follower": "robots/omx_follower", "leader": "teleoperators/omx_leader"},
+        "robot_type": {"single": "omx_follower", "bi": "bi_omx_follower"},
+        "types": {"single": {"omx_follower"}, "bi": {"bi_omx_follower"}},
+        # omx_leader 는 -100~100 고정(use_degrees 없음) — 팔로워도 맞춰야 리더를 그대로 따라갑니다
+        "use_degrees": False,
+        "deg_per_unit": 360.0 / 200.0,   # 0~4095 전체 = -100~100 → 1 단위 ≈ 1.8°
+        "unit": "",
+        "bus": ("lerobot.motors.dynamixel", "DynamixelMotorsBus"),
+        "homing_sign": -1,            # Dynamixel: Present = Actual + Homing_Offset
+        "leader_torque": True,        # OMX 리더 그리퍼는 전류 제어로 토크가 걸려 있습니다 (트리거 방식)
+        "calib": "factory",           # lerobot 이 공장값(오프셋 0, 0~4095)을 씁니다 — 범위 기록 없음
+        "urdf": "omx_f.urdf",
+        "plugin": ("lerobot_robot_bi_omx", "lerobot_teleoperator_bi_omx"),
+    },
+}
+DEFAULT_ROBOT = "so101"
+
+
+def robot_key(cfg=None):
+    r = (cfg if cfg is not None else CFG).get("robot") or DEFAULT_ROBOT
+    return r if r in ROBOT_KINDS else DEFAULT_ROBOT
+
+
+def kind(cfg=None):
+    return ROBOT_KINDS[robot_key(cfg)]
+
+
+_PLUGIN_DIR = Path(__file__).resolve().parent / "plugins"
+
+
+def _load(mod, name):
+    """kind 표의 (모듈, 이름) 을 import. 양팔 OMX 플러그인이 pip 로 안 깔려 있으면 레포의 plugins/ 에서 찾습니다
+    (lrweb 자신은 이걸로 충분하지만, lerobot CLI(롤아웃) 는 설치돼 있어야 합니다)."""
+    import importlib
+    try:
+        m = importlib.import_module(mod)
+    except ModuleNotFoundError:
+        pdir = _PLUGIN_DIR / mod
+        if not (pdir / mod / "__init__.py").exists():
+            raise
+        sys.path.insert(0, str(pdir))
+        m = importlib.import_module(mod)
+    return getattr(m, name)
+
+
+def plugin_missing(k=None):
+    """lerobot CLI 가 양팔 OMX 를 쓰려면 플러그인이 '설치' 돼 있어야 합니다. 빠진 패키지 이름 목록."""
+    import importlib.metadata as md
+    k = k or kind()
+    out = []
+    for name in (k.get("plugin") or ()):
+        try:
+            md.distribution(name)
+        except md.PackageNotFoundError:
+            out.append(name)
+    return out
+
+
+def make_arm(role, arm_cfg=None, *, k=None, port=None, cameras=None, mrt=None):
+    """팔 하나의 lerobot 객체(연결 안 함). role = follower | leader.
+    기종에 맞는 클래스·단위(use_degrees)·캘리브레이션 폴더가 정해집니다."""
+    k = k or kind()
+    mod, cls_name, cfg_name = k[role]
+    cls, cfg_cls = _load(mod, cls_name), _load(mod, cfg_name)
+    arm_cfg = arm_cfg or {}
+    kw = {"id": arm_cfg.get(f"{role}_id") or role,
+          "port": port if port is not None else (arm_cfg.get(f"{role}_port") or "")}
+    if role == "follower":
+        kw.update(use_degrees=k["use_degrees"], max_relative_target=mrt,
+                  cameras=cameras if cameras is not None else {})
+    elif k["use_degrees"]:
+        kw["use_degrees"] = True          # SO 리더만 use_degrees 가 있습니다 (OMX 리더는 -100~100 고정)
+    return cls(cfg_cls(**kw))
+
+
+def make_bi(role, arm_cfgs, *, k=None, cameras=None, mrt=None, arm_cameras=None):
+    """양팔 lerobot 객체(연결 안 함). arm_cfgs = {"left": arm, "right": arm}."""
+    k = k or kind()
+    mod, cls_name, cfg_name = k[f"bi_{role}"]
+    cls, cfg_cls = _load(mod, cls_name), _load(mod, cfg_name)
+    L, R = arm_cfgs["left"], arm_cfgs["right"]
+    if role == "follower":
+        arm_cls = _load(*k["arm_cfg"])
+        mk = lambda a: arm_cls(port=a["follower_port"], max_relative_target=mrt,
+                               use_degrees=k["use_degrees"], cameras=_cam_configs(a["cameras"]))
+        return cls(cfg_cls(id=bimanual_base_id("follower", arm_cfgs), left_arm_config=mk(L),
+                           right_arm_config=mk(R), cameras=cameras if cameras is not None else {}))
+    arm_cls = _load(*k["leader_arm_cfg"])
+    mk = lambda a: arm_cls(port=a["leader_port"])
+    return cls(cfg_cls(id=bimanual_base_id("leader", arm_cfgs), left_arm_config=mk(L), right_arm_config=mk(R)))
+
+
+def make_bus(role, port, *, k=None, calib_id=None):
+    """포트 하나를 기종·역할에 맞는 모터 구성으로 여는 버스 객체(연결 안 함).
+    lerobot 장치 클래스가 만드는 버스를 그대로 씁니다 (모터 ID·모델·정규화 방식이 lerobot 과 같아짐).
+    calib_id 를 주면 그 캘리브레이션 파일이 버스에 실려 있습니다."""
+    dev = make_arm(role, {f"{role}_id": calib_id or role}, k=k, port=port)
+    return dev.bus
+
+
+def kind3d(k=None):
+    """브라우저 3D 용 기종 정보 — URDF, lerobot 관절 이름 → URDF 관절 이름, 단위 → 라디안.
+    SO-ARM101: 관절값이 ° → ×π/180, 그리퍼 0~100 → URDF 그리퍼 한계 사이.
+    OMX: 관절값이 -100~100 (0~4095 전체) → ×π/100. URDF 의 0 rad 가 엔코더 2048 이라고 가정합니다.
+         그리퍼 0~100 이 실제 몇 rad 인지는 URDF 에 없어서(±2π) 추정값입니다 — 실기 확인 후 조정 (확인 필요)."""
+    import math
+    k = k or kind()
+    if k is ROBOT_KINDS["omx"]:
+        return {"urdf": "/urdf/" + k["urdf"], "scale": math.pi / 100,
+                "map": {"shoulder_pan": "joint1", "shoulder_lift": "joint2", "elbow_flex": "joint3",
+                        "wrist_flex": "joint4", "wrist_roll": "joint5", "gripper": "gripper_joint_1"},
+                "sign": {}, "gripper": {"lo": 0.0, "hi": 0.9}, "motor_mat": None}
+    return {"urdf": "/urdf/" + k["urdf"], "scale": math.pi / 180, "map": {j: j for j in CTL_JOINTS},
+            "sign": {}, "gripper": None, "motor_mat": "sts3215"}
+
+
 def robot_name():
     """lerobot 이 데이터셋 meta/info.json 의 robot_type 에 기록하는 이름."""
-    return "bi_so_follower" if BIMANUAL else "so_follower"
-
-
-_SINGLE_TYPES = {"so_follower", "so101_follower", "so100_follower"}
-_BI_TYPES = {"bi_so_follower", "bi_so101_follower", "bi_so100_follower"}
+    return kind()["robot_type"]["bi" if BIMANUAL else "single"]
 
 
 def robot_type_ok(rt):
-    """데이터셋/체크포인트의 robot_type 이 지금 모드와 맞는지. 비어 있으면(모름) 통과.
+    """데이터셋/체크포인트의 robot_type 이 지금 기종·모드와 맞는지. 비어 있으면(모름) 통과.
     예전 lerobot 은 so101_follower 로 기록했으므로 같은 계열로 봅니다."""
     if not rt:
         return True
-    return rt in (_BI_TYPES if BIMANUAL else _SINGLE_TYPES)
+    return rt in kind()["types"]["bi" if BIMANUAL else "single"]
 
 
 def bimanual_base_id(role, arm_cfgs=None):
@@ -776,13 +932,15 @@ def mrt_value(v):
 
 
 def robot_cli_args():
-    """lerobot CLI(rollout) 용 --robot.* 인자. 한팔: so101_follower / 양팔: bi_so_follower"""
+    """lerobot CLI(rollout) 용 --robot.* 인자. 기종·한팔/양팔에 따라 type 이 정해집니다
+    (so101_follower / bi_so_follower / omx_follower / bi_omx_follower)."""
     _need_ports("follower")
+    k = kind()
     # Control·Collect 와 같은 안전 제한을 롤아웃에도 겁니다 (정책 출력이 튀면 한 스텝 이동량을 자름)
     mrt = mrt_value(CFG.get("max_relative_target"))
     if BIMANUAL:
         L, R = ARM_CFGS["left"], ARM_CFGS["right"]
-        args = ["--robot.type=bi_so_follower",
+        args = [f"--robot.type={k['cli']['bi_follower']}",
                 f"--robot.id={bimanual_base_id('follower')}",
                 f"--robot.left_arm_config.port={L['follower_port']}",
                 f"--robot.left_arm_config.cameras={_cam_cli(L['cameras'])}",
@@ -796,7 +954,7 @@ def robot_cli_args():
     arm = ARM_CFGS[SIDES[0]]
     cams = dict(arm["cameras"])
     cams.update(CFG["cameras"])
-    args = ["--robot.type=so101_follower",
+    args = [f"--robot.type={k['cli']['follower']}",
             f"--robot.port={arm['follower_port']}",
             f"--robot.id={arm['follower_id']}",
             f"--robot.cameras={_cam_cli(cams)}"]
@@ -807,14 +965,15 @@ def robot_cli_args():
 
 def teleop_cli_args():
     _need_ports("leader")
+    k = kind()
     if BIMANUAL:
         L, R = ARM_CFGS["left"], ARM_CFGS["right"]
-        return ["--teleop.type=bi_so_leader",
+        return [f"--teleop.type={k['cli']['bi_leader']}",
                 f"--teleop.id={bimanual_base_id('leader')}",
                 f"--teleop.left_arm_config.port={L['leader_port']}",
                 f"--teleop.right_arm_config.port={R['leader_port']}"]
     arm = ARM_CFGS[SIDES[0]]
-    return ["--teleop.type=so101_leader",
+    return [f"--teleop.type={k['cli']['leader']}",
             f"--teleop.port={arm['leader_port']}",
             f"--teleop.id={arm['leader_id']}"]
 
@@ -1026,7 +1185,10 @@ def _write_nothrow(bus, motor, reg, value, tries=3):
     나머지 모터의 토크 해제까지 건너뛰게 됩니다. 반환: 통신 성공 여부."""
     from lerobot.motors.motors_bus import get_address
     m = bus.motors[motor]
-    addr, n = get_address(bus.model_ctrl_table, m.model, reg)
+    try:
+        addr, n = get_address(bus.model_ctrl_table, m.model, reg)
+    except KeyError:
+        return False                    # 이 모터에는 없는 레지스터 (Dynamixel 에는 Lock 이 없음)
     for _ in range(tries):
         try:
             comm, _err = bus._write(addr, n, m.id, value, raise_on_error=False)
@@ -1048,7 +1210,7 @@ def torque_off_all(bus):
     for motor in bus.motors:
         if not _write_nothrow(bus, motor, "Torque_Enable", 0):
             failed.append(motor)
-        _write_nothrow(bus, motor, "Lock", 0, tries=1)
+        _write_nothrow(bus, motor, "Lock", 0, tries=1)     # Feetech 만 (Dynamixel 은 건너뜀)
     return failed
 
 
@@ -1097,7 +1259,8 @@ def connect_follower(dev):
 
 
 def connect_leader(dev):
-    """SOLeader.connect(calibrate=False) + 캘리브레이션 파일을 보드에 씀. 리더는 configure 가 토크를 끕니다."""
+    """리더 connect(calibrate=False) + 캘리브레이션 파일을 보드에 씀.
+    SO 리더는 configure 가 토크를 끕니다. OMX 리더는 그리퍼만 토크를 켭니다(손가락 트리거)."""
     try:
         dev.connect(calibrate=False)
         if dev.calibration and not dev.bus.is_calibrated:
@@ -1148,23 +1311,13 @@ class ArmCtl:
         return self.robot is not None
 
     def calib_path(self):
-        from lerobot.robots.so_follower import SOFollower
-        from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS
-        return HF_LEROBOT_CALIBRATION / ROBOTS / SOFollower.name / f"{self.cfg['follower_id']}.json"
+        return calib_file("follower", self.cfg["follower_id"])
 
     def connect(self):
-        from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
         if not self.cfg.get("follower_port"):
             raise RuntimeError("팔로워 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
         mrt = mrt_value(CFG.get("max_relative_target"))
-        cfg = SOFollowerRobotConfig(
-            id=self.cfg["follower_id"],
-            port=self.cfg["follower_port"],
-            use_degrees=True,
-            max_relative_target=mrt,
-            cameras={},
-        )
-        robot = SOFollower(cfg)
+        robot = make_arm("follower", self.cfg, mrt=mrt)     # 기종(SO-ARM101/OMX)에 맞는 lerobot 클래스
         if not robot.calibration:
             raise RuntimeError(
                 f"캘리브레이션 파일이 없습니다: {robot.calibration_fpath} — Calib 탭에서 만드세요")
@@ -1193,10 +1346,15 @@ class ArmCtl:
         self._last_temp = 0.0
 
     def _build_limits(self):
+        from lerobot.motors import MotorNormMode
         bus = self.robot.bus
         for name in CTL_JOINTS:
-            if name == "gripper":
+            mode = getattr(bus.motors.get(name), "norm_mode", None)
+            if name == "gripper" or mode == MotorNormMode.RANGE_0_100:
                 self.limits[name] = (0.0, 100.0)     # MotorNormMode.RANGE_0_100
+                continue
+            if mode == MotorNormMode.RANGE_M100_100:
+                self.limits[name] = (-100.0, 100.0)  # OMX: 캘리브레이션 범위 전체가 -100~100
                 continue
             c = bus.calibration.get(name)
             if c is None:
@@ -1266,14 +1424,17 @@ class ArmCtl:
                         #   Torque_Enable=0 → 서보가 과부하 보호로 스스로 토크를 뺌
                         #   Torque_Enable=1 + 부하 큼 → 기계적으로 막힘 (곧 과열)
                         #   Torque_Enable=1 + 부하 ~0 → 명령 미도달 / 서보 이상
-                        for name, dst in (("Present_Temperature", "temp"),
-                                          ("Torque_Enable", "ten"),
-                                          ("Present_Load", "load")):
-                            try:
-                                setattr(self, dst, {k: int(v) for k, v in self.robot.bus.sync_read(
-                                    name, normalize=False).items()})
-                            except Exception:
-                                pass
+                        # Dynamixel(OMX) 에는 Present_Load 가 없어서 Present_Current 로 대신합니다
+                        for names, dst in ((("Present_Temperature",), "temp"),
+                                           (("Torque_Enable",), "ten"),
+                                           (("Present_Load", "Present_Current"), "load")):
+                            for name in names:
+                                try:
+                                    setattr(self, dst, {k: int(v) for k, v in self.robot.bus.sync_read(
+                                        name, normalize=False).items()})
+                                    break
+                                except Exception:
+                                    continue
                 self.err = ""
             except Exception as e:
                 self.err = str(e)
@@ -1318,13 +1479,15 @@ class ArmCtl:
             return
         goal = {}
         now = time.monotonic()
-        cap = FOLLOW_STEP_DEG if self.follow else MAX_STEP_DEG
+        # 상한은 ° 기준입니다. OMX(-100~100)는 1 단위가 약 1.8° 라 그만큼 나눠서 같은 실제 속도로 맞춥니다
+        dpu = kind()["deg_per_unit"]
+        cap = (FOLLOW_STEP_DEG if self.follow else MAX_STEP_DEG) / dpu
         for n in CTL_JOINTS:
             cur = self.cmd.get(n, self.actual.get(n, 0.0))
             lo, hi = self.limits[n]
             tgt = max(lo, min(hi, self.target.get(n, cur)))
             diff = tgt - cur
-            if abs(diff) < 0.2:          # 데드밴드: 도달로 간주
+            if abs(diff) < 0.2 / (dpu if n != "gripper" else 1.0):   # 데드밴드: 도달로 간주
                 self.cmd[n] = tgt
                 # 도달했다고 쓰기를 영영 멈추면, 서보가 그 명령을 놓쳤을 때
                 # (막힘·통신 유실·보호 동작) 영원히 어긋난 채로 남습니다.
@@ -1355,11 +1518,7 @@ class LeaderCtl:
         return self.tele is not None
 
     def connect(self):
-        from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
-        cfg = SOLeaderTeleopConfig(id=self.cfg["leader_id"],
-                                   port=self.cfg["leader_port"],
-                                   use_degrees=True)
-        tele = SOLeader(cfg)
+        tele = make_arm("leader", self.cfg)
         if not tele.calibration:
             raise RuntimeError(
                 f"리더 캘리브레이션 파일이 없습니다: {tele.calibration_fpath} — Calib 탭에서 만드세요")
@@ -1375,9 +1534,9 @@ class LeaderCtl:
     def disconnect(self):
         with self.lock:
             if self.tele is not None:
-                # 리더는 토크가 원래 꺼져 있습니다. 토크 해제 재시도(전원 없으면 수 초)를 건너뛰어
-                # E-STOP 이 리더 때문에 늦어지지 않게 합니다.
-                close_arm(self.tele, disable_torque=False)
+                # SO 리더는 토크가 원래 꺼져 있어 해제 재시도(전원 없으면 수 초)를 건너뜁니다 — E-STOP 이 늦어지지 않게.
+                # OMX 리더는 그리퍼에 토크가 걸려 있으므로 끕니다.
+                close_arm(self.tele, disable_torque=kind()["leader_torque"])
             self.tele = None
 
 
@@ -1612,32 +1771,28 @@ def list_video_devices():
     return found
 
 
-def _feetech_motors(norm_degrees=True):
-    from lerobot.motors import Motor, MotorNormMode
-    return {n: Motor(i + 1, "sts3215",
-                     MotorNormMode.RANGE_0_100 if n == "gripper"
-                     else (MotorNormMode.DEGREES if norm_degrees else MotorNormMode.RANGE_M100_100))
-            for i, n in enumerate(CTL_JOINTS)}
+def bus_class(k=None):
+    return _load(*(k or kind())["bus"])        # FeetechMotorsBus (SO-ARM101) / DynamixelMotorsBus (OMX)
 
 
 def probe_port(port, full=False):
-    """포트에 붙은 Feetech 모터 ID 를 나열합니다.
+    """포트에 붙은 모터 ID 를 나열합니다 (기종에 맞는 버스: Feetech / Dynamixel).
     full=False 면 기본 보드레이트(1 Mbps)만 — 웹에서 쓰기에 scan_port 는 너무 느립니다."""
-    from lerobot.motors.feetech import FeetechMotorsBus
+    Bus = bus_class()
     if full:
-        found = FeetechMotorsBus.scan_port(port)
+        found = Bus.scan_port(port)
         return {"baudrates": {str(b): sorted(ids) for b, ids in found.items()}}
-    bus = FeetechMotorsBus(port, {})
+    bus = Bus(port, {})
     bus.connect(handshake=False)
     try:
-        bus.set_baudrate(FeetechMotorsBus.default_baudrate)
+        bus.set_baudrate(Bus.default_baudrate)
         ids_models = bus.broadcast_ping() or {}
     finally:
         try:
             bus.disconnect(disable_torque=False)
         except Exception:
             pass
-    return {"baudrate": FeetechMotorsBus.default_baudrate,
+    return {"baudrate": Bus.default_baudrate,
             "ids": sorted(ids_models),
             "models": {str(i): m for i, m in ids_models.items()}}
 
@@ -1662,13 +1817,25 @@ class PortWatcher:
             self.threads.append(t)
 
     def _loop(self, port):
-        from lerobot.motors.feetech import FeetechMotorsBus
         st = self.state[port]
         bus = None
         try:
-            bus = FeetechMotorsBus(port, _feetech_motors())
-            bus.connect(handshake=False)
-            bus.disable_torque()          # 손으로 움직일 수 있게
+            # 리더/팔로워 중 어느 쪽인지 모르니 두 모터 구성을 차례로 시험합니다.
+            # SO-ARM101 은 둘 다 ID 1~6 이라 첫 번째에서 바로 맞고, OMX 는 리더 1~6 / 팔로워 11~16 입니다.
+            last = None
+            for role in ("leader", "follower"):
+                bus = make_bus(role, port)
+                bus.connect(handshake=False)
+                try:
+                    bus.sync_read("Present_Position", normalize=False)
+                    break
+                except Exception as e:
+                    last = e
+                    bus.disconnect(disable_torque=False)
+                    bus = None
+            if bus is None:
+                raise last or RuntimeError("모터 응답 없음")
+            torque_off_all(bus)           # 손으로 움직일 수 있게 (OMX 리더 그리퍼 토크 포함)
             lo, hi = {}, {}
             while self.on:
                 pos = bus.sync_read("Present_Position", normalize=False)
@@ -1709,6 +1876,7 @@ class MotorSetupSession:
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.role = "follower"
         self._reset()
 
     def _reset(self):
@@ -1728,14 +1896,15 @@ class MotorSetupSession:
     def current(self):
         return self.ORDER[self.idx] if self.idx < len(self.ORDER) else None
 
-    def start(self, port):
+    def start(self, port, role="follower"):
         if self.active:
             raise RuntimeError("이미 모터 ID 세팅 진행 중")
-        from lerobot.motors.feetech import FeetechMotorsBus
         self._reset()
-        bus = FeetechMotorsBus(port, _feetech_motors())
+        # 기종·역할별 모터 구성 (SO-ARM101: ID 1~6 sts3215 / OMX 팔로워: ID 11~16, 리더: ID 1~6 — lerobot 정의 그대로)
+        bus = make_bus(role, port)
         bus.connect(handshake=False)     # 아직 ID 가 안 맞으니 handshake 는 하면 안 됨
         self.bus = bus
+        self.role = role
         self.port = port
         self.stage = "running"
 
@@ -1778,9 +1947,12 @@ class MotorSetupSession:
         self.stage = "idle"
 
     def state(self):
-        return {"stage": self.stage, "port": self.port, "order": self.ORDER,
-                "idx": self.idx, "current": self.current,
-                "current_id": (self.idx + 1 <= len(self.ORDER)) and (len(self.ORDER) - self.idx) or None,
+        cur = self.current
+        cid = None
+        if cur is not None:
+            cid = self.bus.motors[cur].id if self.bus is not None else len(self.ORDER) - self.idx
+        return {"stage": self.stage, "port": self.port, "role": self.role, "order": self.ORDER,
+                "idx": self.idx, "current": cur, "current_id": cid,
                 "done": self.done, "err": self.err, "last": self.last}
 
 
@@ -1814,18 +1986,29 @@ class ArmCheckSession:
     def active(self):
         return self.stage in ("checking", "sweeping")
 
+    @staticmethod
+    def module():
+        """기종별 점검 모듈 — 같은 함수 이름·결과 형식 (SO-ARM101: tools_armcheck, OMX: tools_dxlcheck)."""
+        if kind()["bus"][1] == "DynamixelMotorsBus":
+            import tools_dxlcheck as AC
+        else:
+            import tools_armcheck as AC
+        return AC
+
     def start(self, port, role, sweep):
-        import tools_armcheck as AC
+        AC = self.module()
         if self.active:
             raise RuntimeError("이미 점검 중")
         self._close()
         self._reset()
+        self.AC = AC
         self.port, self.role, self.stage = port, role, "checking"
         try:
-            self.io = AC.BusIO(port)
+            # OMX 는 리더/팔로워 모터 ID 가 달라 역할이 필요합니다 (모르면 팔로워)
+            self.io = AC.BusIO(port, role or "follower") if hasattr(AC, "MOTORS") else AC.BusIO(port)
         except Exception as e:
             raise RuntimeError(f"포트를 열 수 없습니다 ({type(e).__name__}: {e})")
-        rep = AC.Report()
+        rep = AC.new_report(self.io) if hasattr(AC, "new_report") else AC.Report()
         present = AC.check_presence(self.io, rep)
         AC.check_static(self.io, rep, present, role=role or None)
         self.rep, self.present = rep, present
@@ -1857,14 +2040,19 @@ class ArmCheckSession:
                        for j, m in d["motors"].items() if m.get("model") is not None}}
 
     def _sample(self):
-        import tools_armcheck as AC
+        AC = self.AC
+        ids = getattr(self.io, "ids", None) or AC.IDS
         while self._run:
             for j in self.present:
                 if not self._run:
                     break
                 with self.lock:
-                    v, err = self.io.read(AC.IDS[j], "Present_Position")
-                self.rep.note_err(j, err)
+                    v, err = self.io.read(ids[j], "Present_Position")
+                if hasattr(AC, "MOTORS"):
+                    if err & 0x80:            # Dynamixel: 응답 Error 는 Alert 비트만 의미가 같습니다
+                        self.rep.alert[j] = True
+                else:
+                    self.rep.note_err(j, err)
                 self.tracker.feed(j, v)
             time.sleep(0.01)
 
@@ -1875,7 +2063,7 @@ class ArmCheckSession:
             th.join(timeout=2)
 
     def finish(self):
-        import tools_armcheck as AC
+        AC = self.AC
         if self.stage != "sweeping":
             raise RuntimeError("쓸기 중이 아닙니다")
         self._stop_sampler()
@@ -1915,9 +2103,10 @@ class ArmCheckSession:
 ARMCHECK = ArmCheckSession()
 
 
-def calib_file(role, calib_id):
-    sub_dir = "robots/so_follower" if role == "follower" else "teleoperators/so_leader"
-    return CALIB_ROOT / sub_dir / f"{calib_id}.json"
+def calib_file(role, calib_id, k=None):
+    """lerobot 이 쓰는 캘리브레이션 파일 경로. 기종마다 폴더가 다릅니다
+    (robots/so_follower, robots/omx_follower ...) — 같은 id 라도 서로 섞이지 않습니다."""
+    return CALIB_ROOT / (k or kind())["calib_dir"][role] / f"{calib_id}.json"
 
 
 class VerifySession:
@@ -1947,8 +2136,6 @@ class VerifySession:
         return self.on
 
     def start(self, side, role):
-        from lerobot.motors import MotorCalibration
-        from lerobot.motors.feetech import FeetechMotorsBus
         self.stop()
         arm = ARM_CFGS[side]
         port = arm.get(f"{role}_port") or ""
@@ -1957,9 +2144,11 @@ class VerifySession:
             raise RuntimeError("포트가 지정되지 않았습니다")
         if not f.is_file():
             raise RuntimeError(f"캘리브레이션 파일이 없습니다: {f}")
-        data = json.loads(f.read_text())
-        cal = {n: MotorCalibration(**data[n]) for n in CTL_JOINTS}
-        bus = FeetechMotorsBus(port, _feetech_motors(), calibration=cal)
+        # lerobot 장치가 만드는 버스 — 모터 구성·정규화 방식·캘리브레이션 파일이 연결 때와 똑같습니다
+        bus = make_bus(role, port, calib_id=arm[f"{role}_id"])
+        cal = bus.calibration
+        if set(cal) != set(CTL_JOINTS):
+            raise RuntimeError(f"캘리브레이션 파일이 이 기종 형식이 아닙니다: {f}")
         bus.connect(handshake=False)
         try:
             eeprom = bus.sync_read("Homing_Offset", normalize=False)
@@ -1967,7 +2156,10 @@ class VerifySession:
         except Exception:
             bus.disconnect(disable_torque=False)
             raise
-        self.adj = {n: int(eeprom[n]) - int(cal[n].homing_offset) for n in CTL_JOINTS}
+        # 연결 때 파일 값이 써지면 Present 가 얼마나 바뀌는지.
+        # Feetech: Present = Actual - Homing → (EEPROM - 파일),  Dynamixel: Present = Actual + Homing → (파일 - EEPROM)
+        sign = kind()["homing_sign"]
+        self.adj = {n: sign * (int(eeprom[n]) - int(cal[n].homing_offset)) for n in CTL_JOINTS}
         diff = [n for n, v in self.adj.items() if v]
         self.warn = ([f"서보에 저장된 homing offset 이 파일과 다릅니다 ({', '.join(diff)}) — "
                       "Control·수집에서 연결할 때 파일 값이 써집니다. 아래 값은 그 기준입니다."] if diff else [])
@@ -1998,8 +2190,10 @@ class VerifySession:
         if not self.on:
             raise RuntimeError("확인 중이 아닙니다")
         with self.lock:
-            self.bus.disable_torque()
+            failed = torque_off_all(self.bus)
             self.torque = {k: int(v) for k, v in self.bus.sync_read("Torque_Enable", normalize=False).items()}
+        if failed:
+            raise RuntimeError(f"토크 해제 실패: {', '.join(failed)}")
 
     def stop(self):
         self.on = False
@@ -2094,7 +2288,8 @@ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 .appbar{display:flex;align-items:center;gap:26px;background:var(--surface);
   border-bottom:1px solid var(--line);padding:0 22px;height:52px;
   position:sticky;top:0;z-index:10}
-.brand{font-family:var(--mono);font-weight:600;font-size:13px;letter-spacing:.14em;color:var(--text)}
+.brand{font-family:var(--mono);font-weight:600;font-size:13px;letter-spacing:.14em;color:var(--text);white-space:nowrap}
+.brand a{color:inherit;text-decoration:none}
 .brand small{color:var(--dim);font-weight:400;letter-spacing:.14em}
 .nav{display:flex;gap:2px;height:100%}
 .nav a{display:flex;align-items:center;padding:0 14px;color:var(--muted);
@@ -2123,7 +2318,7 @@ td.num{font-family:var(--mono);font-size:13px;text-align:right;color:var(--muted
   font-variant-numeric:tabular-nums}
 th.num{text-align:right}
 .mono{font-family:var(--mono);font-size:13px}
-.badge{display:inline-block;font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+.badge{display:inline-block;white-space:nowrap;font-family:var(--mono);font-size:11px;letter-spacing:.06em;
   padding:2px 9px;border-radius:20px;border:1px solid transparent}
 .b-ok{color:var(--ok);border-color:var(--ok);background:rgba(87,185,138,.08)}
 .b-bad{color:var(--bad);border-color:var(--bad);background:rgba(201,96,96,.08)}
@@ -2244,7 +2439,7 @@ def nav_html(active=""):
         on = ' class=on' if key == active else ''
         return f'<a href="{href}"{on}>{label}</a>'
 
-    return (f'<div class=appbar><div class=brand>LRWEB <small>/ SO-101 PIPELINE</small></div>'
+    return (f'<div class=appbar><div class=brand>LRWEB <a href="/setup/wizard" title="기종 바꾸기 — 셋업 마법사"><small>/ {esc(kind()["label"])}</small></a></div>'
             f'<div class=nav>{tab("/projects", "Projects", "pj")}{tab("/", "Datasets", "ds")}{tab("/collect", "Collect", "co")}'
             f'{tab("/train", "Training", "tr")}{tab("/rollout", "Rollout", "ro")}'
             f'{tab("/control", "Control", "ct")}{tab("/calib", "Calib", "cb")}{tab("/setup", "Setup", "st")}'
@@ -2726,9 +2921,13 @@ def dataset_page(ds: str):
     if not (DATA_ROOT / ds / "meta/info.json").exists():
         return HTMLResponse(f"{CSS}{nav_html('ds')}<div class=wrap>데이터셋 없음: {esc(ds)}</div>", 404)
     views = {sd: (a.get("view") or {"x": 0.0, "y": 0.0, "yaw_deg": 0.0}) for sd, a in ARM_CFGS.items()}
+    # 3D 는 데이터셋을 찍은 기종으로 (지금 기종과 다를 수 있음)
+    rt = load_json(DATA_ROOT / ds / "meta/info.json", {}).get("robot_type", "")
+    k = next((v for v in ROBOT_KINDS.values() if rt in v["types"]["single"] | v["types"]["bi"]), kind())
+    k3 = kind3d(k)
     return (CSS + nav_html("ds")
-            + f"<script>const DS={js(ds)}, URDF_OK={js((URDF_DIR / 'so101.urdf').exists())}, "
-              f"VIEWS_CFG={js(views)};</script>"
+            + f"<script>const DS={js(ds)}, URDF_OK={js((URDF_DIR / k3['urdf'][len('/urdf/'):]).exists())}, "
+              f"VIEWS_CFG={js(views)}, K3={js(k3)};</script>"
             + REVIEW_HTML)
 
 
@@ -2818,7 +3017,7 @@ def collect_page(resume: str = ""):
         projline = (f'<p class=muted>환경 <b class=mono>{esc(env_name())}</b> · 프로젝트 없이 수집합니다 — '
                     f'<a href="/projects">프로젝트</a>를 열면 태스크 설명과 이름이 채워지고 데이터셋이 묶입니다.</p>')
     return f"""{CSS}{nav_html('co')}<div class=wrap>
-    <p class=eyebrow>Teleoperation record · {"양팔 bi_so_follower" if BIMANUAL else "한팔 so101_follower"}</p><h2>Collect</h2>
+    <p class=eyebrow>Teleoperation record · {esc(kind()["label"])} · {"양팔 " + kind()["cli"]["bi_follower"] if BIMANUAL else "한팔 " + kind()["cli"]["follower"]}</p><h2>Collect</h2>
     {busywarn}{projline}
     <div class=card>
     <div class=formgrid>
@@ -2954,7 +3153,7 @@ async def api_record(req: Request):
             return JSONResponse({"error": f"이미 있는 데이터셋: {name} — 다른 이름을 쓰거나 '기존에 이어서' 선택"},
                                 status_code=400)
         resume = False
-    spec = {"mode": CFG["mode"], "arms": json.loads(json.dumps(CFG["arms"])),
+    spec = {"robot": robot_key(), "mode": CFG["mode"], "arms": json.loads(json.dumps(CFG["arms"])),
             "cameras": json.loads(json.dumps(CFG["cameras"])), "fps": int(CFG["fps"]),
             "task": task, "num_episodes": neps, "episode_time_s": ept,
             "repo_id": f"local/{name}", "root": str(DATA_ROOT / name), "resume": resume,
@@ -3191,7 +3390,7 @@ def rollout_page():
                     f'{" · 다른 프로젝트/미분류" if other else ""}</option>')
     empty = "" if ckpts else '<p class=muted>체크포인트가 없습니다 — Training에서 학습을 먼저 완료하세요</p>'
     return f"""{CSS}{nav_html('ro')}<div class=wrap>
-    <p class=eyebrow>Autonomous run · {"양팔 bi_so_follower" if BIMANUAL else "한팔 so101_follower"}</p><h2>Rollout</h2>
+    <p class=eyebrow>Autonomous run · {esc(kind()["label"])} · {"양팔 " + kind()["cli"]["bi_follower"] if BIMANUAL else "한팔 " + kind()["cli"]["follower"]}</p><h2>Rollout</h2>
     {busywarn}{empty}{f'<p class=muted>프로젝트 <b class=mono>{esc(pname)}</b> — 이 프로젝트의 모델이 위에 옵니다.</p>' if pname else ''}
     <div class=card>
     <div class=formgrid>
@@ -3250,6 +3449,12 @@ async def api_rollout(req: Request):
     rt = checkpoint_robot_type(rel)
     if not robot_type_ok(rt):
         return JSONResponse({"error": f"체크포인트는 {rt} 데이터로 학습됨 — 현재 모드({robot_name()})와 다릅니다"},
+                            status_code=400)
+    miss = plugin_missing() if BIMANUAL else []
+    if miss:
+        # lrweb 자신은 plugins/ 를 직접 읽지만, lerobot CLI 는 설치된 패키지만 찾습니다
+        return JSONResponse({"error": "양팔 OMX 플러그인이 설치돼 있지 않습니다 — 터미널에서: "
+                                      "pip install --no-deps " + " ".join(f"-e plugins/{m}" for m in miss)},
                             status_code=400)
     try:
         argv = ([sys.executable, "-m", "lerobot.scripts.lerobot_rollout", f"--policy.path={ck}"] + robot_cli_args()
@@ -3394,7 +3599,7 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
   </div>
   <div id=right>
     <div class=cams id=cams>{cam_panels}</div>
-    <div id=view><div id=nourdf>{esc(URDF_DIR)}/so101.urdf 없음<br>
+    <div id=view><div id=nourdf>{esc(URDF_DIR)}/{esc(kind()["urdf"])} 없음<br>
     URDF와 meshes/ 를 복사하면 3D 표시<br>(슬라이더 제어는 그대로 동작)</div></div>
   </div>
 </div>
@@ -3408,6 +3613,7 @@ button.estop{{background:#4a2020;border-color:var(--bad);color:#ffc9c9;font-fami
 const JOINTS = {js(CTL_JOINTS)};
 const SIDES  = {js(SIDES)};
 const VIEWS  = {views_js};
+const K3     = {js(kind3d())};   // 기종별 URDF·관절 이름·단위 (SO-ARM101 / OMX)
 const CAMS   = {js(list(CAM_SPECS))};
 let ws=null, torque=false, follow=false;
 const robots={{}};                       // side -> URDF root
@@ -3576,7 +3782,7 @@ function showViewMsg(t){{
         o.material=new THREE.MeshStandardMaterial({{metalness:0.15,roughness:0.55}});
         o.userData.recolored=true;
       }}
-      if(o.userData.urdfMat==='sts3215'){{
+      if(K3.motor_mat && o.userData.urdfMat===K3.motor_mat){{
         // 서보는 URDF 색(0.1,0.1,0.1)을 그대로 둡니다 — 다 같은 색이면 형태가 안 보입니다.
         o.material.color.set('#1a1a1a');
         o.material.roughness=0.35;
@@ -3597,7 +3803,7 @@ function showViewMsg(t){{
     const loader=new URDFLoader(mgr);
     loader.workingPath='/urdf/';
     loader.packages='/urdf';           // package://xxx/ 형태도 /urdf/로 해석
-    loader.load('/urdf/so101.urdf',
+    loader.load(K3.urdf,
       r=>{{
         // URDF 는 Z-up / X-forward. -90° 눕히면 URDF X → three X(앞), URDF Y → three -Z(왼쪽).
         // Euler 'XYZ' 는 R = Rx·Ry·Rz 라 z 성분이 먼저 적용됨 → URDF 기준 yaw 가 됩니다.
@@ -3614,12 +3820,12 @@ function showViewMsg(t){{
     const robot=robots[side];
     if(!robot||!actual)return;
     JOINTS.forEach(j=>{{
-      const jt=robot.joints?.[j]; if(!jt)return;
+      const jt=robot.joints?.[K3.map[j]||j]; if(!jt)return;
       const v=actual[j]; if(v===undefined)return;
       if(j==='gripper'){{
-        const lo=jt.limit?.lower??0,hi=jt.limit?.upper??1;
+        const g=K3.gripper, lo=g?g.lo:(jt.limit?.lower??0), hi=g?g.hi:(jt.limit?.upper??1);
         jt.setJointValue(lo+(hi-lo)*(v/100));
-      }}else jt.setJointValue(v*Math.PI/180);
+      }}else jt.setJointValue((K3.sign[j]||1)*v*K3.scale);
     }});
   }};
   }}catch(e){{ console.error(e); showViewMsg('3D 초기화 실패<br>'+(e?.message||e)); }}
@@ -3633,14 +3839,16 @@ def api_ctlstate():
             "torque": all(a.torque for a in ARMS.values()) and any_arm_connected(),
             "sides": SIDES,
             "cams": list(CAM_SPECS),
-            "urdf": (URDF_DIR / "so101.urdf").exists()}
+            "urdf": (URDF_DIR / kind()["urdf"]).exists()}
 
 
 def _arms_state():
     out = {}
     for s, a in ARMS.items():
         hot = [n for n, t in a.temp.items() if t >= TEMP_WARN_C]
-        stuck = ([n for n, e in a.track.items() if abs(e) > TRACK_WARN_DEG]
+        dpu = kind()["deg_per_unit"]          # 오차 기준은 ° — OMX 단위(-100~100)로 환산
+        stuck = ([n for n, e in a.track.items()
+                  if abs(e) > (TRACK_WARN_DEG if n == "gripper" else TRACK_WARN_DEG / dpu)]
                  if a.torque else [])
         diag = {}
         for n in stuck:
@@ -3898,19 +4106,13 @@ def serve_urdf(rest: str):
 
 # ----------------------------- 페이지: Setup (포트/카메라) --------------------
 def calib_status():
-    """설정된 id 별 캘리브레이션 파일 존재 여부."""
+    """설정된 id 별 캘리브레이션 파일 존재 여부 (지금 기종 폴더 기준)."""
     out = {}
     for side, arm in ARM_CFGS.items():
-        out[side] = {
-            "follower": {
-                "id": arm["follower_id"],
-                "path": str(CALIB_ROOT / "robots/so_follower" / f"{arm['follower_id']}.json"),
-                "ok": (CALIB_ROOT / "robots/so_follower" / f"{arm['follower_id']}.json").is_file()},
-            "leader": {
-                "id": arm["leader_id"],
-                "path": str(CALIB_ROOT / "teleoperators/so_leader" / f"{arm['leader_id']}.json"),
-                "ok": (CALIB_ROOT / "teleoperators/so_leader" / f"{arm['leader_id']}.json").is_file()},
-        }
+        out[side] = {}
+        for role in ("follower", "leader"):
+            f = calib_file(role, arm[f"{role}_id"])
+            out[side][role] = {"id": arm[f"{role}_id"], "path": str(f), "ok": f.is_file()}
     return out
 
 
@@ -3942,6 +4144,8 @@ def validate_config(cfg):
     mode = cfg.get("mode")
     if mode not in ("single", "bimanual"):
         return "mode 는 single 또는 bimanual"
+    if cfg.get("robot", DEFAULT_ROBOT) not in ROBOT_KINDS:
+        return f"robot 은 {' / '.join(ROBOT_KINDS)} 중 하나"
     arms = cfg.get("arms")
     want = 2 if mode == "bimanual" else 1
     if not isinstance(arms, list) or len(arms) != want:
@@ -4110,7 +4314,8 @@ async def api_motors_start(req: Request):
     if busy:
         return JSONResponse({"error": f"{busy['id']} 실행 중"}, status_code=400)
     try:
-        await asyncio.to_thread(MOTORSETUP.start, port)
+        role = b.get("role") if b.get("role") in ("follower", "leader") else "follower"
+        await asyncio.to_thread(MOTORSETUP.start, port, role)
     except Exception as e:
         MOTORSETUP.stage = "error"
         MOTORSETUP.err = f"{type(e).__name__}: {e}"
@@ -4213,7 +4418,8 @@ def wizard_state():
             v = w.get(f"{side}|{role}", {})
             fresh = bool(v.get("verified")) and v.get("verified_ts", 0) >= mtime and v.get("port") == port
             dg = ARMCHECK.history.get(port) if port else None
-            ee = (dg or {}).get("eeprom")
+            # 보드 캘리브레이션 판정은 범위 기록형(SO-ARM101)만 — OMX 는 공장값이 곧 캘리브레이션
+            ee = (dg or {}).get("eeprom") if kind()["calib"] == "range" else None
             fcmp, fdiff = file_calib_compare(c["path"], ee) if c["ok"] else ("none", [])
             slots.append({
                 "side": side, "role": role, "port": port, "dev": pe["dev"] if pe else "",
@@ -4225,8 +4431,12 @@ def wizard_state():
                 "verified": v.get("verified") if fresh else None,
                 "verified_stale": bool(v.get("verified")) and not fresh})
     busy = exclusive_busy()
-    return {"mode": CFG["mode"], "env": env_name(), "slots": slots, "ports": ports,
-            "cameras": list(CAM_SPECS), "urdf": (URDF_DIR / "so101.urdf").exists(),
+    k = kind()
+    return {"robot": robot_key(), "robot_label": k["label"], "calib_kind": k["calib"], "unit": k["unit"],
+            "robots": {r: v["label"] for r, v in ROBOT_KINDS.items()},
+            "plugin_missing": plugin_missing(k) if CFG["mode"] == "bimanual" else [],
+            "mode": CFG["mode"], "env": env_name(), "slots": slots, "ports": ports,
+            "cameras": list(CAM_SPECS), "urdf": (URDF_DIR / k["urdf"]).exists(), "kind3d": kind3d(),
             "views": {sd: a.get("view") for sd, a in ARM_CFGS.items()},
             "busy": busy["id"] if busy else ""}
 
@@ -4500,6 +4710,36 @@ async def api_wizard_mode(req: Request):
     return st
 
 
+def convert_robot(cfg, robot):
+    """기종 전환. 보드(USB)가 다르므로 포트는 비우고, id·카메라·3D 배치는 둡니다.
+    캘리브레이션 파일은 기종마다 폴더가 달라 서로 섞이지 않습니다."""
+    cfg = json.loads(json.dumps(cfg))
+    if cfg.get("robot", DEFAULT_ROBOT) == robot:
+        return cfg
+    cfg["robot"] = robot
+    for a in cfg["arms"]:
+        a["follower_port"] = a["leader_port"] = ""
+    return cfg
+
+
+@app.post("/api/wizard/robot")
+async def api_wizard_robot(req: Request):
+    b = await req.json()
+    robot = b.get("robot")
+    if robot not in ROBOT_KINDS:
+        return JSONResponse({"error": f"robot 은 {' / '.join(ROBOT_KINDS)} 중 하나"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 끝난 뒤 바꾸세요"}, status_code=400)
+    cfg = convert_robot(CFG, robot)
+    err = validate_config(cfg)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    _write_active_config(cfg)
+    sync_active_env()
+    return wizard_state()
+
+
 @app.get("/setup/wizard", response_class=HTMLResponse)
 def wizard_page():
     return CSS + nav_html("st") + WIZARD_HTML
@@ -4698,16 +4938,20 @@ IMPORTMAP_HTML = """<script type="importmap">
 # 읽기 전용 3D 뷰어 (리뷰 재생 · 셋업 마법사 확인 단계). Control 탭과 같은 좌표·색 규칙.
 # <script type="module"> 안에 넣어 쓰고 window.mountArm3D(el, sides, views) 로 부릅니다.
 ARM3D_JS = """
-window.mountArm3D = async function(el, sides, views){
+window.mountArm3D = async function(el, sides, views, K3){
+  // K3 = 서버 kind3d(): 기종별 URDF, lerobot 관절 → URDF 관절 이름, 단위 → rad (없으면 SO-ARM101)
+  K3=K3||{urdf:'/urdf/so101.urdf', scale:Math.PI/180, map:{}, sign:{}, gripper:null, motor_mat:'sts3215'};
   const THREE=await import('three');
   const {OrbitControls}=await import('three/addons/controls/OrbitControls.js');
   const URDFLoader=(await import('urdf-loader')).default;
   const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0a0d10);
   const cam=new THREE.PerspectiveCamera(50,1,0.01,10);
   const zoom=sides.length>1?1.7:1.0;
-  cam.position.set(0.4*zoom,0.35*zoom,0.4*zoom);
+  // 팔은 0 자세에서 앞(+X)으로 뻗으므로 한팔이면 시선을 조금 앞으로 (끝이 잘리지 않게)
+  const fx=sides.length>1?0:0.12;
+  cam.position.set(0.4*zoom+fx,0.38*zoom,0.5*zoom);
   const ren=new THREE.WebGLRenderer({antialias:true}); el.appendChild(ren.domElement);
-  const ctl=new OrbitControls(cam,ren.domElement); ctl.target.set(0,0.12,0);
+  const ctl=new OrbitControls(cam,ren.domElement); ctl.target.set(fx,0.1,0);
   scene.add(new THREE.HemisphereLight(0xffffff,0x223344,1.1));
   const dl=new THREE.DirectionalLight(0xffffff,1.2); dl.position.set(1,2,1); scene.add(dl);
   scene.add(new THREE.GridHelper(sides.length>1?1.6:1, sides.length>1?32:20, 0x28303a, 0x1b222a));
@@ -4724,7 +4968,7 @@ window.mountArm3D = async function(el, sides, views){
       if(!o.isMesh) return;
       if(!o.userData.rc){ o.userData.m=(o.material&&o.material.name)||''; o.userData.j=motorJoint(o);
         o.material=new THREE.MeshStandardMaterial({metalness:0.15,roughness:0.55}); o.userData.rc=1; }
-      if(o.userData.m==='sts3215'){
+      if(K3.motor_mat && o.userData.m===K3.motor_mat){
         const c=(hl[side]||{})[o.userData.j];
         o.material.color.set(c||'#1a1a1a'); o.material.roughness=0.35;
         o.material.emissive.set(c||'#000000'); o.material.emissiveIntensity=c?0.5:0;
@@ -4734,7 +4978,7 @@ window.mountArm3D = async function(el, sides, views){
   const mgr=new THREE.LoadingManager(); mgr.onLoad=()=>Object.keys(robots).forEach(s=>paint(robots[s],s));
   await Promise.all(sides.map(side=>new Promise(res=>{
     const loader=new URDFLoader(mgr); loader.workingPath='/urdf/'; loader.packages='/urdf';
-    loader.load('/urdf/so101.urdf', r=>{
+    loader.load(K3.urdf, r=>{
       const v=views[side]||{x:0,y:0,yaw_deg:0};
       r.rotation.set(-Math.PI/2, 0, (v.yaw_deg||0)*Math.PI/180);
       r.position.set(v.x||0, 0, -(v.y||0));
@@ -4756,10 +5000,13 @@ window.mountArm3D = async function(el, sides, views){
     update(side, joints){
       const r=robots[side]; if(!r) return;
       for(const j in joints){
-        const jt=r.joints&&r.joints[j], v=joints[j];
+        const jt=r.joints&&r.joints[(K3.map&&K3.map[j])||j], v=joints[j];
         if(!jt || v==null) continue;
-        if(j==='gripper'){ const lo=jt.limit?jt.limit.lower:0, hi=jt.limit?jt.limit.upper:1; jt.setJointValue(lo+(hi-lo)*(v/100)); }
-        else jt.setJointValue(v*Math.PI/180);
+        if(j==='gripper'){
+          const g=K3.gripper, lo=g?g.lo:(jt.limit?jt.limit.lower:0), hi=g?g.hi:(jt.limit?jt.limit.upper:1);
+          jt.setJointValue(lo+(hi-lo)*(v/100));
+        }
+        else jt.setJointValue(((K3.sign&&K3.sign[j])||1)*v*K3.scale);
       }
     }
   };
@@ -5063,7 +5310,7 @@ document.addEventListener('keydown',ev=>{
     const sides=INFO.bimanual?['left','right']:['main'];
     const views={}; sides.forEach(s=>{ views[s]=VIEWS_CFG[s]||{x:0, y:(s==='left'?0.12:s==='right'?-0.12:0), yaw_deg:0}; });
     $('v3d').style.display='';
-    try{ ARM=await window.mountArm3D($('v3d'), sides, views); }
+    try{ ARM=await window.mountArm3D($('v3d'), sides, views, K3); }
     catch(e){ console.error(e); $('v3d').style.display='none'; ARM=null; }
   }
   select(i0);
@@ -5080,6 +5327,7 @@ WIZARD_HTML = """
 .wrow{display:flex;gap:8px;align-items:center;font-size:12.5px;flex-wrap:wrap}
 .wrow .k{width:74px;color:var(--muted);font-family:var(--mono);font-size:11.5px}
 .modebar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 14px}
+.modebar .tiny,.wpanel .tiny{font-size:11px;color:var(--dim);font-family:var(--mono)}
 .stepper{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 14px}
 .stepper .st{display:flex;gap:7px;align-items:center;padding:6px 10px;border-radius:8px;cursor:pointer;color:var(--muted);font-size:13px}
 .stepper .st.cur{background:var(--surface2);color:var(--text)}
@@ -5155,11 +5403,27 @@ function boardText(s){
 async function load(){ W=await jget('/api/wizard/state'); paintMode(); paintOver(); paintAfter(); }
 function paintMode(){
   const bi=W.mode==='bimanual';
-  $('modebar').innerHTML='<span class=muted>구성</span>'
+  let h='<span class=muted>기종</span>';
+  Object.keys(W.robots).forEach(r=>{ h+='<button data-robot="'+E(r)+'" class="'+(W.robot===r?'primary':'')+'">'+E(W.robots[r])+'</button>'; });
+  h+='<span style="width:14px"></span><span class=muted>구성</span>'
     +'<button id=wm1 class="'+(bi?'':'primary')+'">한팔</button>'
     +'<button id=wm2 class="'+(bi?'primary':'')+'">양팔 (left / right)</button>'
     +'<span class=tiny>환경 <span class=mono>'+E(W.env)+'</span> · 바꾸면 이 환경 설정이 바뀝니다</span>';
+  if(W.plugin_missing && W.plugin_missing.length)
+    h+='<p class="badge b-warn" style="flex-basis:100%">양팔 '+E(W.robot_label)+' 롤아웃에 필요한 플러그인 미설치 — 터미널: pip install --no-deps '
+      +W.plugin_missing.map(m=>'-e plugins/'+E(m)).join(' ')+'</p>';
+  $('modebar').innerHTML=h;
   $('wm1').onclick=()=>setMode('single'); $('wm2').onclick=()=>setMode('bimanual');
+  document.querySelectorAll('#modebar button[data-robot]').forEach(b=>b.onclick=()=>setRobot(b.dataset.robot));
+}
+async function setRobot(r){
+  if(W.robot===r) return;
+  if(!confirm(W.robots[r]+' 로 바꿉니다. 보드가 달라서 지정된 포트는 비웁니다 (캘리브레이션 파일은 기종별로 따로 보관). 계속할까요?')) return;
+  await leave(); SLOT=null; STEP=null; $('wiz').innerHTML='';
+  const r2=await jpost('/api/wizard/robot',{robot:r});
+  if(r2.error){ alert(r2.error); return; }
+  W=r2; paintMode(); paintOver(); paintAfter();
+  history.replaceState(null,'',location.pathname);
 }
 async function setMode(m){
   if(W.mode===m) return;
@@ -5237,9 +5501,9 @@ function legend(items){ return '<div class=legend>'+items.map(x=>'<span><i style
 async function mount3D(leg){
   const el=$('w3d'); if(!el) return null;
   const my=STEP;
-  if(!W.urdf){ el.innerHTML='<p class=muted style="padding:14px">urdf/so101.urdf 가 없어 3D 를 못 그립니다 — 표의 숫자로 확인하세요.</p>'; ARM=null; return null; }
+  if(!W.urdf){ el.innerHTML='<p class=muted style="padding:14px">'+E(W.kind3d.urdf)+' 가 없어 3D 를 못 그립니다 — 표의 숫자로 확인하세요.</p>'; ARM=null; return null; }
   el.innerHTML=leg?legend(leg):'';
-  try{ const v={}; v[SLOT.side]={x:0,y:0,yaw_deg:0}; const a=await window.mountArm3D(el,[SLOT.side],v);
+  try{ const v={}; v[SLOT.side]={x:0,y:0,yaw_deg:0}; const a=await window.mountArm3D(el,[SLOT.side],v,W.kind3d);
        if(STEP!==my || $('w3d')!==el) return null; ARMSIDE=SLOT.side; ARM=a; return a; }
   catch(e){ console.error(e); ARM=null; el.innerHTML='<p class=muted style="padding:14px">3D 를 불러오지 못했습니다 (인터넷 연결 필요) — 표의 숫자로 확인하세요.</p>'; return null; }
 }
@@ -5310,7 +5574,7 @@ async function assign(dev,btn){
 async function stepDiag(s){
   if(!s.port_ok){ $('wstep').innerHTML='<div class=wpanel><p class="note bad">포트가 지정되지 않았거나 연결돼 있지 않습니다.</p><button class=primary id=wback>포트 찾기로</button></div>'; $('wback').onclick=()=>go('port'); return; }
   $('wstep').innerHTML='<div class=wbody><div class=wpanel><p class=muted>진단 중… 서보에 아무것도 쓰지 않습니다 (몇 초)</p></div><div id=w3d></div></div>';
-  mount3D([[C_OK,'정상'],[C_WARN,'주의'],[C_BAD,'불량·응답 없음']]);
+  mount3D(W.kind3d.motor_mat?[[C_OK,'정상'],[C_WARN,'주의'],[C_BAD,'불량·응답 없음']]:null);   // 모터 색 표시는 서보 메시가 따로 있는 기종만
   const key=slotKey();
   let r; try{ r=await jpost('/api/setup/armcheck/start',{port:s.port, role:SLOT.role, sweep:false}); }catch(e){ r={error:String(e)}; }
   if(STEP!=='diag' || slotKey()!==key) return;       // 진단 도중 다른 팔로 옮겼으면 결과를 버립니다
@@ -5328,7 +5592,7 @@ async function stepDiag(s){
     +'<p class="note '+cls+'">판정: <b>'+E(rep.verdict)+'</b> · 모터 '+nOk+'/'+Object.keys(rep.motors).length
     +(rep.power&&rep.power.system?' · 전원 '+E(rep.power.system)+' 계통 (중앙값 '+rep.power.median_v+' V)':(volts.length?' · '+Math.min.apply(null,volts).toFixed(1)+' V':''))+'</p>';
   const b=s.board||{};
-  h+='<p style="margin:0 0 10px">보드 캘리브레이션: '+({calibrated:badge('저장돼 있음','b-ok'),default:badge('없음 (공장값)','b-warn'),partial:badge('일부만','b-warn'),unknown:badge('모름')})[b.calib||'unknown']
+  if(W.calib_kind!=='factory') h+='<p style="margin:0 0 10px">보드 캘리브레이션: '+({calibrated:badge('저장돼 있음','b-ok'),default:badge('없음 (공장값)','b-warn'),partial:badge('일부만','b-warn'),unknown:badge('모름')})[b.calib||'unknown']
     +(s.calib.ok?' · 파일 '+({match:badge('보드와 일치','b-ok'),mismatch:badge('보드와 다름: '+(b.diff||[]).join(', '),'b-warn')})[b.file]||'':'')+'</p>';
   let tbl='<table><tr><th>ID</th><th>관절</th><th class=num>전압</th><th class=num>온도</th><th class=num>흔들림</th><th>결과</th></tr>';
   Object.keys(rep.motors).forEach(j=>{ const m=rep.motors[j];
@@ -5355,7 +5619,7 @@ async function stepDiag(s){
 }
 async function msStart(s){
   if(!confirm('모터를 한 개씩만 보드에 연결한 상태여야 합니다. 시작할까요?')) return;
-  const r=await jpost('/api/setup/motors/start',{port:s.dev||s.port});
+  const r=await jpost('/api/setup/motors/start',{port:s.dev||s.port, role:SLOT.role});
   if(r.error){ alert(r.error); return; }
   MSING=true;
   msPoll();
@@ -5380,7 +5644,27 @@ async function msPoll(){
 }
 
 /* ---------- ③ 캘리브레이션 ---------- */
+function stepFactory(s){
+  /* OMX: lerobot 이 공장값(오프셋 0, 범위 0~4095)을 캘리브레이션으로 씁니다 — 범위 기록이 없습니다 */
+  const fname='<span class=mono>'+E(s.calib.id)+'.json</span>';
+  $('wstep').innerHTML='<div class="wbody one"><div class=wpanel id=wcp>'
+    +(s.calib.ok?'<p class="note ok">캘리브레이션 파일 '+fname+' 이 있습니다 ('+E(s.calib.when)+')</p>'
+                :'<p class=note>캘리브레이션 파일이 없습니다 — '+fname+'</p>')
+    +'<p class=muted>이 기종('+E(W.robot_label)+')은 범위를 기록하지 않고 lerobot 의 공장값(오프셋 0, 범위 0~4095)을 씁니다. '
+    +'버튼을 누르면 토크를 끄고 운전 모드·회전 방향·공장값을 모터에 쓰고 파일을 저장합니다. 팔로워는 받치세요.</p>'
+    +'<div class=toolbar>'+(s.calib.ok?'<button class=primary id=wnext>그대로 쓰고 다음: 확인</button><button id=wfac>공장값 다시 쓰기</button>'
+                                       :'<button class=primary id=wfac>공장값 쓰기</button>')+'</div></div></div>';
+  if($('wnext')) $('wnext').onclick=()=>go('verify');
+  $('wfac').onclick=async()=>{
+    if(!confirm('토크를 끄고 공장값 캘리브레이션을 씁니다. 계속할까요?')) return;
+    $('wfac').disabled=true;
+    const r=await jpost('/api/calib/factory',{side:SLOT.side,role:SLOT.role});
+    if(r.error){ alert(r.error); $('wfac').disabled=false; return; }
+    await refreshSlot(); go('verify');
+  };
+}
 function stepCalib(s){
+  if(W.calib_kind==='factory') return stepFactory(s);
   const back='/setup/wizard?slot='+SLOT.side+'|'+SLOT.role+'&step=verify';
   const link='/calib?side='+encodeURIComponent(SLOT.side)+'&role='+SLOT.role+'&next='+encodeURIComponent(back);
   const b=s.board||{}, fname='<span class=mono>'+E(s.calib.id)+'.json</span>';
@@ -5509,7 +5793,7 @@ async function vpoll(){
   const t=$('wvtbl');
   if(t){
     let h='<tr><th>관절</th><th class=num>값</th></tr>';
-    Object.keys(v.joints).forEach(j=>{ h+='<tr><td class=mono>'+E(j)+'</td><td class="num mono">'+v.joints[j].toFixed(1)+(j==='gripper'?' %':'°')+'</td></tr>'; });
+    Object.keys(v.joints).forEach(j=>{ h+='<tr><td class=mono>'+E(j)+'</td><td class="num mono">'+v.joints[j].toFixed(1)+(j==='gripper'?' %':(W.unit||''))+'</td></tr>'; });
     t.innerHTML=h;
   }
   if($('wok')) $('wok').disabled=!(v.on && Object.keys(v.joints).length && !v.err);
@@ -5575,8 +5859,12 @@ SETUP_HTML = """
   </div>
 </div>
 
-<p class=eyebrow>1 · 모드</p>
+<p class=eyebrow>1 · 기종 · 모드</p>
 <div class=toolbar>
+  <span class=muted>기종</span>
+  <button id=r_so101 onclick="setRobot('so101')">SO-ARM101</button>
+  <button id=r_omx onclick="setRobot('omx')">OMX</button>
+  <span style="width:14px"></span><span class=muted>구성</span>
   <button id=b1 onclick="setMode('single')">한팔</button>
   <button id=b2 onclick="setMode('bimanual')">양팔 (left / right)</button>
   <span class=muted id=modehint></span>
@@ -5612,7 +5900,7 @@ SETUP_HTML = """
   하나만 뜨거나 응답이 없으면 여기서 ID 를 씁니다 — <b>모터를 한 개씩만 보드에 꽂아</b> 순서대로 진행합니다
   (여러 개가 같은 ID 1 로 붙어 있으면 응답이 충돌합니다).</p>
   <div class=toolbar>
-    <select id=msport></select>
+    <select id=msport></select> <select id=msrole title="OMX 는 팔로워(ID 11~16)와 리더(ID 1~6) 모터 구성이 다릅니다"><option value=follower>팔로워</option><option value=leader>리더</option></select>
     <button id=msstart class=primary onclick="withBusy(this,msStart)">모터 ID 세팅 시작</button>
   </div>
   <div id=msbox></div>
@@ -5662,7 +5950,7 @@ SETUP_HTML = """
   <div class=formgrid>
     <label class=f>robot_id <input id=robot_id size=12></label>
     <label class=f>fps <input id=fps size=5></label>
-    <label class=f>max_relative_target(°, 비우면 미사용) <input id=mrt size=6></label>
+    <label class=f title="SO-ARM101 은 °, OMX 는 -100~100 단위 (1 ≈ 1.8°)">max_relative_target (SO: ° / OMX: 1≈1.8°, 비우면 미사용) <input id=mrt size=6></label>
     <label class=f style="flex:1;min-width:240px">기본 태스크 설명 <input id=task></label>
   </div>
   <div id=calib></div>
@@ -5712,6 +6000,17 @@ async function boot(){
 function dump(){ $('cfgdump').textContent=JSON.stringify(CFG,null,2); }
 
 /* ---------- 팔 ---------- */
+async function setRobot(r){
+  // 기종 전환 — 보드가 달라 포트는 비웁니다. 캘리브레이션 파일은 기종별 폴더라 섞이지 않습니다
+  if((CFG.robot||'so101')===r) return;
+  const unsaved=$('savemsg').textContent.indexOf('저장 버튼')>=0;
+  if(!confirm((r==='omx'?'OMX':'SO-ARM101')+' 로 바꿉니다. 지정된 포트는 비웁니다. '+(unsaved?'저장하지 않은 변경은 버려집니다. ':'')+'바로 적용할까요?')) return;
+  let x;
+  try{ x=await (await fetch('/api/wizard/robot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({robot:r})})).json(); }
+  catch(e){ alert('기종 변경 실패: '+e); return; }
+  if(x.error){ alert(x.error); return; }
+  location.reload();
+}
 async function setMode(m){
   // 셋업 마법사와 같은 서버 규칙으로 바로 적용합니다 (id 변경 + 같은 팔 캘리브레이션 파일 복사)
   if(CFG.mode===m) return;
@@ -5732,10 +6031,14 @@ function renderArms(){
   const bi=CFG.mode==='bimanual';
   $('b1').className=bi?'':'primary';
   $('b2').className=bi?'primary':'';
+  const omx=(CFG.robot||'so101')==='omx';
+  $('r_so101').className=omx?'':'primary'; $('r_omx').className=omx?'primary':'';
+  const T=omx?{f:'omx_follower',l:'omx_leader',bf:'bi_omx_follower',bl:'bi_omx_leader'}
+             :{f:'so101_follower',l:'so101_leader',bf:'bi_so_follower',bl:'bi_so_leader'};
   $('modehint').innerHTML = bi
-    ? '양팔 = lerobot <span class=mono>bi_so_follower</span> / <span class=mono>bi_so_leader</span>. '
+    ? '양팔 = lerobot <span class=mono>'+T.bf+'</span> / <span class=mono>'+T.bl+'</span>. '
       +'calib id 는 같은 이름에 _left / _right 를 붙여야 합니다 (lerobot 이 {id}_left 로 파일을 찾습니다).'
-    : '한팔 = lerobot <span class=mono>so101_follower</span> / <span class=mono>so101_leader</span>.';
+    : '한팔 = lerobot <span class=mono>'+T.f+'</span> / <span class=mono>'+T.l+'</span>.';
   const box=$('arms'); box.innerHTML='';
   CFG.arms.forEach(a=>{
     const d=document.createElement('div'); d.className='armcard';
@@ -5953,7 +6256,7 @@ function fillMsPorts(){
 async function msStart(){
   const port=$('msport').value; if(!port){ alert('포트를 고르세요'); return; }
   if(!confirm('모터를 한 개씩만 보드에 연결한 상태여야 합니다. 시작할까요?')) return;
-  const r=await jpost('/api/setup/motors/start',{port:port});
+  const r=await jpost('/api/setup/motors/start',{port:port, role:$('msrole').value});
   if(r.error){ alert(r.error); }
   msRefresh(); if(!mstimer) mstimer=setInterval(msRefresh,1000);
 }
@@ -5994,12 +6297,12 @@ function portTail(p){ if(!p) return '-'; const t=p.split('/').pop(); return t.le
 async function envLoad(){ envPaint(await jget('/api/envs')); }
 function envPaint(d){
   const t=$('envtbl'); if(!t||!d||!d.envs) return;
-  let h='<tr><th>환경</th><th>모드</th><th>팔 — 팔로워 / 리더 포트</th><th>카메라</th><th>수정</th><th></th></tr>';
+  let h='<tr><th>환경</th><th>기종 · 모드</th><th>팔 — 팔로워 / 리더 포트</th><th>카메라</th><th>수정</th><th></th></tr>';
   d.envs.forEach((e,i)=>{
     const arms=e.arms.map(a=>'<span class=mono>'+E(a.side)+'</span> '+E(portTail(a.follower_port))+' / '+E(portTail(a.leader_port))).join('<br>');
     const cams=[].concat.apply([], e.arms.map(a=>a.cameras.map(c=>(e.mode==='bimanual'?a.side+'_':'')+c))).concat(e.cameras);
     h+='<tr><td class=mono>'+E(e.name)+(e.active?' <span class="badge b-ok">사용 중</span>':'')+'</td>'
-      +'<td>'+(e.mode==='bimanual'?'양팔':'한팔')+'</td><td style="font-size:12px">'+arms+'</td>'
+      +'<td>'+(e.robot==='omx'?'OMX':'SO-ARM101')+' · '+(e.mode==='bimanual'?'양팔':'한팔')+'</td><td style="font-size:12px">'+arms+'</td>'
       +'<td class=mono style="font-size:12px">'+E(cams.join(', ')||'-')+'</td><td class=tiny>'+E(e.updated)+'</td>'
       +'<td style="text-align:right;white-space:nowrap" id="envact'+i+'"></td></tr>';
   });
@@ -6346,13 +6649,9 @@ class CalibSession:
             raise RuntimeError(f"{side}/{role} 포트가 지정되지 않았습니다 — Setup 탭에서 먼저 설정하세요")
         self._reset()
         self.side, self.role = side, role
-        if role == "follower":
-            from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
-            dev = SOFollower(SOFollowerRobotConfig(id=arm["follower_id"], port=port,
-                                                   use_degrees=True, cameras={}))
-        else:
-            from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
-            dev = SOLeader(SOLeaderTeleopConfig(id=arm["leader_id"], port=port, use_degrees=True))
+        if kind()["calib"] != "range":
+            raise RuntimeError(f"{kind()['label']} 은 범위 기록 캘리브레이션이 없습니다 — '공장값 쓰기' 를 쓰세요")
+        dev = make_arm(role, arm)
         self.old_calib = dict(dev.calibration) if dev.calibration else None
         # calibrate=True 면 input() 에서 멈춥니다. 팔로워는 Goal=현재 위치로 맞춘 뒤 configure 해서
         # 연결 순간 이전 목표로 튀지 않게 합니다 (connect_follower 참고)
@@ -6547,6 +6846,8 @@ def api_calib_state():
     busy = exclusive_busy() if not CALIB.active else None
     st["busy"] = f"{busy['id']} 실행 중" if busy else ""
     st["ports_configured"] = ports_configured()
+    st["calib_kind"] = kind()["calib"]
+    st["robot_label"] = kind()["label"]
     return st
 
 
@@ -6575,6 +6876,47 @@ async def api_calib_finish():
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, "path": CALIB.saved_path}
+
+
+def factory_calibrate(side, role):
+    """OMX 처럼 범위 기록 없이 공장값을 쓰는 기종의 캘리브레이션.
+    lerobot 장치의 calibrate() 를 그대로 부릅니다 (토크 OFF → Operating_Mode·Drive_Mode → 공장값
+    오프셋 0·범위 0~4095 기록 → 파일 저장). 입력 대기가 없어 웹에서 그대로 돌릴 수 있습니다."""
+    k = kind()
+    if k["calib"] != "factory":
+        raise RuntimeError(f"{k['label']} 은 범위를 기록하는 캘리브레이션을 씁니다")
+    arm = ARM_CFGS[side]
+    if not arm.get(f"{role}_port"):
+        raise RuntimeError("포트가 지정되지 않았습니다")
+    dev = make_arm(role, arm)
+    f = Path(dev.calibration_fpath)
+    try:
+        dev.bus.connect()                 # 핸드셰이크 = 모터 6개 확인
+        failed = torque_off_all(dev.bus)
+        if failed:
+            raise RuntimeError(f"토크 해제 실패: {', '.join(failed)}")
+        if f.exists():
+            shutil.copy2(f, f.with_suffix(".json.bak"))
+        dev.calibrate()
+    finally:
+        close_arm(dev)
+    return str(f)
+
+
+@app.post("/api/calib/factory")
+async def api_calib_factory(req: Request):
+    b = await req.json()
+    side, role = b.get("side"), b.get("role")
+    if side not in ARM_CFGS or role not in ("follower", "leader"):
+        return JSONResponse({"error": "side/role 이 잘못됨"}, status_code=400)
+    busy = exclusive_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 끝난 뒤 하세요"}, status_code=400)
+    try:
+        path = await asyncio.to_thread(factory_calibrate, side, role)
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)
+    return {"ok": True, "path": path}
 
 
 @app.post("/api/calib/cancel")
@@ -6620,6 +6962,9 @@ function renderPicker(s){
   let h='';
   if(!s.ports_configured)
     h+='<p class="badge b-warn">포트가 지정되지 않았습니다 — <a href="/setup">Setup 탭</a>에서 먼저 정하세요</p>';
+  if(s.calib_kind==='factory')
+    h+='<p class=muted>이 기종('+E(s.robot_label)+')은 범위를 기록하지 않고 lerobot 의 공장값(오프셋 0, 범위 0~4095)을 캘리브레이션으로 씁니다. '
+      +'버튼을 누르면 토크를 끄고 운전 모드·회전 방향·공장값을 모터에 쓰고 파일을 저장합니다.</p>';
   h+='<div class=devgrid>';
   Object.keys(s.devices).forEach(side=>{
     ['follower','leader'].forEach(role=>{
@@ -6629,8 +6974,11 @@ function renderPicker(s){
         +'<span class="badge '+(d.ok?'b-ok':'b-bad')+'">'+(d.ok?'캘리브레이션 있음':'없음')+'</span> '
         +'<span class=mono style="font-size:12px">'+E(d.id)+'.json</span>'
         +'<div class=p>'+E(d.path)+'</div>'
-        +'<button class=primary '+(busy||!s.ports_configured?'disabled':'')
-        +' onclick="start(\\''+E(side)+'\\',\\''+role+'\\',this)">'+(d.ok?'다시 캘리브레이션':'캘리브레이션 시작')+'</button>'
+        +(s.calib_kind==='factory'
+          ? '<button class=primary '+(busy||!s.ports_configured?'disabled':'')
+            +' onclick="factory(\\''+E(side)+'\\',\\''+role+'\\',this)">'+(d.ok?'공장값 다시 쓰기':'공장값 쓰기')+'</button>'
+          : '<button class=primary '+(busy||!s.ports_configured?'disabled':'')
+            +' onclick="start(\\''+E(side)+'\\',\\''+role+'\\',this)">'+(d.ok?'다시 캘리브레이션':'캘리브레이션 시작')+'</button>')
         +'</div>';
     });
   });
@@ -6791,6 +7139,15 @@ async function withBusy(el, fn){
     }
   }
 }
+async function factory(side,role,el){
+  if(!confirm(side+' · '+role+': 토크를 끄고 공장값 캘리브레이션을 씁니다'+(role==='follower'?' — 팔로워는 받치세요':'')+'. 계속할까요?')) return;
+  await withBusy(el, async()=>{
+    const r=await jpost('/api/calib/factory',{side:side,role:role});
+    if(r.error) alert(r.error);
+    else if(WIZ.next) location.href=WIZ.next;
+    await refresh();
+  });
+}
 async function start(side,role,el){
   await withBusy(el, async()=>{
     const r=await jpost('/api/calib/start',{side:side,role:role});
@@ -6838,39 +7195,21 @@ def _cam_configs(specs):
 
 
 def make_devices(spec):
-    """spec = 시작 시점의 설정 스냅샷. (robot, teleop, 하위 팔 객체 목록) — 한팔/양팔 분기.
+    """spec = 시작 시점의 설정 스냅샷. (robot, teleop, 하위 팔 객체 목록) — 기종 × 한팔/양팔 분기.
     하위 팔 객체 목록은 캘리브레이션 파일 확인·기록용입니다."""
     arms = {a["side"]: a for a in spec["arms"]}
     mrt = mrt_value(spec.get("max_relative_target"))
+    k = kind(spec)                       # spec 의 robot (예전 spec 에는 없음 → so101)
     if spec["mode"] == "bimanual":
-        from lerobot.robots.bi_so_follower import BiSOFollower, BiSOFollowerConfig
-        from lerobot.robots.so_follower import SOFollowerConfig
-        from lerobot.teleoperators.bi_so_leader import BiSOLeader, BiSOLeaderConfig
-        from lerobot.teleoperators.so_leader import SOLeaderConfig
-        L, R = arms["left"], arms["right"]
-        robot = BiSOFollower(BiSOFollowerConfig(
-            id=bimanual_base_id("follower", arms),
-            left_arm_config=SOFollowerConfig(port=L["follower_port"], max_relative_target=mrt,
-                                             cameras=_cam_configs(L["cameras"])),
-            right_arm_config=SOFollowerConfig(port=R["follower_port"], max_relative_target=mrt,
-                                              cameras=_cam_configs(R["cameras"])),
-            cameras=_cam_configs(spec["cameras"])))
-        teleop = BiSOLeader(BiSOLeaderConfig(
-            id=bimanual_base_id("leader", arms),
-            left_arm_config=SOLeaderConfig(port=L["leader_port"]),
-            right_arm_config=SOLeaderConfig(port=R["leader_port"])))
+        robot = make_bi("follower", arms, k=k, mrt=mrt, cameras=_cam_configs(spec["cameras"]))
+        teleop = make_bi("leader", arms, k=k)
         subs = [robot.left_arm, robot.right_arm, teleop.left_arm, teleop.right_arm]
     else:
-        from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
-        from lerobot.teleoperators.so_leader import SOLeader, SOLeaderTeleopConfig
         arm = spec["arms"][0]
         cams = dict(arm["cameras"])
         cams.update(spec["cameras"])
-        robot = SOFollower(SOFollowerRobotConfig(id=arm["follower_id"], port=arm["follower_port"],
-                                                 use_degrees=True, max_relative_target=mrt,
-                                                 cameras=_cam_configs(cams)))
-        teleop = SOLeader(SOLeaderTeleopConfig(id=arm["leader_id"], port=arm["leader_port"],
-                                               use_degrees=True))
+        robot = make_arm("follower", arm, k=k, mrt=mrt, cameras=_cam_configs(cams))
+        teleop = make_arm("leader", arm, k=k)
         subs = [robot, teleop]
     return robot, teleop, subs
 
@@ -7154,7 +7493,7 @@ def worker_record(jid):
                 close_arm(d)
         if teleop is not None:
             for d in ([teleop.left_arm, teleop.right_arm] if hasattr(teleop, "left_arm") else [teleop]):
-                close_arm(d, disable_torque=False)
+                close_arm(d, disable_torque=kind(spec)["leader_torque"])   # OMX 리더는 그리퍼 토크를 끔
         if preview is not None:
             preview.stop()
         put(phase="finalizing", t0=None)

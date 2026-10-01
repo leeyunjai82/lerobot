@@ -1,0 +1,249 @@
+# LRWEB 개발 문서
+
+사용법은 [README](../README.md) 에 있습니다. 이 문서는 구조와 "왜 이렇게 했는지" 를 적습니다.
+
+- [파일 구성](#파일-구성)
+- [기종 (SO-ARM101 / OMX)](#기종-so-arm101--omx)
+- [설정 파일 `lrweb_config.json`](#설정-파일-lrweb_configjson)
+- [포트 지정 — by-id / by-path](#포트-지정--by-id--by-path)
+- [셋업 마법사 내부](#셋업-마법사-내부)
+- [캘리브레이션 (SO-ARM101)](#캘리브레이션-so-arm101)
+- [연결·토크 순서](#연결토크-순서)
+- [추종 오차 감시](#추종-오차-감시)
+- [수집 worker](#수집-worker)
+- [팔 불량 점검 판정 근거](#팔-불량-점검-판정-근거)
+- [보안·동시성](#보안동시성)
+- [lerobot 버전·설치](#lerobot-버전설치)
+- [테스트](#테스트)
+
+## 파일 구성
+
+| 파일 | 설명 |
+|---|---|
+| `lrweb.py` | 웹 툴 전체 (FastAPI 한 파일, port 8080). `python lrweb.py --worker record <jid>` 로 수집 worker 도 겸함 |
+| `tools_armcheck.py` | SO-ARM101(STS3215) 팔 점검 — Setup 탭·마법사 진단과 CLI 공용 |
+| `tools_dxlcheck.py` | OMX(Dynamixel X) 팔 점검 — 같은 함수 이름·결과 형식 |
+| `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
+| `plugins/lerobot_robot_bi_omx/` | 양팔 OMX 팔로워 `bi_omx_follower` (lerobot 플러그인) |
+| `plugins/lerobot_teleoperator_bi_omx/` | 양팔 OMX 리더 `bi_omx_leader` |
+| `urdf/` | 3D 용 URDF·STL — SO-101 (TheRobotStudio), OMX-F (ROBOTIS) |
+| `lerobot_conda.sh` | 새 기기 설치 스크립트 |
+| `activate.sh` | conda 활성화 + `HF_HOME` + 작업 폴더 이동 (`lerobot_conda.sh` 가 생성) |
+
+실행하면 `~/project/lerobot/` 아래에 생기는 파일 (전부 `.gitignore`):
+
+| 파일 | 설명 |
+|---|---|
+| `lrweb_config.json` | 사용 중인 환경의 설정 |
+| `lrweb_envs/<이름>.json` | 이름 붙은 환경들 — 전환하면 `lrweb_config.json` 으로 복사 |
+| `lrweb_projects.json` | 프로젝트 (태스크·기준 환경·데이터셋·모델) |
+| `lrweb_dsmeta.json` | 데이터셋별 수집 환경·생성 시각 |
+| `lrweb_wizard.json` | 마법사의 팔별 '확인 완료' 기록 (환경별) |
+| `lrweb_jobs/` | 백그라운드 작업 기록·로그 |
+| `lrweb_marks.json` | 불량 에피소드 표시 |
+
+## 기종 (SO-ARM101 / OMX)
+
+기종마다 다른 것은 `lrweb.py` 의 `ROBOT_KINDS` 표 한 곳에 있습니다. 나머지 코드는 `kind()` 로 꺼내 씁니다.
+한팔/양팔(`mode`)과는 독립입니다.
+
+| 항목 | SO-ARM101 | OMX |
+|---|---|---|
+| lerobot 클래스 | `SOFollower` / `SOLeader`, `BiSOFollower` / `BiSOLeader` | `OmxFollower` / `OmxLeader`, `BiOmxFollower` / `BiOmxLeader` (플러그인) |
+| CLI type | `so101_follower`, `bi_so_follower` … | `omx_follower`, `bi_omx_follower` … |
+| 버스 | `FeetechMotorsBus` (STS3215, ID 1~6) | `DynamixelMotorsBus` (팔로워 ID 11~16 XL430/XL330, 리더 ID 1~6 XL330) |
+| 관절 단위 | ° (`use_degrees=True`), 그리퍼 0~100 | -100~100 (`use_degrees=False`), 그리퍼 0~100 |
+| 캘리브레이션 | 범위를 손으로 기록 | lerobot 공장값 (오프셋 0, 범위 0~4095) |
+| `Homing_Offset` 부호 | `Present = Actual − Homing` | `Present = Actual + Homing` |
+| 리더 토크 | 없음 | 그리퍼만 (전류 제어, 손가락 트리거) |
+| 캘리브레이션 폴더 | `robots/so_follower`, `teleoperators/so_leader` | `robots/omx_follower`, `teleoperators/omx_leader` |
+
+- 장치 객체는 `make_arm(role, arm_cfg)` / `make_bi(role, arms)` 로만 만듭니다. 버스만 필요한 곳(포트 감시·모터 ID
+  세팅·확인 단계)은 `make_bus(role, port)` — lerobot 장치가 만드는 버스를 그대로 써서 모터 ID·모델·정규화가 같아집니다.
+- **OMX 단위**: `omx_leader` 에는 `use_degrees` 가 없고 항상 -100~100 입니다. 팔로워를 °로 두면 리더 값을 그대로 못 따라가서
+  팔로워도 -100~100 으로 맞춥니다. 공장값 범위 0~4095 전체가 -100~100 이라 1 단위 ≈ 1.8° 입니다. Control 의 이동 속도 상한,
+  데드밴드, 추종 오차 기준은 ° 로 정의돼 있어 `deg_per_unit` 으로 나눠 씁니다. `max_relative_target` 도 이 단위입니다.
+- **양팔 OMX 플러그인**: lerobot(`e40b58a`, 2026-09 main 까지)에 양팔 OMX 가 없습니다. lerobot 의 `BimanualMixin` 과
+  서드파티 플러그인 규칙(설치된 패키지 이름이 `lerobot_robot_*` / `lerobot_teleoperator_*` 이면
+  `register_third_party_plugins()` 가 import)을 써서 `bi_so_follower` 와 같은 구조로 만들었습니다.
+  팔별 id `{id}_left` / `{id}_right`, 키 접두사 `left_` / `right_`, 공용 카메라는 접두사 없음 — SO 양팔과 같습니다.
+  lrweb 은 설치가 안 돼 있어도 `plugins/` 를 직접 읽지만, lerobot CLI(롤아웃)는 설치된 패키지만 찾으므로
+  롤아웃 시작 때 설치 여부를 확인합니다.
+- **OMX 3D**: ROBOTIS `open_manipulator` 의 `omx_f.urdf`(수정 없음). 관절 이름 `joint1~5`, `gripper_joint_1`(2 는 mimic)로
+  매핑하고 -100~100 → ±π rad 로 바꿉니다. URDF 의 0 rad 가 엔코더 2048 이라고 가정했고, 그리퍼 0~100 → 0~0.9 rad 는
+  URDF 에 범위가 없어서 추정값입니다 (`kind3d()` 에서 조정). 서보 메시가 따로 없어 모터 색 표시는 SO-ARM101 만 됩니다.
+- 데이터셋 `robot_type` 은 기종·모드별로 달라서(`so_follower` / `bi_so_follower` / `omx_follower` / `bi_omx_follower`)
+  기종이 다른 데이터셋은 이어받기·추론이 막힙니다. 리뷰 화면 3D 는 데이터셋을 찍은 기종으로 그립니다.
+
+## 설정 파일 `lrweb_config.json`
+
+```json
+{
+  "robot": "so101",
+  "mode": "bimanual",
+  "fps": 30,
+  "default_task": "Pick up the block and place it in the box",
+  "max_relative_target": null,
+  "arms": [
+    { "side": "left",
+      "follower_port": "/dev/serial/by-id/usb-...", "follower_id": "follower_left",
+      "leader_port":   "/dev/serial/by-id/usb-...", "leader_id":   "leader_left",
+      "cameras": { "wrist": { "index_or_path": "/dev/v4l/by-id/usb-...-video-index0", "width": 640, "height": 480, "fps": 30 } },
+      "view": { "x": 0.0, "y": 0.12, "yaw_deg": 0.0 } },
+    { "side": "right", "...": "..." }
+  ],
+  "cameras": { "top": { "index_or_path": "/dev/v4l/by-id/usb-...", "width": 640, "height": 480, "fps": 30 } }
+}
+```
+
+- `robot` — `so101` | `omx`. 없으면 `so101` (예전 파일 호환)
+- `mode` 가 1차 기준. `single` 이면 `arms` 1개(`side: "main"`), `bimanual` 이면 `left`/`right`. 안 맞으면 로드 때 맞춥니다
+- `follower_id` / `leader_id` → 캘리브레이션 파일 이름. 양팔은 `X_left` / `X_right` 형식이어야 합니다
+  (lerobot 양팔 클래스가 `{id}_left.json` 으로 찾음)
+- 양팔에서 팔 카메라 키는 `left_wrist` 처럼 접두사가 붙고, 최상위 `cameras` 는 그대로입니다.
+  공용 카메라 이름이 팔 카메라 원래 이름과 같으면 lerobot 이 거부하므로 저장 때 막습니다
+- `max_relative_target` — lerobot 상대 이동 제한. Control·수집·롤아웃 공통. 켜면 `send_action` 마다 위치를 한 번 더 읽습니다
+- `arms[].view` — 3D 화면 배치 전용 (제어·데이터와 무관)
+
+## 포트 지정 — by-id / by-path
+
+같은 보드 여러 개는 전기적으로 구분이 안 되고, `/dev/ttyACM*` 순서는 재부팅마다 바뀝니다.
+보드에 USB 시리얼 번호가 있으면 `/dev/serial/by-id/…`(보드를 따라감), 없으면 `/dev/serial/by-path/…`(꽂은 USB 구멍을 따라감)를
+자동으로 고릅니다. Seeed SO-ARM101 Pro 의 보드(`1a86:55d3`)는 시리얼 번호가 있어 by-id 가 잡힙니다.
+
+리더/팔로워는 *포트 감시* 로 구분합니다 — 모든 포트를 토크 OFF 로 열고 엔코더를 읽어, 손으로 움직인 팔의 포트를 찾습니다.
+OMX 는 리더(ID 1~6)·팔로워(ID 11~16) 모터 구성이 달라서 두 구성을 차례로 시험합니다.
+
+## 셋업 마법사 내부
+
+physical-ai-studio 의 SO101 셋업 흐름(전압 → 모터 확인 → EEPROM 캘리브레이션 → 캘리브레이션 → 확인)을 따릅니다.
+모터를 구동하는 단계는 없습니다.
+
+| 단계 | 서보에 쓰는 것 |
+|---|---|
+| 포트 찾기 | 포트 감시 중 `Torque_Enable=0` |
+| 진단 | 없음 (모터 ID 세팅 때만 ID·보드레이트) |
+| 캘리브레이션 (SO) | 시작 때 `Homing_Offset=0`·위치 제한 해제, 저장 때 `Homing_Offset`·`Min/Max_Position_Limit`. 가져오기는 읽기만 |
+| 캘리브레이션 (OMX) | lerobot `calibrate()` — `Operating_Mode`, `Drive_Mode`, 공장값 오프셋·범위 |
+| 확인 | 없음 ('토크 끄기' 때만 `Torque_Enable=0`) |
+
+- **보드에서 가져오기 (SO)**: lerobot 은 캘리브레이션을 파일과 모터 EEPROM 양쪽에 씁니다. 다른 PC 에서 캘리브레이션한 팔은
+  EEPROM 만 읽어 파일을 다시 만듭니다 (`read_calibration` 과 같은 값). 공장값이거나 일부만 캘리브레이션돼 있으면 거부.
+- **확인 단계 보정**: EEPROM 의 `Homing_Offset` 이 파일과 다르면, 연결 때 lerobot 이 파일 값을 써 넣은 뒤의 값으로 보여 줍니다
+  (Feetech `+ (EEPROM − 파일)`, Dynamixel `+ (파일 − EEPROM)`).
+- **한팔 ↔ 양팔 전환**: 한팔의 팔이 `left` 가 되고 id 가 `follower` → `follower_left`. 같은 팔이 쓰던 캘리브레이션 파일을
+  새 id 로 복사하고 '확인됨' 기록도 옮깁니다 (대상에 다른 파일이 있으면 `.json.bak`).
+- **기종 전환**: 보드가 다르니 포트를 비웁니다. 캘리브레이션 파일은 기종별 폴더라 섞이지 않습니다.
+
+## 캘리브레이션 (SO-ARM101)
+
+`lerobot-calibrate` 와 같은 결과를 만들지만 **중앙 자세 단계가 없습니다.** STS3215 는 단일 회전 절대 엔코더라,
+CLI 처럼 "중앙에 놓고 Enter" 로 잡은 자세가 실제 중앙에서 벗어나 있으면 반대쪽 끝에서 `4095 → 0` 으로 넘어가 범위가 망가집니다.
+그래서 순서를 바꿨습니다:
+
+1. `reset_calibration()` — `Homing_Offset=0`, 읽는 값이 원시 엔코더값
+2. 쓸면서 연속 표본 차이로 언랩 (±2048 넘는 점프를 ∓4096 보정) → 진짜 min/max
+3. 저장 때 `homing_offset = 중심 − 2047`, `range = 2047 ± span/2` (오프셋이 −2048 이면 2047 로 바꾸고 범위를 +1 — 부호-크기 11비트 한계)
+
+- `wrist_roll` 은 범위를 재지 않고 0~4095. 저장하는 순간의 자세가 0° — 리더·팔로워를 같은 방향으로 두고 저장
+- 취소하면 바뀐 EEPROM 을 이전 값으로 되돌립니다
+
+## 연결·토크 순서
+
+**토크 ON 전에 목표부터.** STS3215 / Dynamixel 의 `Goal_Position` 은 RAM 에 이전 값이 남아 있어, 토크만 켜면 그 목표로 튑니다.
+`set_torque(True)` 는 현재 위치 → `Goal_Position` → `Torque_Enable=1` 순서이고, 한 모터라도 실패하면 전부 다시 끕니다.
+
+**연결도 같은 문제** — lerobot `connect()` 는 `configure()` 를 `with bus.torque_disabled():` 안에서 돌리고 빠져나올 때
+토크를 켭니다. 그래서 lrweb 은 팔로워를 `connect_follower()` 로 연결합니다 (Control·수집·Calib, 양팔은 팔마다):
+
+1. `bus.connect()` → 모든 모터 `Torque_Enable=0` (Feetech 는 `Lock=0` 도)
+2. 파일과 보드가 다르면 **토크가 꺼진 상태에서** `write_calibration`
+3. `Goal_Position = Present_Position`
+4. 카메라 → `configure()` (토크가 켜짐 — lerobot 과 같은 최종 상태)
+
+lerobot `bus.connect()` 는 모터 확인 실패 때 포트를 연 채로 예외를 내서, 실패하면 `close_arm()` 이 포트·카메라를 닫습니다.
+
+**토크 해제는 모터마다 끝까지.** lerobot `bus.write` 는 에러 비트(과부하 등)만 있어도 예외를 내서, `disable_torque()` 는
+멈춘 모터 하나에서 끝나고 나머지(양팔이면 다른 팔 전체)에 토크가 남습니다. E-STOP·해제·토크 끄기는 모터마다 따로 쓰고
+통신 성공만 봅니다. E-STOP 은 팔로워부터 끕니다.
+
+## 추종 오차 감시
+
+Control 의 명령 적분기는 목표 도달 후 쓰기를 멈추는데, 서보가 명령을 놓치면(막힘·보호·유실) 영원히 어긋납니다.
+
+- 실측과 명령 차이가 `TRACK_WARN_DEG`(6°)를 넘으면 그 관절을 빨갛게 표시
+- 도달 후에도 `GOAL_REFRESH_S`(1초)마다 같은 목표를 다시 씀
+- 1초마다 온도·`Torque_Enable`·부하(OMX 는 `Present_Current`)를 읽어 원인을 가립니다
+
+| Torque_Enable | 부하 | 판정 |
+|---|---|---|
+| 0 | — | 서보가 보호로 토크를 뺌 — 토크 껐다 켜기, 안 되면 전원 재투입 |
+| 1 | 큼 | 기계적으로 막혀 버티는 중 (과열 위험) |
+| 1 | ~0 | 명령을 안 받음 (배선·ID·펌웨어) |
+
+## 수집 worker
+
+`lerobot-record` 는 터미널 키보드로 조작하는데, PTY 로 키를 넣으면 X11 세션에서 pynput 이 가로채 버려집니다.
+그래서 `python lrweb.py --worker record <jid>` 가 lerobot `record_loop()` 를 직접 부르고, 웹 버튼이 `events` 를 바꿉니다.
+데이터셋 생성·인코딩·저장 흐름과 인코더 기본값은 `lerobot_record.record()` / `DatasetRecordConfig` 와 같습니다.
+
+worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/lrweb/<jid>/`): `status.json`(상태), `cam_<name>.jpg`(미리보기), `cmd`(s/n/r/q).
+그래서 lrweb 를 재시작해도 진행 중인 수집에 다시 붙습니다.
+
+- **대기(ready)** 는 `record_loop(dataset=None)` — 기록 없이 리더만 따라갑니다. 녹화는 `s` 를 눌렀을 때만
+- 단계에 맞지 않는 키는 무시 (`s` 는 대기에서만, `n`/`r` 은 녹화 중에만)
+- 프레임 0개 에피소드는 저장하지 않음
+- 끝낼 때 팔부터 놓고(팔마다 토크 해제·포트 닫기) 데이터셋을 마무리
+- 양팔 이미지 기록 스레드 수는 관측 키로 셉니다 (`robot.cameras` 는 `wrist` 이름이 겹쳐 적게 셈)
+- 일시정지는 지원하지 않습니다 — v3.0 은 등간격 타임스탬프 전제
+- 대기 중 2초마다 루프를 끊고 온도를 읽습니다 (반이중 버스라 녹화 루프와 동시에 읽으면 안 됨)
+
+## 팔 불량 점검 판정 근거
+
+**SO-ARM101 (`tools_armcheck.py`)**
+
+| 값 | 출처 |
+|---|---|
+| 보호 비트 1 전압 · 2 각도센서 · 4 과열 · 8 과전류 · 32 과부하 | Feetech SDK `ERRBIT_*` |
+| 전압 `Present_Voltage / 10`, 5V 계통 4.5~5.5 V / 12V 계통 10.5~13.5 V (7.0 V 미만이면 5V) | [Seeed_RoboController](https://github.com/Seeed-Projects/Seeed_RoboController) |
+| 온도 60 °C 주의, 70 °C 서보 차단, Status 레지스터(65) | 같은 저장소 |
+| 엔코더 흔들림 3/10 tick, 튐 400 tick, 쓸기 최소 범위, 온도 편차 8 °C | 경험값 |
+
+**OMX (`tools_dxlcheck.py`)**
+
+| 값 | 출처 |
+|---|---|
+| 모터 ID·모델 (1060 XL430-W250, 1200 XL330-M288, 1190 XL330-M077) | lerobot `omx_follower`/`omx_leader`, `dynamixel/tables.py` |
+| `Hardware_Error_Status`(70) bit0 입력 전압 · bit2 과열 · bit3 모터 엔코더 · bit4 전기 충격 · bit5 과부하 | ROBOTIS DYNAMIXEL X e-Manual |
+| 응답 Error 바이트 bit7 = Alert | ROBOTIS Protocol 2.0 |
+| 전압은 표시만 (판정 안 함) | — |
+
+모터를 구동하는 시험은 없습니다 (Seeed `servo_register_diag.py --move` 는 조립된 팔에 쓰면 안 됩니다 — 목표 없이 토크를 켜고
+절대 위치로 보냄).
+
+## 보안·동시성
+
+- 인증 기본 꺼짐 (`LRWEB_TOKEN` / `LRWEB_AUTH=on` 으로 켬)
+- 다른 사이트에서 온 POST·WebSocket 은 403 (`Sec-Fetch-Site: cross-site` 또는 `Origin` 호스트 불일치) — CSRF 방지
+- 팔·GPU 를 잡는 시작 요청(`/api/record`, `/api/calib/start` …)은 한 번에 하나씩 처리 (두 번 누름 경쟁 방지)
+- record/rollout/train/Control/Setup 세션은 서로 배타 (학습 + Control 은 동시 허용)
+- 데이터셋 사용 중 판정은 작업 spec·CLI 인자를 정확히 비교 (녹화 중 삭제 방지)
+- JSON 파일은 임시 파일 + `os.replace` 로 원자적으로 씀
+- 작업 PID 재사용 방지 (`/proc/<pid>/stat` starttime 비교)
+
+## lerobot 버전·설치
+
+- lerobot commit `e40b58a8dfa9e7b86918c374791599d070518d11` 에 맞춰져 있습니다 (`lerobot_conda.sh` 의 `LEROBOT_COMMIT`)
+- `pip install -e "lerobot-src[feetech,dynamixel,training]"`, 그다음 `torchcodec` 제거 + `av>=15,<16` (pyav 디코딩)
+- 양팔 OMX: `pip install --no-deps -e plugins/lerobot_robot_bi_omx -e plugins/lerobot_teleoperator_bi_omx`
+- Python 3.12, torch 2.9 cu130 (Thor 는 `https://pypi.jetson-ai-lab.io/sbsa/cu130`)
+
+## 테스트
+
+하드웨어 없이 다음으로 검증했습니다 (스크립트는 레포에 넣지 않았습니다):
+
+- STS3215 / Dynamixel X(Protocol 2.0) **PTY 에뮬레이터** + 실제 lerobot 버스 — 진단, 캘리브레이션(범위·공장값·가져오기),
+  확인 단계, Control 연결 순서·E-STOP·과부하 모터, 포트 감시, 모터 ID 세팅, 양팔 OMX 플러그인
+- lerobot API 스텁 — Collect 상태 기계, 양팔 녹화 worker, 강제 종료, 환경·프로젝트
+- 헤드리스 Chromium — SO 한팔·양팔, OMX 한팔·양팔 네 구성에서 전 페이지 JS 오류 0
+- `tools_jscheck.py` — 인라인 JS 문법

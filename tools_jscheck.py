@@ -72,7 +72,7 @@ def main():
                     continue
                 if js.startswith("{"):          # importmap
                     continue
-                chk.write_text("const JID='x', DS='x', URDF_OK=false, VIEWS_CFG={};\n" + js)
+                chk.write_text("const JID='x', DS='x', URDF_OK=false, VIEWS_CFG={}, K3=null;\n" + js)
                 r = subprocess.run([node, "--check", str(chk)], capture_output=True, text=True)
                 if r.returncode:
                     bad += 1
