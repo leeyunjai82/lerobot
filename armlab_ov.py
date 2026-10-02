@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""lrweb OpenVINO 모듈 — ACT 체크포인트를 OpenVINO IR 로 변환·검증하고,
+"""armlab OpenVINO 모듈 — ACT 체크포인트를 OpenVINO IR 로 변환·검증하고,
 lerobot rollout 의 신경망 호출만 OpenVINO(NPU/GPU/CPU)로 바꿔 실행합니다.
 
-  python lrweb_ov.py devices
-  python lrweb_ov.py convert <.../pretrained_model> [--int8] [--fps 30]     (--ckpt=<경로> 도 가능)
-  python lrweb_ov.py rollout --ov.dir=<.../pretrained_model/openvino> --ov.device=NPU [--ov.precision=fp16]
+  python armlab_ov.py devices
+  python armlab_ov.py convert <.../pretrained_model> [--int8] [--fps 30]     (--ckpt=<경로> 도 가능)
+  python armlab_ov.py rollout --ov.dir=<.../pretrained_model/openvino> --ov.device=NPU [--ov.precision=fp16]
                              <lerobot-rollout 인자 그대로...>
 
 설계
@@ -40,7 +40,7 @@ N_CALIB = 64            # INT8 보정 샘플 수
 # 정규화 공간(평균 0, 표준편차 1) 기준 최대 오차 허용치 — 넘으면 "주의"
 TOL = {"fp16": 0.05, "int8": 0.25}
 
-log = logging.getLogger("lrweb_ov")
+log = logging.getLogger("armlab_ov")
 
 
 def say(*a):
@@ -70,7 +70,7 @@ def load_meta(ck):
 
 
 def status(ck):
-    """lrweb 화면용 요약: none | stale | ok (+ meta)"""
+    """arm-lab 화면용 요약: none | stale | ok (+ meta)"""
     meta = load_meta(ck)
     if not meta:
         return {"state": "none"}
@@ -191,9 +191,9 @@ def dataset_batches(ck, pre, spec, n):
         ds = tc.get("dataset") or {}
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         # 학습 기기의 절대경로가 그대로 적혀 있습니다. 다른 기기로 체크포인트를 옮겼으면
-        # 이 기기의 lrweb 데이터 폴더(같은 이름)에서 찾습니다.
+        # 이 기기의 arm-lab 데이터 폴더(같은 이름)에서 찾습니다.
         name = ds["repo_id"].split("/", 1)[-1]
-        roots = [ds.get("root"), Path.home() / "project/lerobot/data/hf/lerobot/local" / name]
+        roots = [ds.get("root"), Path(os.environ.get("ARMLAB_HOME") or Path(__file__).resolve().parent) / "data/hf/lerobot/local" / name]
         root = next((r for r in roots if r and (Path(r) / "meta/info.json").is_file()), None)
         if root is None:
             raise FileNotFoundError(f"데이터셋 '{name}' 없음 (찾은 곳: {', '.join(str(r) for r in roots if r)})")
@@ -488,9 +488,9 @@ def prepare_rollout(opts, rest):
 
 
 def cmd_rollout(argv):
-    """예전 호출 형태 호환 — lrweb_rollout.py 로 넘깁니다 (OV 엔진, 모니터 없음 / --lrweb.run_dir 있으면 모니터)."""
-    import lrweb_rollout
-    return lrweb_rollout.main(["--lrweb.engine=ov"] + list(argv))
+    """예전 호출 형태 호환 — armlab_rollout.py 로 넘깁니다 (OV 엔진, 모니터 없음 / --armlab.run_dir 있으면 모니터)."""
+    import armlab_rollout
+    return armlab_rollout.main(["--armlab.engine=ov"] + list(argv))
 
 
 def main(argv=None):
@@ -507,9 +507,9 @@ def main(argv=None):
         return 0
     if cmd == "convert":
         import argparse
-        ap = argparse.ArgumentParser(prog="lrweb_ov.py convert")
+        ap = argparse.ArgumentParser(prog="armlab_ov.py convert")
         ap.add_argument("ckpt", nargs="?")
-        ap.add_argument("--ckpt", dest="ckpt_opt", help="위치 인자 대신 (lrweb 가 이 형태로 넘깁니다)")
+        ap.add_argument("--ckpt", dest="ckpt_opt", help="위치 인자 대신 (arm-lab 이 이 형태로 넘깁니다)")
         ap.add_argument("--int8", action="store_true")
         ap.add_argument("--fps", type=float, default=30)
         a = ap.parse_args(args)

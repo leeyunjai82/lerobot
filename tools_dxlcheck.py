@@ -4,7 +4,7 @@
     python tools_dxlcheck.py --port /dev/serial/by-id/usb-... --role follower
     python tools_dxlcheck.py --port ... --role leader --json
 
-lrweb 의 Setup 탭 '팔 불량 점검'·셋업 마법사 '진단' 이 OMX 일 때 이 모듈을 씁니다.
+arm-lab 의 Setup 탭 '팔 불량 점검'·셋업 마법사 '진단' 이 OMX 일 때 이 모듈을 씁니다.
 함수 이름·결과 형식은 tools_armcheck(SO-ARM101, STS3215)와 같습니다.
 
 종료 코드: 0 정상 / 1 주의 / 2 불량 의심 / 3 실행 실패
@@ -12,7 +12,7 @@ lrweb 의 Setup 탭 '팔 불량 점검'·셋업 마법사 '진단' 이 OMX 일 �
 점검 항목 (서보에 아무것도 쓰지 않습니다. 토크도 안 건드립니다)
   모터 ID 응답 · 모델 번호 · Hardware_Error_Status · 응답 Alert 비트 · 온도 ·
   정지 상태 엔코더 흔들림 · 통신 누락. 전압은 표시만 하고 판정하지 않습니다.
-  --sweep (lrweb 에서만) 은 Torque_Enable=0 만 씁니다.
+  --sweep (arm-lab 에서만) 은 Torque_Enable=0 만 씁니다.
 
 판정 근거
   [lerobot] robots/omx_follower, teleoperators/omx_leader — 모터 ID·모델

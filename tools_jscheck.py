@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""lrweb 의 모든 페이지에서 인라인 <script> 를 뽑아 node --check 로 파싱 검증.
+"""arm-lab 의 모든 페이지에서 인라인 <script> 를 뽑아 node --check 로 파싱 검증.
 
 Python 문자열 안에 JS 가 들어 있어 따옴표·역슬래시 escape 가 한 번 더 벗겨질 수 있습니다.
 파이썬이 평가한 뒤의 JS 를 검사하므로 그런 문제를 그대로 잡습니다.
@@ -26,7 +26,7 @@ def main():
         print("node 를 찾을 수 없습니다 — NODE=/path/to/node 로 지정하세요", file=sys.stderr)
         return 2
     try:
-        import lrweb
+        import main as armlab
         from fastapi.testclient import TestClient
     except ImportError as e:
         print(f"의존성 없음: {e}", file=sys.stderr)
@@ -34,13 +34,13 @@ def main():
 
     # 포트가 비어 있으면 Control 탭이 '포트 미설정' 안내만 그려서 정작 검사해야 할
     # 모듈 스크립트가 빠집니다. 메모리상으로만 더미 포트를 넣어 전체 페이지를 렌더합니다.
-    if not lrweb.ports_configured():
-        for i, arm in enumerate(lrweb.ARM_CFGS.values()):
+    if not armlab.ports_configured():
+        for i, arm in enumerate(armlab.ARM_CFGS.values()):
             arm["follower_port"] = f"/dev/null_f{i}"
             arm["leader_port"] = f"/dev/null_l{i}"
         print("  (포트 미설정 → 더미 포트 주입, 전체 페이지 렌더)")
 
-    client = TestClient(lrweb.app)
+    client = TestClient(armlab.app)
     bad = 0
     seen = {}
     with tempfile.TemporaryDirectory() as tmp:
@@ -65,9 +65,9 @@ def main():
         # 진행 중 작업이 있을 때만 그려지는 블록은 페이지 요청으로는 안 나옵니다.
         # 모듈 문자열을 직접 검사합니다.
         # 롤아웃 실행 화면은 조립 함수로 만들어지므로 같은 방식으로 감싸 검사합니다
-        ro_run = "<script>" + lrweb.ARM3D_JS + lrweb.ROLLOUT_RUN_JS + "</script>"
+        ro_run = "<script>" + armlab.ARM3D_JS + armlab.ROLLOUT_RUN_JS + "</script>"
         for name in ("COLLECT_RUN_HTML", "REVIEW_HTML", "WIZARD_HTML", "ROLLOUT_RUN"):
-            blk = ro_run if name == "ROLLOUT_RUN" else getattr(lrweb, name, "")
+            blk = ro_run if name == "ROLLOUT_RUN" else getattr(armlab, name, "")
             for i, js in enumerate(re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", blk, re.S)):
                 js = js.strip()
                 if not js:

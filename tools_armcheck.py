@@ -6,7 +6,7 @@
     python tools_armcheck.py --port ... --role leader --sweep # + 손으로 관절 쓸기 (엔코더)
     python tools_armcheck.py --port ... --json                # 결과를 JSON 으로
 
-lrweb 의 Setup 탭 '팔 불량 점검' 도 이 모듈을 그대로 씁니다.
+arm-lab 의 Setup 탭 '팔 불량 점검' 도 이 모듈을 그대로 씁니다.
 
 종료 코드: 0 정상 / 1 주의 / 2 불량 의심 / 3 실행 실패 — 여러 대를 연달아 검사할 때 씁니다.
 
@@ -308,7 +308,7 @@ def finalize(rep):
 
 # --------------------------------------------------------------------------- 쓸기
 class SweepTracker:
-    """손으로 쓸 때의 위치 표본을 관절별로 누적합니다. CLI 와 lrweb 가 같이 씁니다."""
+    """손으로 쓸 때의 위치 표본을 관절별로 누적합니다. CLI 와 arm-lab 이 같이 씁니다."""
 
     def __init__(self, joints, jump_ticks=JUMP_TICKS):
         self.jump = jump_ticks
@@ -458,7 +458,7 @@ def main(argv=None):
         io = BusIO(port)
     except Exception as e:
         print(f"포트를 열 수 없습니다: {port}\n  {type(e).__name__}: {e}\n"
-              "  lrweb 의 Control / Collect / Setup 포트 감시가 잡고 있으면 먼저 끄세요.", file=sys.stderr)
+              "  arm-lab 의 Control / Collect / Setup 포트 감시가 잡고 있으면 먼저 끄세요.", file=sys.stderr)
         return 3
     try:
         if not a.json:

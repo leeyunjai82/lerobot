@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  lrweb.py — LeRobot SO-101 통합 웹 툴 (단일 파일 FastAPI)
+#  main.py — armlab: LeRobot 로봇팔(SO-ARM101 / OMX) 통합 웹 툴 (단일 파일 FastAPI)
 #
-#  Datasets / Collect / Training / Rollout / Control / Calib / Setup / Jobs 를
-#  명령어 없이 웹에서 처리합니다. 한팔(so_follower) · 양팔(bi_so_follower) 지원.
+#  Projects / Datasets / Collect / Training / Models / Rollout / Hub / Control / Calib / Setup / Jobs 를
+#  명령어 없이 웹에서 처리합니다. 한팔 · 양팔 지원.
 #
 #  - 팔·카메라는 lerobot 객체(SOFollower / SOLeader / OpenCVCamera)로 다룹니다.
 #  - 수집은 이 파일을 --worker 로 띄워 lerobot record_loop() 를 직접 부릅니다.
-#    상태·미리보기·명령은 전부 파일(RUN_DIR)이라 lrweb 를 재시작해도 세션이 유지됩니다.
+#    상태·미리보기·명령은 전부 파일(RUN_DIR)이라 arm-lab 을 재시작해도 세션이 유지됩니다.
 #  - 외부 프로세스는 argv 리스트 + shell=False 로만 실행합니다.
-#  - 설정은 lrweb_config.json (Setup 탭에서 채움). 자세한 것은 README.
+#  - 설정은 armlab_config.json (Setup 탭에서 채움). 자세한 것은 README.
 #
-#  실행 (lerobot conda env 안에서)
-#   source ~/project/lerobot/activate.sh
-#   nohup python lrweb.py > lrweb.log 2>&1 &
-#   → http://<host>:8080  (기본 인증 없음. LRWEB_TOKEN / LRWEB_AUTH=on 으로 켤 수 있음)
+#  실행 (arm-lab conda env 안에서)
+#   source ~/project/arm-lab/activate.sh
+#   nohup python main.py > arm-lab.log 2>&1 &
+#   → http://<host>:8080  (기본 인증 없음. ARMLAB_TOKEN / ARMLAB_AUTH=on 으로 켤 수 있음)
 # ============================================================================
 import asyncio
 import glob
@@ -45,24 +45,26 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-import lrweb_ov  # OpenVINO 변환·롤아웃. openvino 자체는 필요할 때 별도 프로세스에서만 import 합니다
+import armlab_ov  # OpenVINO 변환·롤아웃. openvino 자체는 필요할 때 별도 프로세스에서만 import 합니다
 
 # ------------------------------- 경로 ---------------------------------------
 HOME = Path.home()
-PROJ = HOME / "project/lerobot"
+# 레포를 clone 한 폴더가 곧 작업 폴더입니다 (데이터·출력·설정이 이 아래에 생김, .gitignore 처리).
+# 시험 등으로 다른 곳을 쓰려면 ARMLAB_HOME 으로 지정합니다.
+PROJ = Path(os.environ.get("ARMLAB_HOME") or Path(__file__).resolve().parent)
 DATA_ROOT = PROJ / "data/hf/lerobot/local"
 OUT_ROOT = PROJ / "outputs"
-JOB_DIR = PROJ / "lrweb_jobs"
-MARKS_FILE = PROJ / "lrweb_marks.json"
-CONFIG_FILE = PROJ / "lrweb_config.json"
-TOKEN_FILE = PROJ / "lrweb_token.txt"
-URDF_DIR = PROJ / "urdf"
+JOB_DIR = PROJ / "armlab_jobs"
+MARKS_FILE = PROJ / "armlab_marks.json"
+CONFIG_FILE = PROJ / "armlab_config.json"
+TOKEN_FILE = PROJ / "armlab_token.txt"
+URDF_DIR = Path(__file__).resolve().parent / "urdf"     # 레포에 든 자산 — ARMLAB_HOME 과 무관
 
 
 def _lerobot_calib_root():
     """lerobot utils/constants.py 와 같은 규칙: HF_LEROBOT_CALIBRATION > HF_LEROBOT_HOME/calibration
     > HF_HOME/lerobot/calibration > ~/.cache/huggingface/lerobot/calibration.
-    activate.sh 의 HF_HOME 기준이면 ~/project/lerobot/data/hf/lerobot/calibration 입니다."""
+    activate.sh 의 HF_HOME 기준이면 ~/project/arm-lab/data/hf/lerobot/calibration 입니다."""
     if os.environ.get("HF_LEROBOT_CALIBRATION"):
         return Path(os.environ["HF_LEROBOT_CALIBRATION"]).expanduser()
     if os.environ.get("HF_LEROBOT_HOME"):
@@ -90,7 +92,7 @@ PREVIEW_FPS = 10          # record worker 가 미리보기 JPEG 을 갱신하는
 READY_CHUNK_S = 2.0       # 수집 대기 중 record_loop 을 끊어 도는 단위 (이 틈에 온도를 읽습니다)
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 # record worker ↔ 웹 사이의 상태/미리보기/명령 파일. 초당 수십 회 쓰므로 tmpfs 를 우선합니다.
-RUN_DIR = Path("/dev/shm/lrweb") if Path("/dev/shm").is_dir() else PROJ / "lrweb_run"
+RUN_DIR = Path("/dev/shm/armlab") if Path("/dev/shm").is_dir() else PROJ / "armlab_run"
 
 # ------------------------------- 설정 ---------------------------------------
 # arms 는 처음부터 리스트입니다. 한팔이면 원소 1개(side="main"),
@@ -130,13 +132,13 @@ def load_config():
             if isinstance(user, dict):
                 cfg.update(user)
         except Exception as e:
-            print(f"[lrweb] 설정 파일 파싱 실패 — 기본값 사용: {e}")
+            print(f"[armlab] 설정 파일 파싱 실패 — 기본값 사용: {e}")
     else:
         try:
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
         except Exception as e:
-            print(f"[lrweb] 설정 파일 생성 실패: {e}")
+            print(f"[armlab] 설정 파일 생성 실패: {e}")
     if not cfg.get("arms"):
         cfg["arms"] = json.loads(json.dumps(DEFAULT_CONFIG["arms"]))
     # mode 가 1차 기준입니다. arms 길이가 안 맞으면 mode 에 맞춰 잘라내거나 채웁니다.
@@ -204,18 +206,18 @@ def ports_configured():
 
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title="lrweb")
+app = FastAPI(title="armlab")
 
 # ----------------------------- 인증 (기본 꺼짐) -------------------------------
 # 기본은 인증 없음 — http://<host>:8080 으로 바로 들어갑니다.
 # 켜려면 둘 중 하나:
-#   LRWEB_TOKEN=원하는값 python lrweb.py     (토큰 직접 지정)
-#   LRWEB_AUTH=on        python lrweb.py     (lrweb_token.txt 에 자동 생성)
+#   ARMLAB_TOKEN=원하는값 python main.py     (토큰 직접 지정)
+#   ARMLAB_AUTH=on        python main.py     (armlab_token.txt 에 자동 생성)
 def _init_token():
-    tok = os.environ.get("LRWEB_TOKEN")
+    tok = os.environ.get("ARMLAB_TOKEN")
     if tok and tok.strip():
         return tok.strip()
-    if os.environ.get("LRWEB_AUTH", "").lower() not in ("on", "1", "true", "yes"):
+    if os.environ.get("ARMLAB_AUTH", "").lower() not in ("on", "1", "true", "yes"):
         return None
     if TOKEN_FILE.exists():
         tok = TOKEN_FILE.read_text().strip()
@@ -232,7 +234,7 @@ def _init_token():
 
 
 AUTH_TOKEN = _init_token()
-COOKIE = "lrweb_token"
+COOKIE = "armlab_token"
 
 
 def token_ok(tok):
@@ -249,11 +251,11 @@ border-radius:7px;padding:10px;font-size:16px;font-family:ui-monospace,monospace
 button{margin-top:12px;width:100%;background:#2c4257;color:#dceafe;border:1px solid #5d9dd6;
 border-radius:7px;padding:10px;font-size:14px;cursor:pointer}
 p{color:#8b98a7;font-size:12px;line-height:1.6}</style>
-<form method=get action="/"><h1>LRWEB</h1>
+<form method=get action="/"><h1>ARM-LAB</h1>
 <input name=token placeholder="access token" autofocus autocomplete=off>
 <button>접속</button>
-<p>토큰은 서버의 <code>lrweb_token.txt</code> 에 있습니다.<br>
-해제하려면 <code>LRWEB_AUTH=off</code> 로 실행하세요.</p></form>"""
+<p>토큰은 서버의 <code>armlab_token.txt</code> 에 있습니다.<br>
+해제하려면 <code>ARMLAB_AUTH=off</code> 로 실행하세요.</p></form>"""
 
 
 @app.middleware("http")
@@ -262,7 +264,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     qtok = request.query_params.get("token")
     if token_ok(qtok) or token_ok(request.cookies.get(COOKIE)) or token_ok(
-        request.headers.get("x-lrweb-token")
+        request.headers.get("x-armlab-token")
     ):
         resp = await call_next(request)
         if token_ok(qtok):
@@ -369,11 +371,11 @@ def save_marks(m):
 
 # ----------------------------- 환경 · 프로젝트 · 데이터셋 메타 ------------------
 # 환경 = 하드웨어 구성 한 벌(모드·포트·캘리브 id·카메라·fps).
-# 활성 환경은 언제나 lrweb_config.json 입니다 — 나머지 코드는 이 파일만 봅니다.
-# 이름 붙은 사본을 lrweb_envs/<이름>.json 에 두고, 전환하면 그 사본을 활성 설정으로 복사합니다.
-ENV_DIR = PROJ / "lrweb_envs"
-PROJECTS_FILE = PROJ / "lrweb_projects.json"
-DSMETA_FILE = PROJ / "lrweb_dsmeta.json"
+# 활성 환경은 언제나 armlab_config.json 입니다 — 나머지 코드는 이 파일만 봅니다.
+# 이름 붙은 사본을 armlab_envs/<이름>.json 에 두고, 전환하면 그 사본을 활성 설정으로 복사합니다.
+ENV_DIR = PROJ / "armlab_envs"
+PROJECTS_FILE = PROJ / "armlab_projects.json"
+DSMETA_FILE = PROJ / "armlab_dsmeta.json"
 DEFAULT_ENV = "default"
 
 
@@ -482,7 +484,7 @@ def delete_env(name):
     f.unlink()
 
 
-# 데이터셋 메타 — lerobot 파일은 건드리지 않고 lrweb 쪽에만 둡니다 {데이터셋: {env, created}}
+# 데이터셋 메타 — lerobot 파일은 건드리지 않고 arm-lab 쪽에만 둡니다 {데이터셋: {env, created}}
 def load_dsmeta():
     d = load_json(DSMETA_FILE, {})
     return d if isinstance(d, dict) else {}
@@ -842,7 +844,7 @@ _PLUGIN_DIR = Path(__file__).resolve().parent / "plugins"
 
 def _load(mod, name):
     """kind 표의 (모듈, 이름) 을 import. 양팔 OMX 플러그인이 pip 로 안 깔려 있으면 레포의 plugins/ 에서 찾습니다
-    (lrweb 자신은 이걸로 충분하지만, lerobot CLI(롤아웃) 는 설치돼 있어야 합니다)."""
+    (arm-lab 자신은 이걸로 충분하지만, lerobot CLI(롤아웃) 는 설치돼 있어야 합니다)."""
     import importlib
     try:
         m = importlib.import_module(mod)
@@ -1120,7 +1122,7 @@ def start_job(kind, argv, cwd=None, spec=None):
     """argv 는 반드시 리스트 — shell=False 이므로 셸 인젝션이 불가능합니다.
     spec 은 worker 가 읽을 작업 명세(dict) — job json 에 같이 저장됩니다."""
     if shutil.which(argv[0]) is None:
-        raise JobStartError(f"실행 파일을 찾을 수 없습니다: {argv[0]} — lerobot conda env 안에서 lrweb 를 띄웠는지 확인")
+        raise JobStartError(f"실행 파일을 찾을 수 없습니다: {argv[0]} — arm-lab conda env 안에서 arm-lab 을 띄웠는지 확인")
     jid = f"{kind}_{time.strftime('%m%d_%H%M%S')}"
     n = 2
     while (JOB_DIR / f"{jid}.json").exists():     # 같은 초에 두 개 → 로그·pid 덮어쓰기 방지
@@ -1148,7 +1150,7 @@ def start_job(kind, argv, cwd=None, spec=None):
 
 
 def send_cmd(jid, key):
-    """record worker 에 n/r/q 전달 — 파일 큐. lrweb 를 재시작해도 그대로 동작합니다."""
+    """record worker 에 n/r/q 전달 — 파일 큐. arm-lab 을 재시작해도 그대로 동작합니다."""
     if not safe_name(jid):
         return False
     rd = run_dir(jid)
@@ -1170,7 +1172,7 @@ def record_status(jid):
 def kill_job(jid, force=False):
     """force=False: 1 번째 SIGINT(정상 종료 요청), 2 번째부터 SIGKILL.
     force=True : 곧바로 SIGKILL. 프로세스 그룹 전체에 보냅니다
-    (start_job 이 os.setsid 로 새 세션을 열어 두므로 lrweb 자신은 안 맞습니다)."""
+    (start_job 이 os.setsid 로 새 세션을 열어 두므로 arm-lab 자신은 안 맞습니다)."""
     if not safe_name(jid):
         return False
     jf = JOB_DIR / f"{jid}.json"
@@ -1613,7 +1615,7 @@ class CamStreamer:
                 self.cams[name] = cam
             except Exception as e:
                 self.errors[name] = f"{type(e).__name__}: {e}"
-                print(f"[lrweb] 카메라 '{name}' 열기 실패: {e}")
+                print(f"[armlab] 카메라 '{name}' 열기 실패: {e}")
         if not self.cams:
             return False
         self.on = True
@@ -1703,12 +1705,12 @@ def _alias_map(dirname):
     return out
 
 
-SIM_FILE = Path(__file__).resolve().parent / "lrweb_sim.json"     # tools_simarms.py 가 켜져 있을 때만 있음
-SIM_DIR = Path(__file__).resolve().parent / "lrweb_sim"
+SIM_FILE = Path(__file__).resolve().parent / "armlab_sim.json"     # tools_simarms.py 가 켜져 있을 때만 있음
+SIM_DIR = Path(__file__).resolve().parent / "armlab_sim"
 
 
 def serial_path_ok(p):
-    """포트 경로 검사 — /dev/… 또는 가상 팔(tools_simarms) 의 lrweb_sim/<이름> 링크."""
+    """포트 경로 검사 — /dev/… 또는 가상 팔(tools_simarms) 의 armlab_sim/<이름> 링크."""
     return isinstance(p, str) and (p.startswith("/dev/") or p.startswith(str(SIM_DIR) + os.sep))
 
 
@@ -1753,7 +1755,7 @@ def list_serial_ports():
                       or os.path.basename(dev)),
             "used_by": used.get(dev, []),
         })
-    # 가상 팔 — 경로가 고정된 lrweb_sim/<이름> 링크를 by_path 로 둬서 지정한 포트가 재시작해도 유지됩니다
+    # 가상 팔 — 경로가 고정된 armlab_sim/<이름> 링크를 by_path 로 둬서 지정한 포트가 재시작해도 유지됩니다
     for sp in _sim_ports():
         dev = os.path.realpath(sp["path"])
         out.append({"dev": dev, "by_id": "", "by_path": sp["path"],
@@ -2337,7 +2339,7 @@ CSS = """
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="LRWEB">
+<meta name="apple-mobile-web-app-title" content="ARM-LAB">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -2508,7 +2510,7 @@ def nav_html(active=""):
         on = ' class=on' if key == active else ''
         return f'<a href="{href}"{on}>{label}</a>'
 
-    return (f'<div class=appbar><div class=brand>LRWEB <a href="/setup/wizard" title="기종 바꾸기 — 셋업 마법사"><small>/ {esc(kind()["label"])}</small></a></div>'
+    return (f'<div class=appbar><div class=brand>ARM-LAB <a href="/setup/wizard" title="기종 바꾸기 — 셋업 마법사"><small>/ {esc(kind()["label"])}</small></a></div>'
             f'<div class=nav>{tab("/projects", "Projects", "pj")}{tab("/", "Datasets", "ds")}{tab("/collect", "Collect", "co")}'
             f'{tab("/train", "Training", "tr")}{tab("/models", "Models", "md")}{tab("/rollout", "Rollout", "ro")}{tab("/hub", "Hub", "hb")}'
             f'{tab("/control", "Control", "ct")}{tab("/calib", "Calib", "cb")}{tab("/setup", "Setup", "st")}'
@@ -2524,7 +2526,7 @@ def nav_html(active=""):
 @app.get("/manifest.webmanifest")
 def api_manifest():
     return JSONResponse({
-        "name": "LRWEB — SO-101 Pipeline", "short_name": "LRWEB",
+        "name": "ARM-LAB — Robot Arm Lab", "short_name": "ARM-LAB",
         "start_url": "/", "scope": "/", "display": "fullscreen",
         "orientation": "landscape",
         "background_color": "#0f1216", "theme_color": "#161b21",
@@ -2797,7 +2799,7 @@ def api_delete_dataset(ds: str):
 
 
 # ----------------------------- 데이터셋 내려받기 ------------------------------
-# lrweb 이 수집한 데이터셋은 이미 LeRobotDataset v3.0 레이아웃입니다
+# arm-lab 이 수집한 데이터셋은 이미 LeRobotDataset v3.0 레이아웃입니다
 # (meta/info.json 의 codebase_version 이 v3.0). 변환할 게 없으므로 폴더를
 # 그대로 tar 로 감싸 스트리밍합니다. mp4 / parquet 는 이미 압축된 포맷이라
 # gzip 을 걸면 CPU 만 먹고 크기는 거의 안 줄어듭니다.
@@ -3288,15 +3290,15 @@ def api_joblog(jid: str):
 
 
 # ----------------------------- OpenVINO (Intel NPU · GPU · CPU) --------------
-# 변환·검증·롤아웃 본체는 lrweb_ov.py 입니다. 여기는 화면과 API 만 둡니다.
-OV_PY = Path(__file__).resolve().parent / "lrweb_ov.py"
+# 변환·검증·롤아웃 본체는 armlab_ov.py 입니다. 여기는 화면과 API 만 둡니다.
+OV_PY = Path(__file__).resolve().parent / "armlab_ov.py"
 OV_DEVICES = ("NPU", "GPU", "CPU")
 _OV_DEV = {"t": 0.0, "v": None}
 
 
 def ov_devices(refresh=False):
     """{"ok", "devices": [{id, name}], "error"} — openvino 는 별도 프로세스에서 조회합니다
-    (lrweb 프로세스가 NPU 를 붙잡고 있지 않게). 2분 캐시."""
+    (arm-lab 프로세스가 NPU 를 붙잡고 있지 않게). 2분 캐시."""
     now = time.monotonic()
     if not refresh and _OV_DEV["v"] is not None and now - _OV_DEV["t"] < 120:
         return _OV_DEV["v"]
@@ -3388,7 +3390,7 @@ def failure_hint(text):
 def ov_shape_problem(rel):
     """변환 때 고정한 카메라 입력과 지금 Setup 의 카메라(이름·해상도)가 맞는지 — 팔이 움직이기 전에 거릅니다.
     NPU 는 정적 shape 라 해상도가 다르면 첫 추론에서 멈춥니다."""
-    meta = lrweb_ov.load_meta(OUT_ROOT / rel) or {}
+    meta = armlab_ov.load_meta(OUT_ROOT / rel) or {}
     pre = "observation.images."
     have = {pre + n: [1, 3, int(s["height"]), int(s["width"])] for n, s in CAM_SPECS.items()}
     for i in meta.get("inputs", []):
@@ -3405,7 +3407,7 @@ def ov_shape_problem(rel):
 
 
 def ov_label(rel):
-    st = lrweb_ov.status(OUT_ROOT / rel)
+    st = armlab_ov.status(OUT_ROOT / rel)
     return {"ok": " · OV✓", "stale": " · OV(다시 변환 필요)"}.get(st["state"], "")
 
 
@@ -3419,7 +3421,7 @@ def api_ov_status(ckpt: str = "", refresh: int = 0):
     ck = ov_ckpt_ok(ckpt)
     if ck is None:
         return JSONResponse({"error": "체크포인트 없음"}, status_code=400)
-    st = lrweb_ov.status(ck)
+    st = armlab_ov.status(ck)
     return {"status": st, "devices": ov_devices(bool(refresh)), "job": ov_last_job(ckpt),
             "fps": CFG["fps"], "shape_problem": ov_shape_problem(ckpt) if st["state"] != "none" else None}
 
@@ -3437,7 +3439,7 @@ async def api_ov_convert(req: Request):
     d = ov_devices(refresh=True)
     if not d.get("ok"):
         return JSONResponse({"error": f"OpenVINO 를 쓸 수 없습니다 ({d.get('error')}) — Intel 기기에서 "
-                                      "LRWEB_PLATFORM=intel ./lerobot_conda.sh 로 설치하거나 "
+                                      "ARMLAB_PLATFORM=intel ./lerobot_conda.sh 로 설치하거나 "
                                       "pip install openvino nncf"}, status_code=400)
     # 추론 중엔 NPU·CPU 를 같이 써서 지연 측정이 틀어지고, 같은 IR 을 덮어쓰게 됩니다
     busy = busy_with(("rollout", "ovconvert"))
@@ -3503,7 +3505,7 @@ def policy_missing(pol):
     """정책에 필요한 파이썬 패키지 중 없는 것 — lerobot 이 학습 시작 수십 초 뒤에야 ImportError 로 죽기 전에 알려 줍니다."""
     import importlib
     import importlib.util
-    importlib.invalidate_caches()        # 설치 작업 직후에도 lrweb 재시작 없이 보이게
+    importlib.invalidate_caches()        # 설치 작업 직후에도 arm-lab 재시작 없이 보이게
     return [m for m in TRAIN_POLICIES[pol]["needs"] if importlib.util.find_spec(m) is None]
 
 
@@ -3523,7 +3525,7 @@ def api_install_policy(pol: str):
             pins.append(f"{pkg}=={metadata.version(pkg).split('+')[0]}")
         except metadata.PackageNotFoundError:
             pass
-    cons = PROJ / "lrweb_pip_constraint.txt"
+    cons = PROJ / "armlab_pip_constraint.txt"
     _atomic_write(cons, "\n".join(pins) + "\n")
     # lerobot[extra] 대신 그 extra 의 패키지만 설치합니다 (lerobot e40b58a pyproject 의 범위 그대로).
     # 'lerobot[...]' 로 설치하면 소스 설치가 아닌 환경에서 PyPI 의 다른 lerobot 버전이 덮어쓸 수 있습니다.
@@ -3713,7 +3715,7 @@ async def api_train(req: Request):
     miss = policy_missing(pol)
     if miss:
         return JSONResponse({"error": f"{TRAIN_POLICIES[pol]['label']} 에 필요한 패키지가 없습니다 ({', '.join(miss)}) — 터미널에서: "
-                                      f"cd ~/project/lerobot/lerobot-src && pip install -e \".[{TRAIN_POLICIES[pol]['extra']}]\""},
+                                      f"cd ~/project/arm-lab/lerobot-src && pip install -e \".[{TRAIN_POLICIES[pol]['extra']}]\""},
                             status_code=400)
     root = DATA_ROOT / ds
     if not root.exists():
@@ -3748,7 +3750,7 @@ async def api_train(req: Request):
 
 
 def _cloud_train(b, flavor):
-    """HF Jobs 로 학습. 로컬 데이터셋은 lrweb_hub.py 가 내 계정 비공개 repo 로 먼저 올립니다.
+    """HF Jobs 로 학습. 로컬 데이터셋은 armlab_hub.py 가 내 계정 비공개 repo 로 먼저 올립니다.
     이 기기 GPU 를 쓰지 않으므로 수집·추론·로컬 학습과 동시에 돌 수 있습니다."""
     ds = (b.get("dataset") or "").strip()
     if not safe_name(ds) or not (DATA_ROOT / ds / "meta/info.json").is_file():
@@ -3900,7 +3902,7 @@ def run_info(run, trials=None):
         if st.name == "last" or st.is_symlink() or not (pm / "config.json").is_file():
             continue
         rel = f"{run}/checkpoints/{st.name}/pretrained_model"
-        cks.append({"step": st.name, "rel": rel, "ov": lrweb_ov.status(OUT_ROOT / rel)["state"],
+        cks.append({"step": st.name, "rel": rel, "ov": armlab_ov.status(OUT_ROOT / rel)["state"],
                     "trials": trial_summary(rel, trials), "robot_type": checkpoint_robot_type(rel)})
     tc = load_json(OUT_ROOT / cks[-1]["rel"] / "train_config.json", {}) if cks else {}
     pol = (tc.get("policy") or {}).get("type") or load_json(OUT_ROOT / cks[-1]["rel"] / "config.json", {}).get(
@@ -3926,7 +3928,7 @@ def run_info(run, trials=None):
             "steps": tc.get("steps"), "batch": tc.get("batch_size"), "checkpoints": cks, "alive": alive,
             "step": step, "loss": loss, "duration": _fmt_dur(dur) if dur else "", "done_step": done_step,
             "resumable": last_state.is_dir() and not alive,
-            "imported": load_json(rd / "lrweb_import.json", {}).get("imported", ""),
+            "imported": load_json(rd / "armlab_import.json", {}).get("imported", ""),
             "job": jobs[0]["id"] if jobs else ""}
 
 
@@ -4102,7 +4104,7 @@ def _place_models(tmp, stem, filename):
         if orig_run not in runs:
             runs[orig_run] = _free_name(OUT_ROOT, orig_run)
             (OUT_ROOT / runs[orig_run] / "checkpoints").mkdir(parents=True)
-            save_json(OUT_ROOT / runs[orig_run] / "lrweb_import.json",
+            save_json(OUT_ROOT / runs[orig_run] / "armlab_import.json",
                       {"imported": time.strftime("%F %T"), "from": filename, "original_name": orig_run})
         dest = OUT_ROOT / runs[orig_run] / "checkpoints" / step
         if dest.exists():
@@ -4113,10 +4115,10 @@ def _place_models(tmp, stem, filename):
             shutil.move(str(pm.parent / "training_state"), str(dest / "training_state"))
         # 묶음 안의 OpenVINO 변환본은 같은 가중치에서 나온 것으로 봅니다 (크기가 같을 때만).
         # 압축을 풀면 파일 시각이 바뀌어 '다시 변환 필요' 로 보이는 것을 막습니다.
-        mp = dest / "pretrained_model" / lrweb_ov.OV_SUBDIR / lrweb_ov.META
+        mp = dest / "pretrained_model" / armlab_ov.OV_SUBDIR / armlab_ov.META
         meta = load_json(mp, None)
         if meta and (meta.get("source") or {}).get("size") == (dest / "pretrained_model" / "model.safetensors").stat().st_size:
-            meta["source"] = lrweb_ov.fingerprint(dest / "pretrained_model")
+            meta["source"] = armlab_ov.fingerprint(dest / "pretrained_model")
             save_json(mp, meta)
         placed.append(f"{runs[orig_run]}/{step}")
     pname, _ = active_project()
@@ -4212,17 +4214,17 @@ async def api_train_resume(req: Request):
 
 
 # ----------------------------- Hugging Face Hub · HF Jobs 클라우드 학습 -------------
-# 본체는 lrweb_hub.py. 업로드·다운로드·클라우드 학습은 작업(job)으로 띄워 로그로 진행을 봅니다.
+# 본체는 armlab_hub.py. 업로드·다운로드·클라우드 학습은 작업(job)으로 띄워 로그로 진행을 봅니다.
 # 클라우드 학습 작업 종류는 'cloudtrain' — 이 기기의 GPU·팔을 쓰지 않으므로 수집·추론·학습과 배타가 아닙니다.
-HUB_PY = Path(__file__).resolve().parent / "lrweb_hub.py"
+HUB_PY = Path(__file__).resolve().parent / "armlab_hub.py"
 _HF_JOB_RE = re.compile(r"Job submitted:\s*(\S+)")
 _HF_PAGE_RE = re.compile(r"Job page:\s*(\S+)")
 _HF_REPO_RE = re.compile(r"Model repo:\s*https://huggingface\.co/(\S+)")
 
 
 def _hub():
-    import lrweb_hub
-    return lrweb_hub
+    import armlab_hub
+    return armlab_hub
 
 
 def cloud_job_info(j):
@@ -4463,10 +4465,10 @@ def hub_page():
 
 # ----------------------------- 페이지: 추론 (Rollout) ------------------------
 # ----------------------------- 롤아웃 실시간 모니터 · 시도 기록 -------------------
-# 롤아웃은 lrweb_rollout.py 로 띄웁니다. 그 프로세스가 RUN_DIR/<jid>/ 에 status.json · cam_*.jpg 를 씁니다.
-# 시도 기록(성공/실패)은 lrweb_trials.json 에 체크포인트별로 쌓습니다 — 실기 성공률로 모델을 비교하려고.
-ROLLOUT_PY = Path(__file__).resolve().parent / "lrweb_rollout.py"
-TRIALS_FILE = PROJ / "lrweb_trials.json"
+# 롤아웃은 armlab_rollout.py 로 띄웁니다. 그 프로세스가 RUN_DIR/<jid>/ 에 status.json · cam_*.jpg 를 씁니다.
+# 시도 기록(성공/실패)은 armlab_trials.json 에 체크포인트별로 쌓습니다 — 실기 성공률로 모델을 비교하려고.
+ROLLOUT_PY = Path(__file__).resolve().parent / "armlab_rollout.py"
+TRIALS_FILE = PROJ / "armlab_trials.json"
 TRIAL_RESULTS = ("success", "fail")
 
 
@@ -4797,11 +4799,11 @@ def rollout_page(job: str = "", ckpt: str = ""):
     <script>
     {OV_JS}
     const ENG=document.getElementById('engine'), PREC=document.getElementById('prec');
-    try{{ const v=localStorage.getItem('lrweb_engine');
+    try{{ const v=localStorage.getItem('armlab_engine');
           if(v && [...ENG.options].some(o=>o.value===v && !o.disabled)) ENG.value=v;
-          const p=localStorage.getItem('lrweb_prec'); if(p) PREC.value=p; }}catch(e){{}}
+          const p=localStorage.getItem('armlab_prec'); if(p) PREC.value=p; }}catch(e){{}}
     async function ovInfo(){{
-      try{{ localStorage.setItem('lrweb_engine',ENG.value); localStorage.setItem('lrweb_prec',PREC.value); }}catch(e){{}}
+      try{{ localStorage.setItem('armlab_engine',ENG.value); localStorage.setItem('armlab_prec',PREC.value); }}catch(e){{}}
       PREC.disabled = ENG.value==='torch';
       const box=document.getElementById('ovinfo'), ck=document.getElementById('ckpt').value;
       if(ENG.value==='torch' || !ck){{ box.innerHTML=''; return; }}
@@ -4871,21 +4873,21 @@ async def api_rollout(req: Request):
         return JSONResponse({"error": "이 정책은 태스크 설명(언어 지시)을 씁니다 — 태스크 설명을 넣으세요"}, status_code=400)
     miss = plugin_missing() if BIMANUAL else []
     if miss:
-        # lrweb 자신은 plugins/ 를 직접 읽지만, lerobot CLI 는 설치된 패키지만 찾습니다
+        # arm-lab 자신은 plugins/ 를 직접 읽지만, lerobot CLI 는 설치된 패키지만 찾습니다
         return JSONResponse({"error": "양팔 OMX 플러그인이 설치돼 있지 않습니다 — 터미널에서: "
                                       "pip install --no-deps " + " ".join(f"-e plugins/{m}" for m in miss)},
                             status_code=400)
     engine = b.get("engine") or "torch"
-    # 어느 엔진이든 lrweb_rollout.py 로 띄웁니다 — lerobot-rollout 을 그대로 돌리면서 실시간 화면용 상태를 씁니다
-    mon = [sys.executable, str(ROLLOUT_PY), f"--lrweb.run_dir={RUN_DIR}/{{jid}}"]
+    # 어느 엔진이든 armlab_rollout.py 로 띄웁니다 — lerobot-rollout 을 그대로 돌리면서 실시간 화면용 상태를 씁니다
+    mon = [sys.executable, str(ROLLOUT_PY), f"--armlab.run_dir={RUN_DIR}/{{jid}}"]
     if engine == "torch":
-        head = mon + ["--lrweb.engine=torch"]
+        head = mon + ["--armlab.engine=torch"]
     else:
         dev = engine[3:] if engine.startswith("ov:") else ""
         prec = b.get("precision") or "fp16"
-        if dev not in OV_DEVICES or prec not in lrweb_ov.PRECISIONS:
+        if dev not in OV_DEVICES or prec not in armlab_ov.PRECISIONS:
             return JSONResponse({"error": "추론 엔진 값이 잘못됐습니다"}, status_code=400)
-        st = lrweb_ov.status(ck)
+        st = armlab_ov.status(ck)
         if st["state"] == "none":
             return JSONResponse({"error": "OpenVINO 변환이 없습니다 — Training 탭에서 먼저 변환하세요"}, status_code=400)
         if st["state"] == "stale":
@@ -4900,8 +4902,8 @@ async def api_rollout(req: Request):
         conv = busy_with(("ovconvert",))
         if conv:
             return JSONResponse({"error": f"{conv['id']} 변환 중 — 끝난 뒤 시작하세요"}, status_code=400)
-        # 요청 장치가 없으면 lrweb_ov 가 NPU → GPU → CPU 순으로 대체하고 로그에 크게 알립니다
-        head = mon + ["--lrweb.engine=ov", f"--ov.dir={lrweb_ov.ov_dir(ck)}",
+        # 요청 장치가 없으면 armlab_ov 가 NPU → GPU → CPU 순으로 대체하고 로그에 크게 알립니다
+        head = mon + ["--armlab.engine=ov", f"--ov.dir={armlab_ov.ov_dir(ck)}",
                 f"--ov.device={dev}", f"--ov.precision={prec}", f"--ov.fps={CFG['fps']}"]
     try:
         argv = (head + [f"--policy.path={ck}"] + robot_cli_args()
@@ -5101,7 +5103,7 @@ window.reconnect=()=>{{ try{{ws&&ws.close();}}catch(e){{}} openWS(); }};
 function openWS(){{
   wsErr=''; setStatus('연결 중…',''); breconn.style.display='none';
   ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/control');
-  ws.onerror=()=>{{ if(!wsErr) wsErr='서버에 닿지 못했습니다 — lrweb 가 떠 있는지 확인하세요'; }};
+  ws.onerror=()=>{{ if(!wsErr) wsErr='서버에 닿지 못했습니다 — arm-lab 이 떠 있는지 확인하세요'; }};
   ws.onmessage=e=>{{
     const d=JSON.parse(e.data);
     if(d.type==='init'){{
@@ -5647,7 +5649,7 @@ def validate_config(cfg):
             if not port:
                 continue
             if not serial_path_ok(port):
-                return f"{side}/{role} 포트는 /dev/… (또는 가상 팔 lrweb_sim/…) 경로여야 합니다: {port}"
+                return f"{side}/{role} 포트는 /dev/… (또는 가상 팔 armlab_sim/…) 경로여야 합니다: {port}"
             real = os.path.realpath(port)
             if real in seen_ports:
                 return f"같은 포트를 두 곳에 지정했습니다: {port} ({seen_ports[real]} 와 중복)"
@@ -5719,7 +5721,7 @@ async def api_setup_probe(req: Request):
     b = await req.json()
     port = (b.get("port") or "").strip()
     if not serial_path_ok(port):
-        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 lrweb_sim/…) 경로여야 합니다"}, status_code=400)
+        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 armlab_sim/…) 경로여야 합니다"}, status_code=400)
     if WATCH.on:
         return JSONResponse({"error": "포트 감시 중에는 probe 불가 — 감시를 먼저 중지하세요"}, status_code=400)
     busy = exclusive_busy()
@@ -5774,7 +5776,7 @@ async def api_motors_start(req: Request):
     b = await req.json()
     port = (b.get("port") or "").strip()
     if not serial_path_ok(port):
-        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 lrweb_sim/…) 경로여야 합니다"}, status_code=400)
+        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 armlab_sim/…) 경로여야 합니다"}, status_code=400)
     busy = exclusive_busy()
     if busy:
         return JSONResponse({"error": f"{busy['id']} 실행 중"}, status_code=400)
@@ -5815,7 +5817,7 @@ async def api_armcheck_start(req: Request):
     b = await req.json()
     port = (b.get("port") or "").strip()
     if not serial_path_ok(port):
-        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 lrweb_sim/…) 경로여야 합니다"}, status_code=400)
+        return JSONResponse({"error": "포트는 /dev/… (또는 가상 팔 armlab_sim/…) 경로여야 합니다"}, status_code=400)
     role = b.get("role") if b.get("role") in ("leader", "follower") else ""
     busy = exclusive_busy()
     if busy:
@@ -5844,7 +5846,7 @@ async def api_armcheck_cancel():
 
 
 # ----------------------------- 셋업 마법사 ------------------------------------
-WIZARD_FILE = PROJ / "lrweb_wizard.json"     # {환경: {"side|role": {verified, verified_ts, port}}}
+WIZARD_FILE = PROJ / "armlab_wizard.json"     # {환경: {"side|role": {verified, verified_ts, port}}}
 
 
 def _wiz_load():
@@ -7433,7 +7435,7 @@ SETUP_HTML = """
   <button class=primary onclick="save()">설정 저장 &amp; 적용</button>
   <span class=muted id=savemsg></span>
 </div>
-<p class=eyebrow>현재 설정 (lrweb_config.json)</p><pre id=cfgdump></pre>
+<p class=eyebrow>현재 설정 (armlab_config.json)</p><pre id=cfgdump></pre>
 </div>
 <script>
 let CFG=null, PORTS=[], VCAMS=[], WATCHING=false, timer=null, LASTWATCH=null;
@@ -8656,12 +8658,12 @@ poll();
 
 # ----------------------------- Record worker (별도 프로세스, 5단계) ----------------
 # lerobot-record 를 셸로 띄우고 PTY 로 키를 넣던 것을 없앴습니다. 대신 이 파일 자체를
-#   python lrweb.py --worker record <jid>
+#   python main.py --worker record <jid>
 # 로 띄워 lerobot 의 record_loop() 를 직접 부릅니다. events 딕트가 곧 n/r/q 입니다.
 #   상태   : RUN_DIR/<jid>/status.json       (worker → 웹, PREVIEW_FPS 로 갱신)
 #   미리보기: RUN_DIR/<jid>/cam_<name>.jpg   (worker → 웹, 원자적 교체)
 #   명령   : RUN_DIR/<jid>/cmd               (웹 → worker, n/r/q 문자를 append)
-# 전부 파일이라 lrweb 를 재시작해도 세션을 잃지 않습니다.
+# 전부 파일이라 arm-lab 을 재시작해도 세션을 잃지 않습니다.
 
 def _cam_configs(specs):
     from lerobot.cameras.opencv import OpenCVCameraConfig
@@ -8797,7 +8799,7 @@ def worker_record(jid):
                     f.unlink()
                     for ch in txt:
                         on_key(ch)
-                        print(f"[lrweb-worker] key {ch}", flush=True)
+                        print(f"[armlab-worker] key {ch}", flush=True)
             except OSError:
                 pass
             time.sleep(0.05)
@@ -9060,9 +9062,9 @@ let camsBuilt=false, PH='', lastBeep=-1;
 async function key(k){ await fetch('/api/sendkey/'+JID+'/'+k,{method:'POST'}); }
 /* 신호음 — 화면을 안 보고 팔을 움직이는 동안에도 단계를 알 수 있게 (WebAudio, 파일 없음) */
 let AC=null, MUTE=false;
-try{ MUTE=localStorage.getItem('lrweb_mute')==='1'; }catch(e){}
+try{ MUTE=localStorage.getItem('armlab_mute')==='1'; }catch(e){}
 function paintMute(){ $('mute').textContent=MUTE?'소리 꺼짐':'소리 켜짐'; }
-function toggleMute(){ MUTE=!MUTE; try{ localStorage.setItem('lrweb_mute',MUTE?'1':'0'); }catch(e){} paintMute(); if(!MUTE) tone([880],0.08); }
+function toggleMute(){ MUTE=!MUTE; try{ localStorage.setItem('armlab_mute',MUTE?'1':'0'); }catch(e){} paintMute(); if(!MUTE) tone([880],0.08); }
 function tone(freqs, dur){
   if(MUTE) return;
   try{
@@ -9185,9 +9187,9 @@ async function refresh(){
     $('phase').textContent='서버 응답 없음';
     $('phase').className='phase error';
     $('err').style.display='';
-    $('err').textContent='lrweb 서버가 응답하지 않습니다 ('+failN+'회) — '
+    $('err').textContent='arm-lab 서버가 응답하지 않습니다 ('+failN+'회) — '
       +(e.name==='AbortError'?'5초 초과':String(e&&e.message||e))
-      +'. 터미널에서 lrweb.log 를 확인하세요.';
+      +'. 터미널에서 armlab.log 를 확인하세요.';
     polling=false; return;
   }
   failN=0;
@@ -9290,5 +9292,5 @@ if __name__ == "__main__":
     if AUTH_TOKEN:
         print(f"open : http://<host>:{PORT}/?token={AUTH_TOKEN}   (token: {TOKEN_FILE})")
     else:
-        print(f"open : http://<host>:{PORT}/   (인증 없음 — 켜려면 LRWEB_AUTH=on)")
+        print(f"open : http://<host>:{PORT}/   (인증 없음 — 켜려면 ARMLAB_AUTH=on)")
     uvicorn.run(app, host="0.0.0.0", port=PORT)

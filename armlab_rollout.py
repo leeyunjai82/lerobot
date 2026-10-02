@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""lrweb 롤아웃 실행기 — lerobot-rollout 을 같은 프로세스에서 그대로 돌리면서
+"""arm-lab 롤아웃 실행기 — lerobot-rollout 을 같은 프로세스에서 그대로 돌리면서
 웹 화면용 실시간 상태(카메라·관절 실측/명령·추론 시간·제어 주기)를 파일로 내보냅니다.
 
-  python lrweb_rollout.py --lrweb.run_dir=<RUN_DIR/jid> [--lrweb.engine=torch|ov]
+  python armlab_rollout.py --armlab.run_dir=<RUN_DIR/jid> [--armlab.engine=torch|ov]
                           [--ov.device=NPU --ov.precision=fp16 --ov.fps=30]
                           <lerobot-rollout 인자 그대로...>
 
-  출력 (lrweb 수집 worker 와 같은 규칙, 원자적 교체):
+  출력 (arm-lab 수집 worker 와 같은 규칙, 원자적 교체):
     <run_dir>/status.json     phase · 경과 · 관절 실측(obs)/명령(act) · 추론 ms · 제어 Hz
     <run_dir>/cam_<이름>.jpg  카메라 미리보기
 
@@ -204,7 +204,7 @@ def main(argv=None):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
-    lw, rest = _pop_opts(argv, "--lrweb.")
+    lw, rest = _pop_opts(argv, "--armlab.")
     ov_opts, rest = _pop_opts(rest, "--ov.")
     engine = (lw.get("engine") or ("ov" if ov_opts else "torch")).lower()
     run_dir = lw.get("run_dir")
@@ -214,14 +214,14 @@ def main(argv=None):
                       precision=ov_opts.get("precision") or "")
     try:
         if engine == "ov":
-            import lrweb_ov
-            ov_eng, rest = lrweb_ov.prepare_rollout(ov_opts, rest)
+            import armlab_ov
+            ov_eng, rest = armlab_ov.prepare_rollout(ov_opts, rest)
             if mon:
                 mon.set(device=ov_eng.device)
                 mon.extra = lambda: {"ov_last_ms": round(ov_eng.ts[-1], 1) if ov_eng.ts else None,
                                      "ov_n": ov_eng.n, "ov_over": ov_eng.over}
         elif engine != "torch":
-            raise SystemExit(f"--lrweb.engine 은 torch | ov: {engine}")
+            raise SystemExit(f"--armlab.engine 은 torch | ov: {engine}")
         rest = _skip_backbone_download(rest)
         _answer_calibration_prompt()
         if mon:
@@ -244,14 +244,14 @@ def main(argv=None):
 
 def _answer_calibration_prompt():
     """lerobot 은 모터 값이 캘리브레이션 파일과 다르면 input() 으로 묻습니다. 웹 작업은 stdin 이 없어 EOFError 로 죽습니다.
-    'ENTER = 파일을 모터에 쓰기' 만 자동으로 답합니다 — lrweb Control 탭의 연결(토크 OFF → 파일 캘리브레이션 쓰기)과
+    'ENTER = 파일을 모터에 쓰기' 만 자동으로 답합니다 — armlab Control 탭의 연결(토크 OFF → 파일 캘리브레이션 쓰기)과
     같은 동작입니다. 처음부터 하는 캘리브레이션(팔을 움직여야 함)이 필요하면 멈추고 Calib 탭으로 안내합니다."""
     import builtins
 
     def _input(prompt=""):
         say(prompt)
         if "use provided calibration file" in str(prompt):
-            say("[lrweb] 모터 값이 캘리브레이션 파일과 달라 파일 값을 모터에 씁니다 (Control 탭 연결과 같은 동작)")
+            say("[armlab] 모터 값이 캘리브레이션 파일과 달라 파일 값을 모터에 씁니다 (Control 탭 연결과 같은 동작)")
             return ""
         raise EOFError("캘리브레이션 파일이 없습니다 — Calib 탭에서 먼저 캘리브레이션하세요")
 

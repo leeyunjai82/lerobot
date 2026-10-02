@@ -1,4 +1,4 @@
-# LRWEB — SO-ARM101 / OMX 로봇팔 웹 툴
+# arm-lab — SO-ARM101 / OMX 로봇팔 웹 툴
 
 HuggingFace [lerobot](https://github.com/huggingface/lerobot) 으로 로봇팔을 **셋업 → 수집 → 학습 → 추론** 하는 과정을
 명령어 없이 웹 화면에서 하는 도구입니다. (lerobot 자체가 아니라 그 위에서 도는 운용 도구입니다)
@@ -20,8 +20,8 @@ HuggingFace [lerobot](https://github.com/huggingface/lerobot) 으로 로봇팔�
 
 ```bash
 mkdir -p ~/project && cd ~/project
-git clone https://github.com/leeyunjai82/lerobot.git lerobot
-cd lerobot
+git clone https://github.com/leeyunjai82/arm-lab.git arm-lab
+cd arm-lab
 chmod +x lerobot_conda.sh
 sudo -v
 nohup ./lerobot_conda.sh > /dev/null 2>&1 &
@@ -36,13 +36,13 @@ conda 환경, PyTorch, lerobot, OMX 용 Dynamixel 패키지와 양팔 OMX 플러
 | `cuda` | x86_64 + NVIDIA GPU | CUDA 13 휠 | PyTorch (GPU) |
 | `intel` | x86_64 + NVIDIA 없음 (Core Ultra 권장) | CPU 휠 + **OpenVINO / NNCF** | OpenVINO **NPU / GPU / CPU** |
 
-자동 판정이 틀리면 `LRWEB_PLATFORM=intel ./lerobot_conda.sh` 처럼 지정합니다. Intel 쪽은 아래
+자동 판정이 틀리면 `ARMLAB_PLATFORM=intel ./lerobot_conda.sh` 처럼 지정합니다. Intel 쪽은 아래
 [Intel Core Ultra 에서 추론](#intel-core-ultra-에서-추론--openvino) 을 보세요.
 
 ### 이미 설치된 기기 업데이트
 
 ```bash
-cd ~/project/lerobot && git pull
+cd ~/project/arm-lab && git pull
 source activate.sh
 # OMX 를 처음 쓸 때 한 번만
 pip install "dynamixel-sdk>=3.7.31,<3.9.0"
@@ -56,11 +56,11 @@ pip install "openvino>=2025.4" "nncf>=2.19"
 ## 실행
 
 ```bash
-source ~/project/lerobot/activate.sh      # conda 활성화 + 작업 폴더로 이동
-nohup python lrweb.py > lrweb.log 2>&1 &
+source ~/project/arm-lab/activate.sh      # conda 활성화 + 작업 폴더로 이동
+nohup python main.py > arm-lab.log 2>&1 &
 ```
 
-브라우저에서 `http://<기기 IP>:8080/` 으로 들어갑니다. 업데이트했으면 **lrweb 를 껐다 켜고** 브라우저는 강력 새로고침(Ctrl+Shift+R) 하세요.
+브라우저에서 `http://<기기 IP>:8080/` 으로 들어갑니다. 업데이트했으면 **arm-lab 을 껐다 켜고** 브라우저는 강력 새로고침(Ctrl+Shift+R) 하세요.
 
 ## 처음 셋업 — 셋업 마법사
 
@@ -292,25 +292,25 @@ p95 가 프레임 예산(30 fps 면 33 ms) 안이고 오차가 작으면 **OK** 
 
 ## 팔 없이 시험하기 — 가상 팔
 
-실제 팔이 없어도 셋업 마법사·Calib·Control·Collect 를 끝까지 돌려 볼 수 있습니다. lrweb 와 **별도 터미널**에서 켭니다.
+실제 팔이 없어도 셋업 마법사·Calib·Control·Collect 를 끝까지 돌려 볼 수 있습니다. arm-lab 과 **별도 터미널**에서 켭니다.
 
 ```bash
-source ~/project/lerobot/activate.sh
+source ~/project/arm-lab/activate.sh
 python tools_simarms.py --robot so101 --mode bimanual    # SO-ARM101 양팔 (보드 4개)
 python tools_simarms.py --robot omx   --mode single      # OMX 한팔 (보드 2개)
 ```
 
-- 켜 두는 동안 포트 목록에 **가상 …** 보드로 나타나고, 끄면(`q` 또는 Ctrl+C) 사라집니다. lrweb 재시작은 필요 없습니다
+- 켜 두는 동안 포트 목록에 **가상 …** 보드로 나타나고, 끄면(`q` 또는 Ctrl+C) 사라집니다. arm-lab 재시작은 필요 없습니다
 - 모터는 실제 프로토콜(Feetech / Dynamixel)로 lerobot 과 통신합니다. 처음엔 캘리브레이션 안 된 공장 상태입니다
 - 손으로 움직이는 대신 콘솔 명령을 씁니다: `w <번호>` 그 보드 관절 쓸기 (포트 찾기·캘리브레이션·확인), `a` 리더 자동 움직임 (리더 팔로우·수집), `l` 목록
-- 포트 경로는 `lrweb_sim/<이름>` 으로 고정이라 껐다 켜도 다시 지정할 필요가 없습니다
+- 포트 경로는 `armlab_sim/<이름>` 으로 고정이라 껐다 켜도 다시 지정할 필요가 없습니다
 - Setup 기종·구성을 가상 팔과 같게 맞추세요 (환경을 하나 복사해서 쓰면 실제 팔 설정이 안 지워집니다)
 - 모터 ID 세팅은 흉내내지 않습니다. Collect 는 카메라가 하나 이상 등록돼 있어야 시작됩니다
 - 실제 팔을 쓸 때는 이 도구를 켜지 않으면 됩니다 — 실제 팔 동작과는 관계가 없습니다
 
 ## 팔 불량 점검 (터미널)
 
-Setup 탭의 팔 불량 점검과 같은 판정을 터미널에서도 돌릴 수 있습니다 (lrweb 가 그 포트를 잡고 있지 않을 때).
+Setup 탭의 팔 불량 점검과 같은 판정을 터미널에서도 돌릴 수 있습니다 (arm-lab 이 그 포트를 잡고 있지 않을 때).
 서보에 아무것도 쓰지 않습니다.
 
 ```bash
@@ -331,7 +331,7 @@ python tools_dxlcheck.py --port /dev/serial/by-id/usb-... --role follower   # OM
 | "다른 작업 실행 중" | Control 탭이 열려 있거나 수집·감시·캘리브레이션이 도는 중 — Jobs 탭이나 해당 화면에서 끝내기 |
 | 양팔 OMX 추론이 안 됨 | 플러그인 설치 필요 — 위 "이미 설치된 기기 업데이트" 의 두 번째 `pip` 줄 |
 | 수집 화면이 멈춤 | 오른쪽 위 **강제 종료** 후 다시 시작 |
-| 업데이트 후 화면이 이상함 | lrweb 재시작 + 브라우저 강력 새로고침 |
+| 업데이트 후 화면이 이상함 | arm-lab 재시작 + 브라우저 강력 새로고침 |
 
 ### 예전 버전으로 되돌리기
 
@@ -347,8 +347,8 @@ git checkout main                # 최신으로
 기본은 인증 없이 `http://<host>:8080/` 으로 들어갑니다. 필요하면 토큰을 켭니다.
 
 ```bash
-LRWEB_TOKEN=원하는값 python lrweb.py    # 토큰 직접 지정
-LRWEB_AUTH=on        python lrweb.py    # lrweb_token.txt 에 자동 생성
+ARMLAB_TOKEN=원하는값 python main.py    # 토큰 직접 지정
+ARMLAB_AUTH=on        python main.py    # armlab_token.txt 에 자동 생성
 ```
 
 인증과 별개로, 다른 웹사이트가 브라우저를 통해 몰래 보내는 요청은 받지 않습니다.

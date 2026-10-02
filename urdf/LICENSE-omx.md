@@ -9,4 +9,4 @@
 - 라이선스: Apache License 2.0 — Copyright ROBOTIS CO., LTD.
 
 URDF 의 메시 경로(`package://open_manipulator_description/...`)를 고치지 않으려고
-같은 폴더 구조로 두었습니다. lrweb 3D 는 `package://` 를 `/urdf/` 로 풀어 읽습니다.
+같은 폴더 구조로 두었습니다. arm-lab 3D 는 `package://` 를 `/urdf/` 로 풀어 읽습니다.

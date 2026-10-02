@@ -1,10 +1,10 @@
-# LRWEB 개발 문서
+# ARMLAB 개발 문서
 
 사용법은 [README](../README.md) 에 있습니다. 이 문서는 구조와 "왜 이렇게 했는지" 를 적습니다.
 
 - [파일 구성](#파일-구성)
 - [기종 (SO-ARM101 / OMX)](#기종-so-arm101--omx)
-- [설정 파일 `lrweb_config.json`](#설정-파일-lrweb_configjson)
+- [설정 파일 `armlab_config.json`](#설정-파일-armlab_configjson)
 - [포트 지정 — by-id / by-path](#포트-지정--by-id--by-path)
 - [셋업 마법사 내부](#셋업-마법사-내부)
 - [캘리브레이션 (SO-ARM101)](#캘리브레이션-so-arm101)
@@ -25,38 +25,38 @@
 
 | 파일 | 설명 |
 |---|---|
-| `lrweb.py` | 웹 툴 전체 (FastAPI 한 파일, port 8080). `python lrweb.py --worker record <jid>` 로 수집 worker 도 겸함 |
+| `main.py` | 웹 툴 전체 (FastAPI 한 파일, port 8080). `python main.py --worker record <jid>` 로 수집 worker 도 겸함 |
 | `tools_armcheck.py` | SO-ARM101(STS3215) 팔 점검 — Setup 탭·마법사 진단과 CLI 공용 |
 | `tools_dxlcheck.py` | OMX(Dynamixel X) 팔 점검 — 같은 함수 이름·결과 형식 |
-| `lrweb_rollout.py` | 롤아웃 실행기 — lerobot-rollout 을 같은 프로세스에서 돌리며 실시간 상태(카메라·관절·추론 ms·Hz)를 `RUN_DIR/<jid>/` 에 씀. `--lrweb.engine=ov` 면 lrweb_ov 로 신경망 교체 |
-| `lrweb_hub.py` | Hugging Face Hub — 로그인 상태(whoami 캐시)·하드웨어 목록, 데이터셋 올리기/받기, 모델 받기, HF Jobs 클라우드 학습 래퍼 |
+| `armlab_rollout.py` | 롤아웃 실행기 — lerobot-rollout 을 같은 프로세스에서 돌리며 실시간 상태(카메라·관절·추론 ms·Hz)를 `RUN_DIR/<jid>/` 에 씀. `--armlab.engine=ov` 면 armlab_ov 로 신경망 교체 |
+| `armlab_hub.py` | Hugging Face Hub — 로그인 상태(whoami 캐시)·하드웨어 목록, 데이터셋 올리기/받기, 모델 받기, HF Jobs 클라우드 학습 래퍼 |
 | `tools_dsrepair.py` | 마무리 안 된(끊긴) 데이터셋 복구 — huggingface/leLab `dataset_repair.py`(Apache-2.0)를 옮겨 와 백업·CLI 추가 |
-| `lrweb_ov.py` | ACT → OpenVINO 변환·검증(`convert`), 장치 조회(`devices`), OpenVINO 추론으로 lerobot-rollout 실행(`rollout`). lrweb 는 이 파일을 별도 프로세스로 띄웁니다 |
+| `armlab_ov.py` | ACT → OpenVINO 변환·검증(`convert`), 장치 조회(`devices`), OpenVINO 추론으로 lerobot-rollout 실행(`rollout`). arm-lab 은 이 파일을 별도 프로세스로 띄웁니다 |
 | `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
-| `tools_simarms.py` | 가상 팔 — PTY 위에서 STS3215 / Dynamixel X 를 흉내. 켜 있으면 `lrweb_sim.json` 에 포트를 알리고 lrweb 포트 목록에 추가됨 |
+| `tools_simarms.py` | 가상 팔 — PTY 위에서 STS3215 / Dynamixel X 를 흉내. 켜 있으면 `armlab_sim.json` 에 포트를 알리고 arm-lab 포트 목록에 추가됨 |
 | `plugins/lerobot_robot_bi_omx/` | 양팔 OMX 팔로워 `bi_omx_follower` (lerobot 플러그인) |
 | `plugins/lerobot_teleoperator_bi_omx/` | 양팔 OMX 리더 `bi_omx_leader` |
 | `urdf/` | 3D 용 URDF·STL — SO-101 (TheRobotStudio), OMX-F (ROBOTIS) |
 | `lerobot_conda.sh` | 새 기기 설치 스크립트 |
 | `activate.sh` | conda 활성화 + `HF_HOME` + 작업 폴더 이동 (`lerobot_conda.sh` 가 생성) |
 
-실행하면 `~/project/lerobot/` 아래에 생기는 파일 (전부 `.gitignore`):
+실행하면 `~/project/arm-lab/` 아래에 생기는 파일 (전부 `.gitignore`):
 
 | 파일 | 설명 |
 |---|---|
-| `lrweb_config.json` | 사용 중인 환경의 설정 |
-| `lrweb_envs/<이름>.json` | 이름 붙은 환경들 — 전환하면 `lrweb_config.json` 으로 복사 |
-| `lrweb_projects.json` | 프로젝트 (태스크·기준 환경·데이터셋·모델) |
-| `lrweb_dsmeta.json` | 데이터셋별 수집 환경·생성 시각 |
-| `lrweb_wizard.json` | 마법사의 팔별 '확인 완료' 기록 (환경별) |
-| `lrweb_jobs/` | 백그라운드 작업 기록·로그 |
-| `lrweb_marks.json` | 불량 에피소드 표시 |
-| `lrweb_trials.json` | 롤아웃 시도 결과 (체크포인트별 성공/실패) |
-| `outputs/<run>/lrweb_import.json` | 다른 기기에서 가져온 모델 표시 |
+| `armlab_config.json` | 사용 중인 환경의 설정 |
+| `armlab_envs/<이름>.json` | 이름 붙은 환경들 — 전환하면 `armlab_config.json` 으로 복사 |
+| `armlab_projects.json` | 프로젝트 (태스크·기준 환경·데이터셋·모델) |
+| `armlab_dsmeta.json` | 데이터셋별 수집 환경·생성 시각 |
+| `armlab_wizard.json` | 마법사의 팔별 '확인 완료' 기록 (환경별) |
+| `armlab_jobs/` | 백그라운드 작업 기록·로그 |
+| `armlab_marks.json` | 불량 에피소드 표시 |
+| `armlab_trials.json` | 롤아웃 시도 결과 (체크포인트별 성공/실패) |
+| `outputs/<run>/armlab_import.json` | 다른 기기에서 가져온 모델 표시 |
 
 ## 기종 (SO-ARM101 / OMX)
 
-기종마다 다른 것은 `lrweb.py` 의 `ROBOT_KINDS` 표 한 곳에 있습니다. 나머지 코드는 `kind()` 로 꺼내 씁니다.
+기종마다 다른 것은 `main.py` 의 `ROBOT_KINDS` 표 한 곳에 있습니다. 나머지 코드는 `kind()` 로 꺼내 씁니다.
 한팔/양팔(`mode`)과는 독립입니다.
 
 | 항목 | SO-ARM101 | OMX |
@@ -79,7 +79,7 @@
   서드파티 플러그인 규칙(설치된 패키지 이름이 `lerobot_robot_*` / `lerobot_teleoperator_*` 이면
   `register_third_party_plugins()` 가 import)을 써서 `bi_so_follower` 와 같은 구조로 만들었습니다.
   팔별 id `{id}_left` / `{id}_right`, 키 접두사 `left_` / `right_`, 공용 카메라는 접두사 없음 — SO 양팔과 같습니다.
-  lrweb 은 설치가 안 돼 있어도 `plugins/` 를 직접 읽지만, lerobot CLI(롤아웃)는 설치된 패키지만 찾으므로
+  arm-lab 은 설치가 안 돼 있어도 `plugins/` 를 직접 읽지만, lerobot CLI(롤아웃)는 설치된 패키지만 찾으므로
   롤아웃 시작 때 설치 여부를 확인합니다.
 - **OMX 3D**: ROBOTIS `open_manipulator` 의 `omx_f.urdf`(수정 없음). 관절 이름 `joint1~5`, `gripper_joint_1`(2 는 mimic)로
   매핑하고 -100~100 → ±π rad 로 바꿉니다. URDF 의 0 rad 가 엔코더 2048 이라고 가정했고, 그리퍼 0~100 → 0~0.9 rad 는
@@ -87,7 +87,7 @@
 - 데이터셋 `robot_type` 은 기종·모드별로 달라서(`so_follower` / `bi_so_follower` / `omx_follower` / `bi_omx_follower`)
   기종이 다른 데이터셋은 이어받기·추론이 막힙니다. 리뷰 화면 3D 는 데이터셋을 찍은 기종으로 그립니다.
 
-## 설정 파일 `lrweb_config.json`
+## 설정 파일 `armlab_config.json`
 
 ```json
 {
@@ -166,7 +166,7 @@ CLI 처럼 "중앙에 놓고 Enter" 로 잡은 자세가 실제 중앙에서 벗
 `set_torque(True)` 는 현재 위치 → `Goal_Position` → `Torque_Enable=1` 순서이고, 한 모터라도 실패하면 전부 다시 끕니다.
 
 **연결도 같은 문제** — lerobot `connect()` 는 `configure()` 를 `with bus.torque_disabled():` 안에서 돌리고 빠져나올 때
-토크를 켭니다. 그래서 lrweb 은 팔로워를 `connect_follower()` 로 연결합니다 (Control·수집·Calib, 양팔은 팔마다):
+토크를 켭니다. 그래서 arm-lab 은 팔로워를 `connect_follower()` 로 연결합니다 (Control·수집·Calib, 양팔은 팔마다):
 
 1. `bus.connect()` → 모든 모터 `Torque_Enable=0` (Feetech 는 `Lock=0` 도)
 2. 파일과 보드가 다르면 **토크가 꺼진 상태에서** `write_calibration`
@@ -196,11 +196,11 @@ Control 의 명령 적분기는 목표 도달 후 쓰기를 멈추는데, 서보
 ## 수집 worker
 
 `lerobot-record` 는 터미널 키보드로 조작하는데, PTY 로 키를 넣으면 X11 세션에서 pynput 이 가로채 버려집니다.
-그래서 `python lrweb.py --worker record <jid>` 가 lerobot `record_loop()` 를 직접 부르고, 웹 버튼이 `events` 를 바꿉니다.
+그래서 `python main.py --worker record <jid>` 가 lerobot `record_loop()` 를 직접 부르고, 웹 버튼이 `events` 를 바꿉니다.
 데이터셋 생성·인코딩·저장 흐름과 인코더 기본값은 `lerobot_record.record()` / `DatasetRecordConfig` 와 같습니다.
 
-worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/lrweb/<jid>/`): `status.json`(상태), `cam_<name>.jpg`(미리보기), `cmd`(s/n/r/q).
-그래서 lrweb 를 재시작해도 진행 중인 수집에 다시 붙습니다.
+worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/armlab/<jid>/`): `status.json`(상태), `cam_<name>.jpg`(미리보기), `cmd`(s/n/r/q).
+그래서 arm-lab 을 재시작해도 진행 중인 수집에 다시 붙습니다.
 
 - **대기(ready)** 는 `record_loop(dataset=None)` — 기록 없이 리더만 따라갑니다. 녹화는 `s` 를 눌렀을 때만
 - 단계에 맞지 않는 키는 무시 (`s` 는 대기에서만, `n`/`r` 은 녹화 중에만)
@@ -235,7 +235,7 @@ worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/lrweb/<jid>/`): `status.j
 
 ## 보안·동시성
 
-- 인증 기본 꺼짐 (`LRWEB_TOKEN` / `LRWEB_AUTH=on` 으로 켬)
+- 인증 기본 꺼짐 (`ARMLAB_TOKEN` / `ARMLAB_AUTH=on` 으로 켬)
 - 다른 사이트에서 온 POST·WebSocket 은 403 (`Sec-Fetch-Site: cross-site` 또는 `Origin` 호스트 불일치) — CSRF 방지
 - 팔·GPU 를 잡는 시작 요청(`/api/record`, `/api/calib/start` …)은 한 번에 하나씩 처리 (두 번 누름 경쟁 방지)
 - record/rollout/train/Control/Setup 세션은 서로 배타 (학습 + Control 은 동시 허용)
@@ -252,7 +252,7 @@ worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/lrweb/<jid>/`): `status.j
 `ACTPolicy.model` 의 추론 경로만 IR 로 바꿉니다. 관절 순서·단위·카메라 키가 PyTorch 경로와 같다는 게 보장됩니다.
 (physical-ai-studio 의 export 는 정규화가 모델 안에 있던 예전 lerobot 형식을 가정해서 이 커밋과 맞지 않습니다)
 
-변환 (`lrweb_ov.py convert`)
+변환 (`armlab_ov.py convert`)
 - `ACTCore(state, [env_state], *images) → actions (1, chunk, A)` 로 감싼 뒤 `openvino.convert_model` (정적 shape).
   추론 때 VAE 인코더는 안 쓰므로(잠재 = 0) IR 에도 없습니다.
 - 정적 shape = 학습 데이터의 `input_features` shape. NPU 는 동적 shape 를 못 받습니다.
@@ -264,7 +264,7 @@ worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/lrweb/<jid>/`): `status.j
   `model.safetensors` 의 크기·mtime 지문), `cache/`(컴파일 캐시 — NPU 첫 컴파일 이후 빨라짐).
 - 모델 생성 시 `pretrained_backbone_weights=None` — ImageNet 가중치를 내려받지 않습니다(어차피 체크포인트 가중치로 덮어씀).
 
-추론 (`lrweb_ov.py rollout --ov.* <lerobot-rollout 인자>`)
+추론 (`armlab_ov.py rollout --ov.* <lerobot-rollout 인자>`)
 - 같은 프로세스에서 `lerobot.scripts.lerobot_rollout.main()` 을 그대로 실행하고 `ACTPolicy.predict_action_chunk` 만 교체합니다.
   `select_action` 의 액션 큐·`n_action_steps`·temporal ensemble, `max_relative_target`, 중지(SIGINT) 시 시작 자세 복귀 + 토크 해제는
   PyTorch 경로와 같은 코드입니다.
@@ -272,11 +272,11 @@ worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/lrweb/<jid>/`): `status.j
 - 장치 대체: 요청 장치 → 그보다 뒤의 NPU → GPU → CPU. 대체되면 로그에 `!!` 로 남깁니다.
 - `--device=cpu`, `--policy.pretrained_backbone_weights=null` 을 붙입니다. 후자가 없으면 오프라인 기기에서 torchvision 다운로드로 죽습니다
   (PyTorch 경로는 기존 동작 유지).
-- 입력 shape 가 변환 때와 다르면 첫 추론에서 예외 → lerobot teardown(시작 자세 복귀) 후 종료. lrweb 는 그 전에
+- 입력 shape 가 변환 때와 다르면 첫 추론에서 예외 → lerobot teardown(시작 자세 복귀) 후 종료. arm-lab 은 그 전에
   `ov_shape_problem()` 으로 Setup 카메라 이름·해상도를 대조해 시작 자체를 막습니다.
 
-lrweb 쪽
-- `openvino` 는 lrweb 프로세스에서 import 하지 않습니다. 장치 조회도 `lrweb_ov.py devices` 를 띄워서 합니다(2분 캐시) —
+arm-lab 쪽
+- `openvino` 는 arm-lab 프로세스에서 import 하지 않습니다. 장치 조회도 `armlab_ov.py devices` 를 띄워서 합니다(2분 캐시) —
   웹 프로세스가 NPU 를 붙잡지 않게, 그리고 openvino 가 없는 Thor 에서도 그대로 뜨게.
 - 작업 종류 `ovconvert` (spec 에 체크포인트). 롤아웃·다른 변환과 동시 실행 금지(지연 측정이 틀어지고 IR 을 덮어씀).
   OV 롤아웃은 작업 종류가 그대로 `rollout` 이라 배타·중지·체크포인트 삭제 보호가 기존 규칙을 따릅니다.
@@ -285,9 +285,9 @@ lrweb 쪽
 ## 롤아웃 실행기·실시간 모니터·시도 기록
 
 physical-ai-studio 는 추론 중 카메라·3D 는 보여 주지만 명령값·지연은 안 보여 주고, 실기 성공률을 기록하는 기능이 없습니다.
-lrweb 는 둘 다 넣었습니다.
+arm-lab 은 둘 다 넣었습니다.
 
-- 모든 롤아웃(PyTorch/OpenVINO)은 `lrweb_rollout.py` 로 띄웁니다. `lerobot.scripts.lerobot_rollout.main()` 을 그대로 부르고
+- 모든 롤아웃(PyTorch/OpenVINO)은 `armlab_rollout.py` 로 띄웁니다. `lerobot.scripts.lerobot_rollout.main()` 을 그대로 부르고
   세 곳만 감쌉니다 — 관찰만 하고 로봇에 가는 명령은 바꾸지 않습니다.
   - `lerobot.rollout.context.make_robot_from_config` → 로봇 인스턴스의 `get_observation`(카메라 프레임·관절 실측·제어 주기),
     `send_action`(마지막 명령), `connect`(단계 표시)
@@ -298,7 +298,7 @@ lrweb 는 둘 다 넣었습니다.
 - ACT·Diffusion 체크포인트면 `--policy.pretrained_backbone_weights=null` 을 붙입니다. 모델을 만들 때 torchvision 이
   ImageNet 가중치를 내려받는데 곧바로 체크포인트 가중치로 덮어써져 쓸모가 없고, 오프라인 기기에서는 여기서 죽습니다.
   BatchNorm/GroupNorm 구조는 `use_group_norm` 이 따로 정하므로 구조는 같습니다.
-- 시도 기록: `POST /api/rollout/trial {job, result: success|fail|undo}` → `lrweb_trials.json` 의 체크포인트(outputs 기준 상대경로) 목록에 추가.
+- 시도 기록: `POST /api/rollout/trial {job, result: success|fail|undo}` → `armlab_trials.json` 의 체크포인트(outputs 기준 상대경로) 목록에 추가.
   작업 id·엔진·환경을 같이 남깁니다. 끝난 실행도 `/rollout?job=<jid>` 로 다시 열어 기록할 수 있습니다.
 - 화면 갱신은 앞 요청이 끝난 뒤 다음 요청(0.5 s) — 서버가 느려도 요청이 쌓이지 않고, 늦게 온 옛 응답은 버립니다.
 
@@ -322,23 +322,23 @@ lrweb 는 둘 다 넣었습니다.
 
 ## Hugging Face Hub · HF Jobs
 
-LeLab(huggingface/leLab) 에 있고 lrweb 에 없던 것 중 가장 큰 것. 구현은 `lrweb_hub.py`.
+LeLab(huggingface/leLab) 에 있고 arm-lab 에 없던 것 중 가장 큰 것. 구현은 `armlab_hub.py`.
 
 - 토큰: `huggingface_hub.login(add_to_git_credential=False)` — `HF_HOME/token`(activate.sh 가 `data/hf` 로 지정). `/whoami-v2` 는 사용량
   제한이 있어 5 분 캐시, 하드웨어 목록(`HfApi.list_jobs_hardware`, 로그인 없이도 됨)은 10 분 캐시. `unit_cost_usd`·`unit_label` 로 $/h 계산.
 - 오래 걸리는 일은 작업으로: `hub`(push-dataset / pull-dataset / pull-model), `cloudtrain`.
 - **클라우드 학습**: lerobot e40b58a 의 원격 학습(`lerobot-train --job.target=<flavor>`)을 씁니다. 그 경로의
-  `ensure_dataset_available` 은 `HF_LEROBOT_HOME/<repo_id>` 의 로컬 데이터셋을 그 repo id 로 올리는데, lrweb 데이터셋은 `local/<이름>` 이라
+  `ensure_dataset_available` 은 `HF_LEROBOT_HOME/<repo_id>` 의 로컬 데이터셋을 그 repo id 로 올리는데, arm-lab 데이터셋은 `local/<이름>` 이라
   남의 네임스페이스(`local`)로 올리려다 실패합니다. 그래서 `cloud-train` 이 먼저 `LeRobotDataset(<user>/<이름>, root=...).push_to_hub(private=True)`
   로 내 계정에 올리고(매번 — 이어서 수집한 에피소드 반영), `--dataset.repo_id=<user>/<이름>` 으로 `lerobot_train` 을 **exec** 합니다
   (PID 유지 → 작업 추적·중지 그대로). `--output_dir`·`--dataset.root` 는 뺍니다(파드에 없는 경로). `--save_checkpoint_to_hub=true`,
-  `--job.tags=["lrweb"]`.
+  `--job.tags=["armlab"]`.
 - lerobot 은 Ctrl-C 를 "로그 분리" 로 처리해 원격 학습이 계속 과금됩니다. `kill_job` 이 `cloudtrain` 이면 로그의 `Job submitted: <id>` 를 찾아
   `HfApi.cancel_job` 도 부릅니다. 작업 종류를 `train` 과 나눈 이유: 이 기기 GPU·팔을 안 쓰므로 수집·추론·로컬 학습과 배타가 아님.
   학습 그래프(`/api/trainlog`)는 원격 로그 줄이 같은 형식이라 그대로 그려집니다.
 - **모델 받기**: repo 파일 목록에서 `checkpoints/<step>/pretrained_model/config.json` 을 찾아 마지막(또는 지정) step 만
   `snapshot_download(allow_patterns=...)`, 없으면 루트의 `config.json + model.safetensors` 를 step `hub` 로. `outputs/<repo이름>/checkpoints/<step>/`
-  에 놓고 `lrweb_import.json` 에 출처 기록.
+  에 놓고 `armlab_import.json` 에 출처 기록.
 - **데이터셋 받기**: `LeRobotDataset(repo_id, root=임시)` 로 받아(코드베이스 버전 태그 기준) 끝나면 `DATA_ROOT/<이름>` 으로 옮깁니다.
   실패하면 임시 폴더를 지웁니다.
 - 실패 로그 끝에 원인 한 줄(네트워크면 `huggingface.co`·`*.xethub.hf.co` 접속 확인, 권한이면 토큰).
@@ -347,13 +347,13 @@ LeLab(huggingface/leLab) 에 있고 lrweb 에 없던 것 중 가장 큰 것. 구
 
 - **데이터셋 복구** (`tools_dsrepair.py`, LeLab 코드 기반): `finalize()` 전에 끊긴 v3.0 데이터셋은 `meta/episodes/` 가 없어 열리지 않습니다.
   읽을 수 있는 parquet·영상 길이로 색인을 다시 만들고, 꼬리 없는 parquet 는 `.unreadable` 로 치우고, 잃은 에피소드가 있으면 data 를 잘라내고
-  stats 를 다시 계산합니다. lrweb 쪽 변경: 백업(`DATA_ROOT/.repair_backup/<이름>_<시각>/` — 폴더 밖이라 다운로드·업로드에 안 섞임), 작업(`repair`)으로 실행,
+  stats 를 다시 계산합니다. arm-lab 쪽 변경: 백업(`DATA_ROOT/.repair_backup/<이름>_<시각>/` — 폴더 밖이라 다운로드·업로드에 안 섞임), 작업(`repair`)으로 실행,
   목록에서 v3.0 이고 수집 중이 아닌데 `meta/episodes/*.parquet` 가 없으면 **마무리 안 됨** 표시.
 - **롤아웃 사전 점검** `policy_fit()`: 체크포인트 `config.json` 의 `input_features` 로 카메라 이름(없으면 거부)·해상도(다르면 경고)·
   `observation.state` 차원(한팔 6 / 양팔 12, 다르면 거부)을 대조. 가져온 모델처럼 학습 데이터셋 정보가 없어도 됩니다.
   언어 정책(smolvla·pi0·pi05 등)은 태스크 설명 필수.
 - **실패 원인 추정** `FAILURE_HINTS`: 로그 끝의 예외 문구 → 한국어 안내 (정규식 표, 위에서부터 첫 일치).
-- **캘리브레이션 프롬프트**: lerobot 이 모터 값 ≠ 파일일 때 `input()` 으로 묻는 것을 `lrweb_rollout.py` 가 "파일을 모터에 쓰기"(ENTER) 로만 답합니다.
+- **캘리브레이션 프롬프트**: lerobot 이 모터 값 ≠ 파일일 때 `input()` 으로 묻는 것을 `armlab_rollout.py` 가 "파일을 모터에 쓰기"(ENTER) 로만 답합니다.
   Control 탭 연결과 같은 동작. 처음부터 하는 캘리브레이션 질문이면 `EOFError` 로 멈추고 Calib 탭 안내.
 - **수집 신호음·키**: WebAudio 사인파(파일 없음). 녹화 시작 660→880 Hz, 저장 660→440 Hz, 최대 길이 마지막 3 초 880 Hz.
   Space/→ = 다음 단계, ←/Backspace = 버리고 다시, Esc = 수집 끝내기(대기 중). 음소거는 localStorage.
@@ -386,7 +386,7 @@ LeLab 에 있지만 넣지 않은 것: 온보딩 투어(셋업 마법사가 대�
 - 헤드리스 Chromium — SO 한팔·양팔, OMX 한팔·양팔 네 구성에서 전 페이지 JS 오류 0
 - `tools_jscheck.py` — 인라인 JS 문법
 - OpenVINO: 실제 lerobot(e40b58a)·torch 2.11·OpenVINO 2026.4 로 합성 데이터셋 → CPU 학습 20 step 체크포인트 → 변환(FP16/INT8, CPU) →
-  가상 SO-ARM101 팔 + 가상 카메라로 lrweb 에서 OV 롤아웃(정상 종료·SIGINT 중지·NPU/GPU 없음 → CPU 대체·해상도 불일치·낡은 IR 거부),
+  가상 SO-ARM101 팔 + 가상 카메라로 arm-lab 에서 OV 롤아웃(정상 종료·SIGINT 중지·NPU/GPU 없음 → CPU 대체·해상도 불일치·낡은 IR 거부),
   PyTorch 롤아웃 회귀. **NPU·내장 GPU 실측은 하지 못했습니다** (시험 서버에 장치 없음)
 - Hub: 실제 Hub API 로 하드웨어·가격 목록, 잘못된 토큰 거부, 체크포인트 찾기(루트형), 클라우드 학습 인자를 lerobot 이 받아 제출 직전
   ("Not logged in")까지 진행 확인(과금 없음). 대용량 파일 다운로드는 시험 환경에서 `*.xethub.hf.co` 가 막혀 실제 전송은 확인 못 함(실패 시 정리는 확인)

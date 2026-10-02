@@ -8,4 +8,4 @@ The URDF and STL mesh files in this directory are derived from the
 - License: Apache License 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
 
 Modifications: file layout flattened and mesh path prefixes removed
-for use with the lrweb URDF viewer.
+for use with the armlab URDF viewer.

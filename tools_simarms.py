@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""가상 팔 — 실제 팔 없이 lrweb 전체 흐름(셋업 마법사·Calib·Control·Collect)을 시험하는 도구.
+"""가상 팔 — 실제 팔 없이 arm-lab 전체 흐름(셋업 마법사·Calib·Control·Collect)을 시험하는 도구.
 
     python tools_simarms.py --robot so101 --mode bimanual     # SO-ARM101 양팔 (보드 4개)
     python tools_simarms.py --robot omx   --mode single       # OMX 한팔 (보드 2개)
 
-켜 두는 동안 lrweb 의 포트 목록에 '가상 …' 보드로 나타나고, 끄면 사라집니다 (lrweb 재시작 불필요).
+켜 두는 동안 arm-lab 의 포트 목록에 '가상 …' 보드로 나타나고, 끄면 사라집니다 (arm-lab 재시작 불필요).
 실제 팔과는 아무 관계가 없습니다 — 실제 팔을 쓸 때는 이 도구를 켜지 않으면 됩니다.
 
 동작
@@ -21,7 +21,7 @@
         q          끝내기
   - 모터 ID 세팅(보드레이트·ID 변경)은 흉내내지 않습니다.
 
-포트 경로는 레포 안의 lrweb_sim/<이름> 심볼릭 링크로 고정됩니다 — 껐다 켜도 같은 경로라 다시 지정할 필요가 없습니다.
+포트 경로는 레포 안의 armlab_sim/<이름> 심볼릭 링크로 고정됩니다 — 껐다 켜도 같은 경로라 다시 지정할 필요가 없습니다.
 """
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ import tty
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SIM_DIR = ROOT / "lrweb_sim"
-SIM_FILE = ROOT / "lrweb_sim.json"
+SIM_DIR = ROOT / "armlab_sim"
+SIM_FILE = ROOT / "armlab_sim.json"
 JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 
 
@@ -311,7 +311,7 @@ class SimArm:
         self.master, slave = pty.openpty()
         tty.setraw(self.master)
         tty.setraw(slave)
-        self._slave = slave                   # 열어 두어야 lrweb 가 닫아도 PTY 가 유지됩니다
+        self._slave = slave                   # 열어 두어야 arm-lab 이 닫아도 PTY 가 유지됩니다
         self.dev = os.ttyname(slave)
         self.link = SIM_DIR / self.name
         self.wiggle_until = 0.0
@@ -351,7 +351,7 @@ class SimArm:
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="가상 팔 — 실제 팔 없이 lrweb 시험")
+    ap = argparse.ArgumentParser(description="가상 팔 — 실제 팔 없이 arm-lab 시험")
     ap.add_argument("--robot", choices=("so101", "omx"), default="so101")
     ap.add_argument("--mode", choices=("single", "bimanual"), default="single")
     ap.add_argument("--auto", action="store_true", help="시작부터 리더를 계속 움직임")
@@ -400,7 +400,7 @@ def main(argv=None):
     threading.Thread(target=loop, daemon=True).start()
 
     def show():
-        print(f"\n가상 {label} {'양팔' if a.mode == 'bimanual' else '한팔'} — lrweb 포트 목록에 '가상 …' 으로 나타납니다")
+        print(f"\n가상 {label} {'양팔' if a.mode == 'bimanual' else '한팔'} — arm-lab 포트 목록에 '가상 …' 으로 나타납니다")
         for i, arm in enumerate(arms, 1):
             print(f"  {i}. {arm.name:16s} {arm.link}  (→ {arm.dev})")
         print("명령: w <번호> 쓸기 · a 리더 자동 움직임 " + ("[켜짐]" if state["auto"] else "[꺼짐]") + " · l 목록 · q 끝")

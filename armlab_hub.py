@@ -1,16 +1,16 @@
 #!/usr/bin/env python
-"""lrweb ↔ Hugging Face Hub — 로그인 상태, 데이터셋 올리기/받기, 모델 받기, HF Jobs 클라우드 학습.
+"""arm-lab ↔ Hugging Face Hub — 로그인 상태, 데이터셋 올리기/받기, 모델 받기, HF Jobs 클라우드 학습.
 
-lrweb 가 오래 걸리는 일(업로드·다운로드·클라우드 학습)을 작업(job)으로 띄울 때 쓰는 명령:
+arm-lab 이 오래 걸리는 일(업로드·다운로드·클라우드 학습)을 작업(job)으로 띄울 때 쓰는 명령:
 
-  python lrweb_hub.py push-dataset  --root <로컬 데이터셋 폴더> --repo <user/name> [--public]
-  python lrweb_hub.py pull-dataset  --repo <org/name> --dest <DATA_ROOT> [--name <로컬 이름>]
-  python lrweb_hub.py pull-model    --repo <org/name> --dest <OUT_ROOT> [--step <체크포인트>] [--name <로컬 이름>]
-  python lrweb_hub.py cloud-train   --root <로컬 데이터셋 폴더> --name <데이터셋 이름> --flavor <HF Jobs 하드웨어>
+  python armlab_hub.py push-dataset  --root <로컬 데이터셋 폴더> --repo <user/name> [--public]
+  python armlab_hub.py pull-dataset  --repo <org/name> --dest <DATA_ROOT> [--name <로컬 이름>]
+  python armlab_hub.py pull-model    --repo <org/name> --dest <OUT_ROOT> [--step <체크포인트>] [--name <로컬 이름>]
+  python armlab_hub.py cloud-train   --root <로컬 데이터셋 폴더> --name <데이터셋 이름> --flavor <HF Jobs 하드웨어>
                                     -- <lerobot-train 인자...>
 
 토큰은 huggingface_hub 표준 위치(HF_HOME/token, `hf auth login` 과 같은 곳)에 둡니다.
-lrweb 프로세스 안에서 쓰는 가벼운 함수(whoami 캐시·로그인·하드웨어 목록)도 여기 있습니다.
+arm-lab 프로세스 안에서 쓰는 가벼운 함수(whoami 캐시·로그인·하드웨어 목록)도 여기 있습니다.
 """
 import json
 import os
@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-LRWEB_TAG = "lrweb"
+ARMLAB_TAG = "armlab"
 _WHOAMI = {"token": None, "t": 0.0, "v": None}
 _FLAVORS = {"t": 0.0, "v": None}
 
@@ -29,7 +29,7 @@ def say(*a):
     print(*a, flush=True)
 
 
-# ----------------------------------------------------------------- lrweb 프로세스용
+# ----------------------------------------------------------------- arm-lab 프로세스용
 def status(refresh=False):
     """{"ok": 로그인 여부, "user", "orgs", "error"} — whoami 는 /whoami-v2 사용량 제한이 있어 5분 캐시."""
     try:
@@ -132,7 +132,7 @@ def push_dataset(root, repo, private=True):
         raise SystemExit(f"데이터셋 폴더가 아닙니다: {root}")
     say(f"[hub] 데이터셋 올리기: {root} → {repo} ({'비공개' if private else '공개'})")
     ds = LeRobotDataset(repo, root=root)
-    ds.push_to_hub(private=private, tags=["lerobot", LRWEB_TAG])
+    ds.push_to_hub(private=private, tags=["lerobot", ARMLAB_TAG])
     say(f"[hub] 완료: https://huggingface.co/datasets/{repo}")
     return repo
 
@@ -192,7 +192,7 @@ def pull_model(repo, dest, step=None, name=None):
         target.parent.mkdir(parents=True)
         shutil.move(str(src), str(target))
         shutil.rmtree(target / ".cache", ignore_errors=True)
-        (dest / run / "lrweb_import.json").write_text(json.dumps(
+        (dest / run / "armlab_import.json").write_text(json.dumps(
             {"imported": time.strftime("%F %T"), "from": f"hf:{repo}", "original_name": repo, "step": step},
             ensure_ascii=False, indent=1))
     finally:
@@ -211,9 +211,9 @@ def cloud_train(root, name, flavor, train_args):
     push_dataset(root, repo, private=True)
     argv = [a for a in train_args if not a.startswith(("--dataset.repo_id=", "--dataset.root=", "--output_dir="))]
     argv = [sys.executable, "-m", "lerobot.scripts.lerobot_train", f"--dataset.repo_id={repo}", *argv,
-            f"--job.target={flavor}", f'--job.tags=["{LRWEB_TAG}"]', "--save_checkpoint_to_hub=true"]
+            f"--job.target={flavor}", f'--job.tags=["{ARMLAB_TAG}"]', "--save_checkpoint_to_hub=true"]
     say("[hub] HF Jobs 제출: " + " ".join(argv[2:]))
-    os.execv(sys.executable, argv)        # PID 를 그대로 이어받아 lrweb 의 작업 추적·중지가 그대로 동작
+    os.execv(sys.executable, argv)        # PID 를 그대로 이어받아 arm-lab 의 작업 추적·중지가 그대로 동작
 
 
 def main(argv=None):
@@ -227,7 +227,7 @@ def main(argv=None):
     if "--" in rest:
         i = rest.index("--")
         rest, extra = rest[:i], rest[i + 1:]
-    ap = argparse.ArgumentParser(prog=f"lrweb_hub.py {cmd}")
+    ap = argparse.ArgumentParser(prog=f"armlab_hub.py {cmd}")
     if cmd == "push-dataset":
         ap.add_argument("--root", required=True)
         ap.add_argument("--repo", required=True)
