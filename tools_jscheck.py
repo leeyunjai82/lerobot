@@ -74,7 +74,7 @@ def main():
         for name in ("COLLECT_RUN_HTML", "REVIEW_HTML", "WIZARD_HTML", "ROLLOUT_RUN"):
             blk = ro_run if name == "ROLLOUT_RUN" else getattr(armlab, name, "")
             if en:
-                blk = armlab.to_en(blk)
+                blk = armlab.to_en_html(blk)
             for i, js in enumerate(re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", blk, re.S)):
                 js = js.strip()
                 if not js:

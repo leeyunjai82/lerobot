@@ -333,11 +333,62 @@ def _i18n():
     return _I18N
 
 
+_JOSA = set("을를이가은는에로와과의도만")
+
+
 def to_en(text):
     t = _i18n()
     if not t or t["rx"] is None:
         return text
-    return t["rx"].sub(lambda mt: t["map"][mt.group(0)], text)
+
+    def rep(mt):
+        k, v = mt.group(0), t["map"][mt.group(0)]
+        if not v.strip():
+            return v
+        # 한국어는 조사를 태그·영문 뒤에 붙여 씁니다 (<b>설정 저장</b>을 → </b> to apply) — 영어는 띄어야 합니다
+        a = text[mt.start() - 1] if mt.start() else ""
+        lt = text.rfind("<", 0, mt.start())
+        closing = a == ">" and lt >= 0 and text.startswith("</", lt)      # </b>을 → 띄움, <b>저장 → 안 띄움
+        if a and v[0].isalnum() and (closing or a in ")]}" or (a.isascii() and a.isalnum())
+                                     or (a in "'\"`" and k[0] in _JOSA)):
+            v = " " + v
+        z = text[mt.end()] if mt.end() < len(text) else ""
+        if v[-1].isalnum() and z.isascii() and z.isalnum():
+            v += " "
+        return v
+    return t["rx"].sub(rep, text)
+
+
+# 사용자가 입력한 글(작업 설명 task, 설정값, 메모)은 번역하면 저장할 때 망가지므로 건드리지 않습니다.
+I18N_KEEP_KEYS = {"task", "tasks", "default_task", "config", "note", "notes", "memo", "desc", "description"}
+_I18N_KEEP_HTML = re.compile(r'(\svalue="[^"]*"|<textarea[^>]*>.*?</textarea>)', re.S)
+
+
+def to_en_html(text):
+    """HTML·JS — 입력칸의 value="..." 와 textarea 내용(사용자 글)은 남기고 나머지만 바꿉니다."""
+    parts = _I18N_KEEP_HTML.split(text)
+    return "".join(x if i % 2 else to_en(x) for i, x in enumerate(parts))
+
+
+def to_en_obj(o, key=None):
+    """JSON — 문자열 값만 바꾸고 I18N_KEEP_KEYS 아래는 그대로 둡니다."""
+    if key in I18N_KEEP_KEYS:
+        return o
+    if isinstance(o, str):
+        return to_en(o)
+    if isinstance(o, list):
+        return [to_en_obj(x) for x in o]
+    if isinstance(o, dict):
+        return {k: to_en_obj(v, k) for k, v in o.items()}
+    return o
+
+
+def to_en_json(text):
+    try:
+        o = json.loads(text)
+    except ValueError:
+        return to_en(text)
+    return json.dumps(to_en_obj(o), ensure_ascii=False)
 
 
 def lang_of(cookies):
@@ -354,7 +405,8 @@ async def i18n_middleware(request: Request, call_next):
     if not (ct.startswith("text/html") or ct.startswith("application/json")):
         return resp                    # 영상·MJPEG·tar 다운로드 등은 그대로 흘림
     body = b"".join([chunk async for chunk in resp.body_iterator])
-    out = to_en(body.decode("utf-8", "replace")).encode("utf-8")
+    text = body.decode("utf-8", "replace")
+    out = (to_en_json(text) if ct.startswith("application/json") else to_en_html(text)).encode("utf-8")
     headers = {k: v for k, v in resp.headers.items() if k.lower() != "content-length"}
     return Response(out, status_code=resp.status_code, headers=headers)
 
@@ -5395,11 +5447,7 @@ async def ws_control(sock: WebSocket):
         _send = sock.send_text
 
         async def _send_en(t):          # json.dumps 기본값은 한글을 \uXXXX 로 내보내므로 풀어서 바꿉니다
-            try:
-                t = to_en(json.dumps(json.loads(t), ensure_ascii=False))
-            except ValueError:
-                t = to_en(t)
-            await _send(t)
+            await _send(to_en_json(t))
 
         sock.send_text = _send_en
     if not ws_authed(sock):

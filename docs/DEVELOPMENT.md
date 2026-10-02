@@ -32,7 +32,8 @@
 | `armlab_hub.py` | Hugging Face Hub — 로그인 상태(whoami 캐시)·하드웨어 목록, 데이터셋 올리기/받기, 모델 받기, HF Jobs 클라우드 학습 래퍼 |
 | `tools_dsrepair.py` | 마무리 안 된(끊긴) 데이터셋 복구 — huggingface/leLab `dataset_repair.py`(Apache-2.0)를 옮겨 와 백업·CLI 추가 |
 | `armlab_ov.py` | ACT → OpenVINO 변환·검증(`convert`), 장치 조회(`devices`), OpenVINO 추론으로 lerobot-rollout 실행(`rollout`). arm-lab 은 이 파일을 별도 프로세스로 띄웁니다 |
-| `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
+| `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 (`--en` 이면 영어 치환 후 검증) |
+| `armlab_i18n_en.json` | 영어 화면 사전 — 한국어 조각 → 영어 (한/EN 버튼) |
 | `tools_simarms.py` | 가상 팔 — PTY 위에서 STS3215 / Dynamixel X 를 흉내. 켜 있으면 `armlab_sim.json` 에 포트를 알리고 arm-lab 포트 목록에 추가됨 |
 | `plugins/lerobot_robot_bi_omx/` | 양팔 OMX 팔로워 `bi_omx_follower` (lerobot 플러그인) |
 | `plugins/lerobot_teleoperator_bi_omx/` | 양팔 OMX 리더 `bi_omx_leader` |
@@ -365,6 +366,26 @@ LeLab(huggingface/leLab) 에 있고 arm-lab 에 없던 것 중 가장 큰 것. �
 LeLab 에 있지만 넣지 않은 것: 온보딩 투어(셋업 마법사가 대신), 자체 업데이트(git checkout 이라 `git pull`), W&B, 단일 탭 강제
 (Control 은 이미 소유권으로 막음), OS 별 카메라 이름 매칭(Linux 전용 도구).
 
+## 한/영 전환 (i18n)
+
+화면 문자열은 소스에 한국어로 그대로 둡니다. 영어 모드(쿠키 `armlab_lang=en`, 기본값은 `ARMLAB_LANG`)면 서버가 응답을 내보내기
+직전에 사전 `armlab_i18n_en.json` 으로 한국어 조각을 바꿉니다. 화면마다 번역 키를 다는 방식보다 소스 변경이 적고,
+번역이 빠진 곳은 한국어로 남을 뿐 깨지지 않습니다.
+
+- **어디서**: HTTP 미들웨어(`i18n_middleware`)가 `text/html`·`application/json` 응답을, Control WebSocket 은 `send_text` 를 감싸서 바꿉니다.
+  영상·MJPEG·다운로드는 건드리지 않습니다. `/lang` 은 쿠키를 뒤집고 같은 사이트의 직전 경로로 되돌립니다(외부 referer 는 `/`).
+- **어떻게**: 사전 키를 길이 내림차순으로 묶은 정규식 하나로 한 번에 치환합니다. 키는 소스 문자열 리터럴(주석·docstring 제외)을
+  따옴표·태그·`{}`·이스케이프·`+=;|` 경계로 잘라 만든 조각이라, 화면 문자열은 조각 단위로 정확히 맞습니다. 사전 파일이 바뀌면
+  (mtime) 다시 읽습니다.
+- **문법 안전**: 사전 값에는 따옴표(`'` `"` `` ` ``)·역슬래시·`<` `>` `{` `}`·줄바꿈을 넣지 않습니다 — JS 문자열·JSON·HTML 속성 안에서 치환해도 문법이 깨지지
+  않습니다. `\n` 이스케이프 뒤의 조각은 키가 `n삭제할까요` 처럼 `n` 으로 시작하므로 값도 `n` 으로 시작해야 합니다.
+  `tools_jscheck.py --en` 으로 치환 후 JS 를 검증합니다.
+- **띄어쓰기 보정**: 한국어는 조사를 닫는 태그·영문 바로 뒤에 붙여 쓰므로(`</b>을 누르면`, `ACT로`) 치환 결과 앞에 공백을 넣습니다
+  (`</…>`·`)]}`·영숫자 뒤, 또는 따옴표 뒤인데 키가 조사로 시작할 때). 뒤가 영숫자면 뒤에도 넣습니다.
+- **사용자 글 보호**: HTML 의 `value="…"` 속성과 `<textarea>` 내용, JSON 의 `task`·`tasks`·`default_task`·`config`·`note(s)`·`memo`·`desc(ription)`
+  키 아래 값은 바꾸지 않습니다(`I18N_KEEP_KEYS`). 영어 화면에서 불러와 그대로 저장해도 한국어 태스크 설명이 망가지지 않습니다.
+- **화면 문자열을 고치면** 사전도 고칩니다(CLAUDE.md). 새 조각은 소스에서 다시 뽑아 사전에 없는 키만 번역해 넣으면 됩니다.
+
 ## lerobot 버전·설치
 
 - lerobot commit `e40b58a8dfa9e7b86918c374791599d070518d11` 에 맞춰져 있습니다 (`lerobot_conda.sh` 의 `LEROBOT_COMMIT`)
@@ -384,7 +405,9 @@ LeLab 에 있지만 넣지 않은 것: 온보딩 투어(셋업 마법사가 대�
   확인 단계, Control 연결 순서·E-STOP·과부하 모터, 포트 감시, 모터 ID 세팅, 양팔 OMX 플러그인
 - lerobot API 스텁 — Collect 상태 기계, 양팔 녹화 worker, 강제 종료, 환경·프로젝트
 - 헤드리스 Chromium — SO 한팔·양팔, OMX 한팔·양팔 네 구성에서 전 페이지 JS 오류 0
-- `tools_jscheck.py` — 인라인 JS 문법
+- `tools_jscheck.py` — 인라인 JS 문법 (한국어·영어 두 모드)
+- 영어 모드 — 헤드리스 Chromium 으로 전 페이지 순회: 한/EN 버튼 전환·복귀, JS 오류 0, 화면에 남은 한국어 없음(버튼 글자 제외),
+  한국어 태스크 설명이 입력칸·`/api/setup/state`·`/api/projects` 에서 그대로 유지
 - OpenVINO: 실제 lerobot(e40b58a)·torch 2.11·OpenVINO 2026.4 로 합성 데이터셋 → CPU 학습 20 step 체크포인트 → 변환(FP16/INT8, CPU) →
   가상 SO-ARM101 팔 + 가상 카메라로 arm-lab 에서 OV 롤아웃(정상 종료·SIGINT 중지·NPU/GPU 없음 → CPU 대체·해상도 불일치·낡은 IR 거부),
   PyTorch 롤아웃 회귀. **NPU·내장 GPU 실측은 하지 못했습니다** (시험 서버에 장치 없음)
