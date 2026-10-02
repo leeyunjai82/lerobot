@@ -2367,8 +2367,11 @@ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
   border-bottom:2px solid transparent;font-weight:500;font-size:13.5px}
 .nav a:hover{color:var(--text);text-decoration:none}
 .nav a.on{color:var(--text);border-bottom-color:var(--accent)}
-.statuscluster{margin-left:auto;display:flex;align-items:center;gap:10px;
+.statuscluster{margin-left:auto;display:flex;align-items:center;gap:10px;min-width:0;white-space:nowrap;
   font-family:var(--mono);font-size:12px;color:var(--muted)}
+.jobtxt{color:inherit;overflow:hidden;text-overflow:ellipsis;min-width:0}
+/* 탭이 11개라 1600px 아래에서는 작업 id 를 숨기고(마우스를 올리면 보임) 탭 간격을 줄입니다 */
+@media(max-width:1600px){ .statuscluster .jobid{display:none} .nav a{padding:0 10px} .appbar{gap:18px} }
 .dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
 .dot.live{background:var(--ok);animation:pulse 1.6s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
@@ -2492,7 +2495,7 @@ def nav_html(active=""):
         j = running[0]
         extra = f' +{len(running) - 1}' if len(running) > 1 else ''
         cluster = (f'<div class=statuscluster><span class="dot live"></span>'
-                   f'{esc(j["kind"].upper())} · {esc(j["id"])}{extra}</div>')
+                   f'<a href="/jobs/{esc(j["id"])}" class=jobtxt title="{esc(j["id"])}">{esc(j["kind"].upper())}<span class=jobid> · {esc(j["id"])}</span>{extra}</a></div>')
     else:
         cluster = '<div class=statuscluster><span class=dot></span>IDLE</div>'
     pname, _ = active_project()

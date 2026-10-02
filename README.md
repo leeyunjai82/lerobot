@@ -53,6 +53,23 @@ pip install --no-deps -e plugins/lerobot_robot_bi_omx -e plugins/lerobot_teleope
 pip install "openvino>=2025.4" "nncf>=2.19"
 ```
 
+### 예전 설치(lrweb, `~/project/lerobot`)에서 옮기기
+
+arm-lab 으로 이름이 바뀌면서 실행 파일(`lrweb.py` → `main.py`), 작업 폴더, 설정 파일 이름(`lrweb_*` → `armlab_*`), conda 환경 이름
+(`lerobot` → `arm-lab`)이 바뀌었습니다. 새로 설치한 뒤 예전 기기의 데이터·설정을 이렇게 옮깁니다.
+
+```bash
+OLD=~/project/lerobot; NEW=~/project/arm-lab
+cp -a $OLD/data $NEW/                     # 데이터셋 + 캘리브레이션 (data/hf/lerobot/...)
+cp -a $OLD/outputs $NEW/                  # 학습한 모델
+cd $OLD && for f in lrweb_*.json; do cp "$f" "$NEW/armlab_${f#lrweb_}"; done   # 설정·프로젝트·환경 목록
+[ -d lrweb_envs ] && cp -a lrweb_envs $NEW/armlab_envs
+```
+
+- 설정(`armlab_config.json`)을 옮기면 Setup·캘리브레이션을 다시 할 필요가 없습니다
+- 새로 설치하지 않고 예전 폴더에서 `git pull` 만 했다면, conda 환경 이름이 달라 `activate.sh` 가 실패합니다 —
+  `conda rename -n lerobot arm-lab` 로 이름을 바꾸거나 새로 설치하세요
+
 ## 실행
 
 ```bash
@@ -332,13 +349,19 @@ python tools_dxlcheck.py --port /dev/serial/by-id/usb-... --role follower   # OM
 | 양팔 OMX 추론이 안 됨 | 플러그인 설치 필요 — 위 "이미 설치된 기기 업데이트" 의 두 번째 `pip` 줄 |
 | 수집 화면이 멈춤 | 오른쪽 위 **강제 종료** 후 다시 시작 |
 | 업데이트 후 화면이 이상함 | arm-lab 재시작 + 브라우저 강력 새로고침 |
+| 데이터셋에 "마무리 안 됨" | 녹화가 끊긴 데이터셋 — Datasets 의 **복구** (백업 후 남은 에피소드로 색인 재생성) |
+| 롤아웃이 바로 끝남 | 실행 화면의 **원인 추정** 과 로그 확인 (모터 무응답·과부하·포트·카메라·캘리브레이션) |
+| "정책이 카메라 … 를 씁니다" / "관절 수 …" | 학습 때와 카메라 이름·한팔/양팔이 다름 — Setup 을 학습 때와 같게 |
+| 카메라 여러 대가 끊김·멈춤 | Setup → 카메라 **형식** 을 MJPG 로 (USB 대역폭) |
+| Hub 받기 실패 | `huggingface.co` 와 `*.xethub.hf.co`(대용량 파일) 접속 확인. 비공개 repo 는 소유자 토큰 필요 |
+| HF Jobs 학습을 멈췄는데 요금이 걱정됨 | Hub 탭의 **원격 취소** — 중지 버튼도 원격 작업을 취소하지만, HF Jobs 페이지에서 상태를 한 번 확인하세요 |
 
 ### 예전 버전으로 되돌리기
 
 SO-ARM101 만 쓰던 안정 버전에 태그가 있습니다.
 
 ```bash
-git checkout so-arm101-stable    # 되돌리기
+git checkout so-arm101-stable    # 되돌리기 (이 버전은 실행 파일이 lrweb.py, 설정이 lrweb_config.json 입니다)
 git checkout main                # 최신으로
 ```
 
@@ -363,3 +386,4 @@ ARMLAB_AUTH=on        python main.py    # armlab_token.txt 에 자동 생성
 - `urdf/` SO-101 URDF·STL: [TheRobotStudio SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100) (Apache 2.0) — [urdf/LICENSE.md](urdf/LICENSE.md)
 - `urdf/omx_f.urdf`, `urdf/open_manipulator_description/`: [ROBOTIS open_manipulator](https://github.com/ROBOTIS-GIT/open_manipulator) (Apache 2.0) — [urdf/LICENSE-omx.md](urdf/LICENSE-omx.md)
 - `plugins/`: lerobot `bi_so_follower` / `bi_so_leader` 구조를 따른 코드 (Apache 2.0)
+- `tools_dsrepair.py`: [huggingface/leLab](https://github.com/huggingface/leLab) `dataset_repair.py` 를 옮겨 고친 코드 (Apache 2.0, 파일 머리에 표기)
