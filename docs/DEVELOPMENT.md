@@ -14,6 +14,8 @@
 - [팔 불량 점검 판정 근거](#팔-불량-점검-판정-근거)
 - [보안·동시성](#보안동시성)
 - [OpenVINO (Intel NPU / GPU / CPU)](#openvino-intel-npu--gpu--cpu)
+- [롤아웃 실행기·실시간 모니터·시도 기록](#롤아웃-실행기실시간-모니터시도-기록)
+- [모델·데이터셋 내보내기/가져오기, 이어서 학습, 정책](#모델데이터셋-내보내기가져오기-이어서-학습-정책)
 - [lerobot 버전·설치](#lerobot-버전설치)
 - [테스트](#테스트)
 
@@ -24,6 +26,7 @@
 | `lrweb.py` | 웹 툴 전체 (FastAPI 한 파일, port 8080). `python lrweb.py --worker record <jid>` 로 수집 worker 도 겸함 |
 | `tools_armcheck.py` | SO-ARM101(STS3215) 팔 점검 — Setup 탭·마법사 진단과 CLI 공용 |
 | `tools_dxlcheck.py` | OMX(Dynamixel X) 팔 점검 — 같은 함수 이름·결과 형식 |
+| `lrweb_rollout.py` | 롤아웃 실행기 — lerobot-rollout 을 같은 프로세스에서 돌리며 실시간 상태(카메라·관절·추론 ms·Hz)를 `RUN_DIR/<jid>/` 에 씀. `--lrweb.engine=ov` 면 lrweb_ov 로 신경망 교체 |
 | `lrweb_ov.py` | ACT → OpenVINO 변환·검증(`convert`), 장치 조회(`devices`), OpenVINO 추론으로 lerobot-rollout 실행(`rollout`). lrweb 는 이 파일을 별도 프로세스로 띄웁니다 |
 | `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
 | `tools_simarms.py` | 가상 팔 — PTY 위에서 STS3215 / Dynamixel X 를 흉내. 켜 있으면 `lrweb_sim.json` 에 포트를 알리고 lrweb 포트 목록에 추가됨 |
@@ -44,6 +47,8 @@
 | `lrweb_wizard.json` | 마법사의 팔별 '확인 완료' 기록 (환경별) |
 | `lrweb_jobs/` | 백그라운드 작업 기록·로그 |
 | `lrweb_marks.json` | 불량 에피소드 표시 |
+| `lrweb_trials.json` | 롤아웃 시도 결과 (체크포인트별 성공/실패) |
+| `outputs/<run>/lrweb_import.json` | 다른 기기에서 가져온 모델 표시 |
 
 ## 기종 (SO-ARM101 / OMX)
 
@@ -273,10 +278,48 @@ lrweb 쪽
   OV 롤아웃은 작업 종류가 그대로 `rollout` 이라 배타·중지·체크포인트 삭제 보호가 기존 규칙을 따릅니다.
 - `/api/ov/status?ckpt=` · `/api/ov/convert` · `/api/rollout` 의 `engine: torch | ov:NPU | ov:GPU | ov:CPU`, `precision: fp16 | int8`.
 
+## 롤아웃 실행기·실시간 모니터·시도 기록
+
+physical-ai-studio 는 추론 중 카메라·3D 는 보여 주지만 명령값·지연은 안 보여 주고, 실기 성공률을 기록하는 기능이 없습니다.
+lrweb 는 둘 다 넣었습니다.
+
+- 모든 롤아웃(PyTorch/OpenVINO)은 `lrweb_rollout.py` 로 띄웁니다. `lerobot.scripts.lerobot_rollout.main()` 을 그대로 부르고
+  세 곳만 감쌉니다 — 관찰만 하고 로봇에 가는 명령은 바꾸지 않습니다.
+  - `lerobot.rollout.context.make_robot_from_config` → 로봇 인스턴스의 `get_observation`(카메라 프레임·관절 실측·제어 주기),
+    `send_action`(마지막 명령), `connect`(단계 표시)
+  - `SyncInferenceEngine.get_action` → 틱별 시간. 최근 5 초 중앙값 = 보통 틱(큐에서 꺼내기), 최대 = 청크 계산
+  - `RolloutStrategy._teardown_hardware` → "시작 자세로 복귀 중" 단계
+- 별도 스레드가 10 fps 로 `status.json`·`cam_*.jpg` 를 원자적으로 씁니다 (수집 worker 와 같은 규칙, 제어 루프에 인코딩 비용 없음).
+  웹은 `/api/rollout/status/<jid>`, `/api/runstream/<jid>/<cam>`(MJPEG) 로 읽습니다.
+- ACT·Diffusion 체크포인트면 `--policy.pretrained_backbone_weights=null` 을 붙입니다. 모델을 만들 때 torchvision 이
+  ImageNet 가중치를 내려받는데 곧바로 체크포인트 가중치로 덮어써져 쓸모가 없고, 오프라인 기기에서는 여기서 죽습니다.
+  BatchNorm/GroupNorm 구조는 `use_group_norm` 이 따로 정하므로 구조는 같습니다.
+- 시도 기록: `POST /api/rollout/trial {job, result: success|fail|undo}` → `lrweb_trials.json` 의 체크포인트(outputs 기준 상대경로) 목록에 추가.
+  작업 id·엔진·환경을 같이 남깁니다. 끝난 실행도 `/rollout?job=<jid>` 로 다시 열어 기록할 수 있습니다.
+- 화면 갱신은 앞 요청이 끝난 뒤 다음 요청(0.5 s) — 서버가 느려도 요청이 쌓이지 않고, 늦게 온 옛 응답은 버립니다.
+
+## 모델·데이터셋 내보내기/가져오기, 이어서 학습, 정책
+
+- **내보내기** `GET /api/model/download?ckpt=` — `pretrained_model` 만(학습 상태 제외), tar 안 경로를 `<run>/checkpoints/<step>/pretrained_model`
+  로 맞춰 받는 쪽에서 같은 구조로 풀리게 합니다. `openvino/cache`(장치별 컴파일 캐시)는 뺍니다. 데이터셋은 기존 `/api/download/<ds>`.
+- **가져오기** `POST /api/import/{model|dataset}?filename=` — 원본 바이트를 그대로 스트리밍(python-multipart 의존성 없음).
+  - 업로드 크기는 여유 공간의 45% 이하(압축 파일 + 풀린 내용), 풀린 총량은 여유 공간의 90% 이하
+  - 절대경로·`..`·심볼릭/하드 링크·장치 파일은 거부, tar 는 `filter="data"` 로 풂. 임시 폴더(`.import_*`)는 끝나면 지움
+  - 모델: `config.json + model.safetensors` 폴더를 찾아 배치, 이름이 겹치면 `_2`. 묶음 안의 OpenVINO 변환본은 가중치 크기가 같을 때만
+    지문을 새로 찍어 "다시 변환 필요" 로 보이지 않게 함. 데이터셋: `meta/info.json` 이 있는 최상위 폴더
+  - 열린 프로젝트가 있으면 그 프로젝트에 넣음
+- **이어서 학습** `POST /api/train/resume {run, steps}` — `lerobot_train --config_path=<run>/checkpoints/last/pretrained_model/train_config.json
+  --resume=true --steps=<목표> --output_dir=<run>`. `last/training_state` 가 있어야 합니다(가져온 모델은 없음).
+- **정책** `TRAIN_POLICIES` 표: ACT(`--policy.type=act`), Diffusion(`--policy.type=diffusion`, `diffusers` 필요),
+  SmolVLA(`--policy.path=lerobot/smolvla_base`, `transformers`·`num2words` 필요). 시작 전에 `importlib.util.find_spec` 으로 패키지를
+  확인해 lerobot 이 수십 초 뒤 ImportError 로 죽기 전에 설치 명령을 알려 줍니다. OpenVINO 변환은 ACT 만.
+- **학습 그래프** — lerobot 로그 줄의 `loss`·`grdn`·`lr`·`smp/s` 를 읽어 loss, grad norm·학습률 그래프와 진행률·남은 시간
+  (남은 step ÷ (samples/s ÷ batch))을 보여 줍니다.
+
 ## lerobot 버전·설치
 
 - lerobot commit `e40b58a8dfa9e7b86918c374791599d070518d11` 에 맞춰져 있습니다 (`lerobot_conda.sh` 의 `LEROBOT_COMMIT`)
-- `pip install -e "lerobot-src[feetech,dynamixel,training]"`, 그다음 `torchcodec` 제거 + `av>=15,<16` (pyav 디코딩)
+- `pip install -e "lerobot-src[feetech,dynamixel,training,diffusion,smolvla]"`, 그다음 `torchcodec` 제거 + `av>=15,<16` (pyav 디코딩)
 - 양팔 OMX: `pip install --no-deps -e plugins/lerobot_robot_bi_omx -e plugins/lerobot_teleoperator_bi_omx`
 - Python 3.12, torch 2.9 cu130 (Thor 는 `https://pypi.jetson-ai-lab.io/sbsa/cu130`)
 - lerobot 이 `torch<2.12, torchvision<0.27` 을 요구합니다. `cuda`·`intel` 플랫폼은 이 범위로 받습니다(`thor` 는 기존 인덱스 그대로).
@@ -296,3 +339,5 @@ lrweb 쪽
 - OpenVINO: 실제 lerobot(e40b58a)·torch 2.11·OpenVINO 2026.4 로 합성 데이터셋 → CPU 학습 20 step 체크포인트 → 변환(FP16/INT8, CPU) →
   가상 SO-ARM101 팔 + 가상 카메라로 lrweb 에서 OV 롤아웃(정상 종료·SIGINT 중지·NPU/GPU 없음 → CPU 대체·해상도 불일치·낡은 IR 거부),
   PyTorch 롤아웃 회귀. **NPU·내장 GPU 실측은 하지 못했습니다** (시험 서버에 장치 없음)
+- 롤아웃 모니터·시도 기록(브라우저: 카메라·3D·관절표·S/F/U 키·중지 후 화면), 모델 내보내기→가져오기 왕복(OV 상태 유지),
+  악성 tar/zip(경로 탈출·링크) 거부, 데이터셋 왕복, 이어서 학습(20→30 step, 데이터 순서 이어짐), Diffusion 학습·롤아웃(오프라인)

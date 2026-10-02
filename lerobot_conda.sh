@@ -179,7 +179,7 @@ git -C "${LEROBOT_SRC}" checkout -q "${LEROBOT_COMMIT}" \
   || die "lerobot commit ${LEROBOT_COMMIT} 체크아웃 실패"
 cd "${LEROBOT_SRC}"
 
-log "4-1. lerobot[feetech,dynamixel,training] 설치 (torch 는 위 휠 유지)"
+log "4-1. lerobot[feetech,dynamixel,training,diffusion,smolvla] 설치 (torch 는 위 휠 유지)"
 # torch 를 pip 기본 인덱스 것으로 덮어쓰지 않도록 현재 버전으로 핀.
 # 로컬 버전 꼬리표(+cu130 / +cpu)는 뗍니다 — 붙어 있으면 pip 가 "Cannot install None" 으로 해석을 포기합니다.
 # (PEP 440: 'torch==2.11.0' 은 설치된 2.11.0+cu130 을 그대로 만족합니다)
@@ -190,7 +190,8 @@ print(f"torchvision=={torchvision.__version__.split('+')[0]}")
 PY
 cat /tmp/torch-constraint.txt
 # feetech = SO-ARM101 (STS3215), dynamixel = ROBOTIS OMX (XL430/XL330)
-PIP_CONSTRAINT=/tmp/torch-constraint.txt pip install -e ".[feetech,dynamixel,training]" \
+# diffusion / smolvla = Training 탭에서 고를 수 있는 정책 (diffusers / transformers)
+PIP_CONSTRAINT=/tmp/torch-constraint.txt pip install -e ".[feetech,dynamixel,training,diffusion,smolvla]" \
   || die "lerobot 설치 실패 (로그 확인)"
 
 # torchcodec 은 Jetson 에서 문제를 일으켜 pyav 디코딩으로 통일합니다 (README 와 동일)

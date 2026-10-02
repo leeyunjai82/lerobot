@@ -461,8 +461,10 @@ def _pop_opts(argv, prefix):
     return opts, rest
 
 
-def cmd_rollout(argv):
-    opts, rest = _pop_opts(argv, "--ov.")
+def prepare_rollout(opts, rest):
+    """--ov.* 옵션으로 OVEngine 을 만들고 ACTPolicy 를 패치합니다. (engine, 고친 lerobot 인자) 반환.
+    컴파일(특히 NPU 첫 컴파일)은 로봇 연결 전에 끝냅니다 — 연결된 채로 수십 초 멈춰 있지 않게."""
+    rest = list(rest)
     pol = next((a.split("=", 1)[1] for a in rest if a.startswith("--policy.path=")), "")
     if not pol:
         raise SystemExit("--policy.path=<.../pretrained_model> 가 필요합니다")
@@ -474,7 +476,6 @@ def cmd_rollout(argv):
         raise SystemExit(f"--ov.device 는 {'/'.join(DEVICE_ORDER)} 중 하나")
     precision = (opts.get("precision") or "fp16").lower()
     fps = float(opts.get("fps") or 30)
-    # 컴파일(특히 NPU 첫 컴파일)은 로봇 연결 전에 끝냅니다 — 연결된 채로 수십 초 멈춰 있지 않게
     engine = OVEngine(ck, device, precision, fps)
     patch_act(engine)
     if not any(a.startswith("--device=") for a in rest):
@@ -483,15 +484,13 @@ def cmd_rollout(argv):
         # 모델 생성 시 torchvision 이 ImageNet ResNet 가중치를 내려받는데, 곧바로 체크포인트 가중치로
         # 덮어써지므로 쓸모가 없습니다. 학습 기기와 다른(오프라인) Intel 기기에서는 이 다운로드에서 죽습니다.
         rest.append("--policy.pretrained_backbone_weights=null")
-    sys.argv = ["lerobot-rollout"] + rest
-    from lerobot.scripts.lerobot_rollout import main
-    try:
-        main()
-    finally:
-        if engine.ts:
-            ts = sorted(engine.ts)
-            say(f"[ov] 종료: 추론 {engine.n}회, 평균 {sum(ts) / len(ts):.1f} ms, "
-                f"p95 {ts[min(len(ts) - 1, int(len(ts) * 0.95))]:.1f} ms, 예산 초과 {engine.over}회 @ {engine.device}")
+    return engine, rest
+
+
+def cmd_rollout(argv):
+    """예전 호출 형태 호환 — lrweb_rollout.py 로 넘깁니다 (OV 엔진, 모니터 없음 / --lrweb.run_dir 있으면 모니터)."""
+    import lrweb_rollout
+    return lrweb_rollout.main(["--lrweb.engine=ov"] + list(argv))
 
 
 def main(argv=None):
@@ -520,8 +519,7 @@ def main(argv=None):
         convert(ck, int8=a.int8, fps=a.fps)
         return 0
     if cmd == "rollout":
-        cmd_rollout(args)
-        return 0
+        return cmd_rollout(args)
     print(f"알 수 없는 명령: {cmd}\n{__doc__}")
     return 2
 

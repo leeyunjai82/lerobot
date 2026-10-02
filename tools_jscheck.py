@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-PAGES = ("/projects", "/", "/collect", "/train", "/rollout", "/control", "/calib", "/setup", "/setup/wizard", "/jobs")
+PAGES = ("/projects", "/", "/collect", "/train", "/models", "/rollout", "/control", "/calib", "/setup", "/setup/wizard", "/jobs")
 
 
 def main():
@@ -64,15 +64,17 @@ def main():
                 seen[path] = seen.get(path, 0) + 1
         # 진행 중 작업이 있을 때만 그려지는 블록은 페이지 요청으로는 안 나옵니다.
         # 모듈 문자열을 직접 검사합니다.
-        for name in ("COLLECT_RUN_HTML", "REVIEW_HTML", "WIZARD_HTML"):
-            blk = getattr(lrweb, name, "")
+        # 롤아웃 실행 화면은 조립 함수로 만들어지므로 같은 방식으로 감싸 검사합니다
+        ro_run = "<script>" + lrweb.ARM3D_JS + lrweb.ROLLOUT_RUN_JS + "</script>"
+        for name in ("COLLECT_RUN_HTML", "REVIEW_HTML", "WIZARD_HTML", "ROLLOUT_RUN"):
+            blk = ro_run if name == "ROLLOUT_RUN" else getattr(lrweb, name, "")
             for i, js in enumerate(re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", blk, re.S)):
                 js = js.strip()
                 if not js:
                     continue
                 if js.startswith("{"):          # importmap
                     continue
-                chk.write_text("const JID='x', DS='x', URDF_OK=false, VIEWS_CFG={}, K3=null;\n" + js)
+                chk.write_text("const JID='x', DS='x', URDF_OK=false, VIEWS_CFG={}, K3=null, RO={};\n" + js)
                 r = subprocess.run([node, "--check", str(chk)], capture_output=True, text=True)
                 if r.returncode:
                     bad += 1

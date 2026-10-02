@@ -30,6 +30,7 @@ import sys
 import tarfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -2472,7 +2473,7 @@ def nav_html(active=""):
 
     return (f'<div class=appbar><div class=brand>LRWEB <a href="/setup/wizard" title="기종 바꾸기 — 셋업 마법사"><small>/ {esc(kind()["label"])}</small></a></div>'
             f'<div class=nav>{tab("/projects", "Projects", "pj")}{tab("/", "Datasets", "ds")}{tab("/collect", "Collect", "co")}'
-            f'{tab("/train", "Training", "tr")}{tab("/rollout", "Rollout", "ro")}'
+            f'{tab("/train", "Training", "tr")}{tab("/models", "Models", "md")}{tab("/rollout", "Rollout", "ro")}'
             f'{tab("/control", "Control", "ct")}{tab("/calib", "Calib", "cb")}{tab("/setup", "Setup", "st")}'
             f'{tab("/jobs", "Jobs", "jb")}</div>{cluster}'
             f'<button class=fsbtn title="전체화면" aria-label="전체화면" onclick="toggleFS()">'
@@ -2701,8 +2702,15 @@ def index(all: int = 0):
     받은 뒤 <span class=mono>tar xf 이름_v3.0.tar</span> 로 풀면 바로
     <span class=mono>LeRobotDataset(repo_id, root=풀린폴더)</span> 로 열립니다.
     환경 열은 수집할 때 쓴 환경이고, 흐리게 보이면 지금 환경과 다른 것입니다.</p>
-    <p class=muted>삭제는 폴더를 통째로 지웁니다 (복구 불가). 데이터셋 이름을 입력해야 실행됩니다.</p></div>
+    <p class=muted>삭제는 폴더를 통째로 지웁니다 (복구 불가). 데이터셋 이름을 입력해야 실행됩니다.</p>
+    <div class=card style="margin-top:14px"><div class=formgrid>
+      <label class=f style="min-width:320px">데이터셋 가져오기 (.tar / .zip)
+        <input type=file id=upf accept=".tar,.gz,.tgz,.zip"></label>
+      <button class=primary onclick="upload('dataset')">가져오기</button><span class=muted id=upmsg></span></div>
+      <p class=muted style="margin:6px 0 0">위 다운로드 파일이나 meta/info.json 이 든 LeRobot 데이터셋 폴더를 묶은 파일. 같은 이름이 있으면 _2 를 붙입니다.</p></div>
+    </div>
     <script>
+    {UPLOAD_JS}
     async function delDs(name){{
       const typed = prompt('데이터셋 "'+name+'" 을 통째로 삭제합니다.\\n확인을 위해 이름을 그대로 입력하세요:');
       if(typed !== name){{ if(typed!==null) alert('이름 불일치 — 취소됨'); return; }}
@@ -2751,9 +2759,12 @@ _TAR_CHUNK = 1 << 20          # 1 MiB 씩 읽어 흘립니다 (파일 전체를 
 _TAR_RECORD = 10240           # tar 표준 레코드 크기
 
 
-def _tar_files(root: Path):
-    """root 아래 일반 파일만, 경로 정렬해서 (실제경로, tar 내부경로) 로 돌려줍니다."""
+def _tar_files(root: Path, skip=()):
+    """root 아래 일반 파일만, 경로 정렬해서 (실제경로, tar 내부경로) 로 돌려줍니다.
+    skip: 빼낼 하위 폴더 (root 기준 상대경로, 예: 'openvino/cache')"""
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        rel_dir = Path(dirpath).relative_to(root).as_posix()
+        dirnames[:] = [d for d in dirnames if (f"{rel_dir}/{d}" if rel_dir != "." else d) not in skip]
         dirnames.sort()
         for name in sorted(filenames):
             f = Path(dirpath) / name
@@ -2762,12 +2773,12 @@ def _tar_files(root: Path):
             yield f, f.relative_to(root).as_posix()
 
 
-def _tar_stream(root: Path, arc_root: str):
+def _tar_stream(root: Path, arc_root: str, skip=()):
     """tarfile 객체 대신 블록을 직접 만들어 흘립니다.
     tarfile.addfile 은 파일을 통째로 버퍼에 복사해서, 수 GB 짜리 영상이 들어간
     데이터셋에서는 메모리를 그만큼 먹습니다."""
     total = 0
-    for path, rel in _tar_files(root):
+    for path, rel in _tar_files(root, skip):
         try:
             st = path.stat()
         except OSError:
@@ -3317,6 +3328,9 @@ async def api_ov_convert(req: Request):
     ck = ov_ckpt_ok(rel)
     if ck is None:
         return JSONResponse({"error": "체크포인트 없음 — 목록에서 고르세요"}, status_code=400)
+    ptype = load_json(ck / "config.json", {}).get("type")
+    if ptype != "act":
+        return JSONResponse({"error": f"OpenVINO 변환은 ACT 만 지원합니다 (이 체크포인트: {ptype})"}, status_code=400)
     d = ov_devices(refresh=True)
     if not d.get("ok"):
         return JSONResponse({"error": f"OpenVINO 를 쓸 수 없습니다 ({d.get('error')}) — Intel 기기에서 "
@@ -3365,6 +3379,27 @@ function ovEsc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;
 
 
 # ----------------------------- 페이지: 학습 ----------------------------------
+# 학습 가능한 정책. lerobot e40b58a 의 정책을 그대로 씁니다 (롤아웃도 lerobot-rollout 이 정책 종류를 알아서 처리).
+# OpenVINO 변환·NPU 추론은 ACT 만 지원합니다.
+TRAIN_POLICIES = {
+    "act": {"label": "ACT", "args": ["--policy.type=act"], "needs": [], "extra": "",
+            "hint": "ACT — 기본. 데모 50개 안팎으로도 잘 배우고 가볍습니다. OpenVINO(NPU) 변환 가능."},
+    "diffusion": {"label": "Diffusion", "args": ["--policy.type=diffusion"], "needs": ["diffusers"], "extra": "diffusion",
+                  "hint": "Diffusion Policy — 동작이 여러 갈래인 태스크에 강하지만 추론이 느립니다(디노이징 반복). "
+                          "OpenVINO 변환은 아직 ACT 만 됩니다."},
+    "smolvla": {"label": "SmolVLA (사전학습 미세조정)", "args": ["--policy.path=lerobot/smolvla_base"],
+                "needs": ["transformers", "num2words"], "extra": "smolvla",
+                "hint": "SmolVLA — 450M 비전-언어-행동 모델을 미세조정합니다. 태스크 설명(언어)을 씁니다. "
+                        "처음 한 번 HuggingFace 에서 lerobot/smolvla_base 를 내려받고(인터넷 필요), GPU 메모리를 많이 씁니다."},
+}
+
+
+def policy_missing(pol):
+    """정책에 필요한 파이썬 패키지 중 없는 것 — lerobot 이 학습 시작 수십 초 뒤에야 ImportError 로 죽기 전에 알려 줍니다."""
+    import importlib.util
+    return [m for m in TRAIN_POLICIES[pol]["needs"] if importlib.util.find_spec(m) is None]
+
+
 @app.get("/train", response_class=HTMLResponse)
 def train_page():
     pname, pr = active_project()
@@ -3385,17 +3420,21 @@ def train_page():
         f'<button class=danger onclick="stopJob({jsattr(j["id"])})">중지</button></div>'
         for j in running)
     return f"""{CSS}{nav_html('tr')}<div class=wrap>
-    <p class=eyebrow>ACT policy</p><h2>Training</h2>
+    <p class=eyebrow>Policy training</p><h2>Training</h2>
     {projline}{run_html}
     <form class=row onsubmit="startTrain(event)">
       <select id=ds>{ds_opts}</select>
       <input id=name placeholder="출력 이름 (예: act_pick_place_v2)" size=26>
+      <select id=policy onchange="polHint()">{''.join(f'<option value="{k}">{esc(v["label"])}{" — 패키지 미설치" if policy_missing(k) else ""}</option>' for k, v in TRAIN_POLICIES.items())}</select>
       <input id=steps value=80000 size=7> <span class=muted>steps</span>
       <input id=batch value=8 size=3> <span class=muted>batch</span>
+      <label class=muted title="CUDA 에서 메모리·시간 절약. 손실이 튀면 끄세요"><input type=checkbox id=amp> AMP</label>
       <button class=primary>학습 시작</button>
     </form>
+    <p class=muted id=polhint style="margin:-4px 0 10px"></p>
     <div class="muted mono" id=which style="margin-bottom:8px"></div>
     <div class=chartbox><canvas id=chart height=90></canvas></div>
+    <div class=chartbox><canvas id=chart2 height=60></canvas></div>
     <p class=eyebrow>Log tail</p><pre id=tail>...</pre>
     <p class=eyebrow style="margin-top:22px">OpenVINO 변환 · Intel NPU / GPU / CPU</p>
     <div class=card>
@@ -3437,10 +3476,14 @@ def train_page():
     </script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
+    const POL={js({k: v["hint"] for k, v in TRAIN_POLICIES.items()})};
+    function polHint(){{ document.getElementById('polhint').textContent=POL[document.getElementById('policy').value]||''; }}
+    polHint();
     async function startTrain(e){{
       e.preventDefault();
       const b={{dataset:document.getElementById('ds').value,name:document.getElementById('name').value,
-               steps:document.getElementById('steps').value,batch:document.getElementById('batch').value}};
+               steps:document.getElementById('steps').value,batch:document.getElementById('batch').value,
+               policy:document.getElementById('policy').value,amp:document.getElementById('amp').checked}};
       const r=await fetch('/api/train',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
       const d=await r.json();
       if(d.error){{alert(d.error);return;}}
@@ -3451,10 +3494,13 @@ def train_page():
       if(!confirm('학습을 중지할까요? (한 번 더 누르면 강제종료)'))return;
       await fetch('/api/kill/'+id,{{method:'POST'}}); setTimeout(()=>location.reload(),1500);
     }}
-    let chart;
+    let chart, chart2;
+    function fmtEta(s){{ const h=Math.floor(s/3600), m=Math.floor(s%3600/60); return h?h+'시간 '+m+'분':m+'분'; }}
     async function refresh(){{
       const r=await fetch('/api/trainlog'); const d=await r.json();
-      document.getElementById('which').textContent=d.current||'로그 없음';
+      const p=d.progress;
+      document.getElementById('which').textContent=(d.current||'로그 없음')
+        +(p?'  ·  step '+p.step+' / '+p.target+' ('+p.pct+'%)'+(p.eta_s!=null?' · 남은 시간 약 '+fmtEta(p.eta_s):''):'');
       document.getElementById('tail').textContent=d.tail||'';
       const xs=d.points.map(p=>p[0]),ys=d.points.map(p=>p[1]);
       if(!window.Chart) return;              // CDN 을 못 받으면(오프라인) 그래프만 생략
@@ -3466,6 +3512,19 @@ def train_page():
                    x:{{grid:{{display:false}},ticks:{{color:'#5d6a79',font:{{family:'IBM Plex Mono',size:10}},maxTicksLimit:10}}}}}},
           plugins:{{legend:{{display:false}}}}}}}});}}
       else{{chart.data.labels=xs;chart.data.datasets[0].data=ys;chart.update();}}
+      // 기울기 크기(grad norm)·학습률 — 손실이 튀거나 정체될 때 원인 확인용
+      const ex=d.extra||[], ex_x=ex.map(p=>p[0]), g=ex.map(p=>p[1]), lr=ex.map(p=>p[2]);
+      const tick={{color:'#8b98a7',font:{{family:'IBM Plex Mono',size:11}}}};
+      if(!chart2){{chart2=new Chart(document.getElementById('chart2'),{{type:'line',
+        data:{{labels:ex_x,datasets:[
+          {{label:'grad norm',data:g,borderColor:'#e07a3f',pointRadius:0,borderWidth:1.2,yAxisID:'y'}},
+          {{label:'lr',data:lr,borderColor:'#6cc070',pointRadius:0,borderWidth:1.2,yAxisID:'y1'}}]}},
+        options:{{animation:false,
+          scales:{{y:{{grid:{{color:'#28303a'}},ticks:tick,title:{{display:true,text:'grad norm',color:'#8b98a7'}}}},
+                   y1:{{position:'right',grid:{{display:false}},ticks:{{...tick,callback:v=>Number(v).toExponential(1)}},title:{{display:true,text:'lr',color:'#8b98a7'}}}},
+                   x:{{grid:{{display:false}},ticks:{{color:'#5d6a79',font:{{family:'IBM Plex Mono',size:10}},maxTicksLimit:10}}}}}},
+          plugins:{{legend:{{labels:{{color:'#8b98a7'}}}}}}}}}});}}
+      else{{chart2.data.labels=ex_x;chart2.data.datasets[0].data=g;chart2.data.datasets[1].data=lr;chart2.update();}}
     }}
     refresh(); setInterval(refresh,5000);
     </script>"""
@@ -3485,6 +3544,14 @@ async def api_train(req: Request):
         return JSONResponse({"error": "출력 이름은 영문/숫자/._- 만"}, status_code=400)
     steps = _clamp_int(b.get("steps"), 80000, 1, 100000000)
     batch = _clamp_int(b.get("batch"), 8, 1, 4096)
+    pol = b.get("policy") or "act"
+    if pol not in TRAIN_POLICIES:
+        return JSONResponse({"error": f"정책은 {', '.join(TRAIN_POLICIES)} 중 하나"}, status_code=400)
+    miss = policy_missing(pol)
+    if miss:
+        return JSONResponse({"error": f"{TRAIN_POLICIES[pol]['label']} 에 필요한 패키지가 없습니다 ({', '.join(miss)}) — 터미널에서: "
+                                      f"cd ~/project/lerobot/lerobot-src && pip install -e \".[{TRAIN_POLICIES[pol]['extra']}]\""},
+                            status_code=400)
     root = DATA_ROOT / ds
     if not root.exists():
         return JSONResponse({"error": "dataset not found"}, status_code=400)
@@ -3502,9 +3569,11 @@ async def api_train(req: Request):
                                 status_code=400)
     argv = [sys.executable, "-m", "lerobot.scripts.lerobot_train",
             f"--dataset.repo_id=local/{ds}", f"--dataset.root={root}",
-            "--policy.type=act", f"--output_dir={out}",
+            *TRAIN_POLICIES[pol]["args"], f"--output_dir={out}",
             f"--steps={steps}", f"--batch_size={batch}", "--num_workers=4",
             "--save_freq=10000", "--policy.push_to_hub=false"]
+    if b.get("amp"):
+        argv.append("--policy.use_amp=true")
     try:
         jid = start_job("train", argv)
     except JobStartError as e:
@@ -3535,7 +3604,7 @@ def api_trainlog():
     if not trains:
         return JSONResponse({"points": [], "tail": "", "current": None})
     j = next((t for t in trains if t["alive"]), trains[0])
-    pts = []
+    pts, extra, sps = [], [], None
     try:
         with open(j["log"], errors="ignore") as f:
             for line in f:
@@ -3547,15 +3616,641 @@ def api_trainlog():
                     try:
                         pts.append([step, float(m.group(2))])
                     except ValueError:
+                        continue
+                    g = re.search(r"grdn:([\d.eE+-]+)", line)
+                    lr = re.search(r"\blr:([\d.eE+-]+)", line)
+                    sp = re.search(r"smp/s:([\d.]+)", line)
+                    try:
+                        extra.append([step, float(g.group(1)) if g else None, float(lr.group(1)) if lr else None])
+                        sps = float(sp.group(1)) if sp else sps
+                    except ValueError:
                         pass
     except Exception:
         pass
     status = "running" if job_alive(j) else "finished"
-    return JSONResponse({"points": pts[-2000:], "tail": log_tail(j["id"]),
-                         "current": f'{j["id"]} [{status}]'})
+    # 진행률·남은 시간: --steps 목표와 마지막 처리 속도(samples/s ÷ batch)
+    args = dict(a.split("=", 1) for a in (j.get("argv") or []) if a.startswith("--") and "=" in a)
+    target = _clamp_int(args.get("--steps"), 0, 0, 10 ** 9)
+    batch = _clamp_int(args.get("--batch_size"), 0, 0, 10 ** 6)
+    prog = None
+    if target and pts:
+        prog = {"step": pts[-1][0], "target": target, "pct": round(100 * pts[-1][0] / target, 1)}
+        if sps and batch and status == "running":
+            prog["eta_s"] = int(max(0, target - pts[-1][0]) / (sps / batch))
+    return JSONResponse({"points": pts[-2000:], "extra": extra[-2000:], "progress": prog,
+                         "tail": log_tail(j["id"]), "current": f'{j["id"]} [{status}]'})
+
+
+# ----------------------------- 모델 (Models 탭) · 내보내기/가져오기 · 이어서 학습 ---------
+# outputs/<run>/checkpoints/<step>/pretrained_model 하나가 '모델' 하나입니다.
+# 학습 기기(Thor)에서 내보낸 tar 를 추론 기기(Intel)에서 그대로 가져오는 흐름을 염두에 뒀습니다.
+IMPORT_DISK_SHARE = 0.45         # 업로드 파일 + 풀린 내용이 같이 들어가야 하므로 여유 공간의 절반 이하만
+
+
+def _train_jobs_for_run(run):
+    """outputs/<run> 에 쓰는 train 작업들 (최신 먼저) — 처음 학습과 이어서 학습 모두"""
+    rp = os.path.realpath(OUT_ROOT / run)
+    out = []
+    for j in jobs_index():
+        if j["kind"] != "train":
+            continue
+        if any(a.startswith("--output_dir=") and os.path.realpath(a.split("=", 1)[1]) == rp
+               for a in j.get("argv") or []):
+            out.append(j)
+    return out
+
+
+def _log_last_metrics(log, nbytes=65536):
+    """로그 끝부분에서 마지막 (step, loss). 수 MB 짜리 로그를 다 읽지 않습니다."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - nbytes))
+            txt = f.read().decode(errors="ignore")
+    except OSError:
+        return None, None
+    last = None
+    for last in re.finditer(r"step:(\S+)\s.*?loss:([\d.]+)", txt):
+        pass
+    if not last:
+        return None, None
+    try:
+        return _parse_step(last.group(1)), float(last.group(2))
+    except ValueError:
+        return None, None
+
+
+def _fmt_dur(sec):
+    sec = int(sec or 0)
+    if sec < 60:
+        return "1분 미만"
+    h, m = sec // 3600, sec % 3600 // 60
+    return f"{h}시간 {m}분" if h else f"{m}분"
+
+
+def run_info(run, trials=None):
+    rd = OUT_ROOT / run
+    trials = trials if trials is not None else load_trials()
+    cks = []
+    cdir = rd / "checkpoints"
+    for st in sorted(cdir.iterdir()) if cdir.is_dir() else []:
+        pm = st / "pretrained_model"
+        if st.name == "last" or st.is_symlink() or not (pm / "config.json").is_file():
+            continue
+        rel = f"{run}/checkpoints/{st.name}/pretrained_model"
+        cks.append({"step": st.name, "rel": rel, "ov": lrweb_ov.status(OUT_ROOT / rel)["state"],
+                    "trials": trial_summary(rel, trials), "robot_type": checkpoint_robot_type(rel)})
+    tc = load_json(OUT_ROOT / cks[-1]["rel"] / "train_config.json", {}) if cks else {}
+    pol = (tc.get("policy") or {}).get("type") or load_json(OUT_ROOT / cks[-1]["rel"] / "config.json", {}).get(
+        "type", "?") if cks else "?"
+    jobs = _train_jobs_for_run(run)
+    alive = any(j["alive"] for j in jobs)
+    step = loss = None
+    dur = 0.0
+    for j in reversed(jobs):                 # 처음 학습 → 이어서 학습 순서로 시간 합산
+        try:
+            t0 = time.mktime(time.strptime(j["started"], "%Y-%m-%d %H:%M:%S"))
+            t1 = time.time() if j["alive"] else os.path.getmtime(j["log"])
+            dur += max(0.0, t1 - t0)
+        except (KeyError, ValueError, OSError):
+            pass
+    if jobs:
+        step, loss = _log_last_metrics(jobs[0]["log"])
+    last_state = rd / "checkpoints" / "last" / "training_state"
+    done_step = load_json(last_state / "training_step.json", {}).get("step")
+    if done_step is None and cks and cks[-1]["step"].isdigit():
+        done_step = int(cks[-1]["step"])          # last 링크가 없으면(가져온 모델 등) 마지막 체크포인트 이름으로
+    return {"run": run, "policy": pol, "dataset": ((tc.get("dataset") or {}).get("repo_id") or "").split("/", 1)[-1],
+            "steps": tc.get("steps"), "batch": tc.get("batch_size"), "checkpoints": cks, "alive": alive,
+            "step": step, "loss": loss, "duration": _fmt_dur(dur) if dur else "", "done_step": done_step,
+            "resumable": last_state.is_dir() and not alive,
+            "imported": load_json(rd / "lrweb_import.json", {}).get("imported", ""),
+            "job": jobs[0]["id"] if jobs else ""}
+
+
+def list_runs():
+    return sorted((d.name for d in OUT_ROOT.iterdir()
+                   if d.is_dir() and not d.name.startswith(".") and (d / "checkpoints").is_dir()),
+                  key=lambda r: -(OUT_ROOT / r).stat().st_mtime) if OUT_ROOT.exists() else []
+
+
+@app.get("/models", response_class=HTMLResponse)
+def models_page():
+    pname, pr = active_project()
+    mine = set(pr["models"]) if pr else set()
+    trials = load_trials()
+    runs = sorted(list_runs(), key=lambda r: r not in mine)     # 안정 정렬 — 최근 순서는 유지
+    cards = ""
+    for r in runs:
+        ri = run_info(r, trials)
+        badges = (f'<span class=badge>{esc(ri["policy"])}</span> '
+                  + ('<span class="badge b-run">학습 중</span> ' if ri["alive"] else '')
+                  + (f'<span class=badge title="{esc(ri["imported"])}">가져옴</span> ' if ri["imported"] else '')
+                  + ('<span class="badge b-run">이 프로젝트</span> ' if r in mine else ''))
+        meta = " · ".join(x for x in [
+            f'데이터셋 <span class=mono>{esc(ri["dataset"])}</span>' if ri["dataset"] else "",
+            f'step {esc(ri["done_step"] or ri["step"] or "?")} / {esc(ri["steps"] or "?")}',
+            f'batch {esc(ri["batch"])}' if ri["batch"] else "",
+            f'마지막 loss <span class=mono>{ri["loss"]:.4f}</span>' if ri["loss"] is not None else "",
+            f'학습 시간 {esc(ri["duration"])}' if ri["duration"] else ""] if x)
+        rows = ""
+        for c in reversed(ri["checkpoints"]):
+            t = c["trials"]
+            ov = {"ok": '<span class="badge b-ok">OV✓</span>', "stale": '<span class="badge b-warn">OV 다시 변환</span>'}.get(c["ov"], '<span class=muted>-</span>')
+            bad = not robot_type_ok(c["robot_type"])
+            rate = f'{t["rate"]}% ({t["ok"]}/{t["n"]})' if t["n"] else "-"
+            rows += (f'<tr><td class=mono>{esc(c["step"])}</td><td>{ov}</td>'
+                     f'<td class=num>{rate}</td>'
+                     f'<td style="text-align:right;white-space:nowrap">'
+                     + (f'<span class="badge b-warn">{esc(c["robot_type"])} — 모드 불일치</span> ' if bad else
+                        f'<a class=btnlink href="/rollout?ckpt={esc(c["rel"])}">롤아웃</a> ')
+                     + f'<a class=btnlink href="/api/model/download?ckpt={esc(c["rel"])}" download>내보내기</a> '
+                     f'<button class=danger onclick="delCk({jsattr(c["rel"])},\'step\')">삭제</button></td></tr>')
+        acts = ""
+        if ri["resumable"]:
+            acts += (f'<button onclick="resume({jsattr(r)},{jsattr(ri["done_step"] or 0)},{jsattr(ri["steps"] or 0)})">'
+                     f'이어서 학습</button> ')
+        if ri["alive"]:
+            acts += '<a class=btnlink href="/train">학습 화면</a> '
+        acts += f'<button class=danger onclick="delCk({jsattr(ri["checkpoints"][-1]["rel"] if ri["checkpoints"] else r + "/checkpoints/x")},\'run\',{jsattr(r)})">전체 삭제</button>'
+        cards += (f'<div class=card style="margin-bottom:12px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+                  f'<b class=mono style="font-size:15px">{esc(r)}</b> {badges}<span style="flex:1"></span>{acts}</div>'
+                  f'<p class=muted style="margin:6px 0 8px">{meta}</p>'
+                  f'<table><tr><th>체크포인트</th><th>OpenVINO</th><th class=num>실기 성공률</th><th></th></tr>{rows}</table></div>')
+    empty = '' if runs else '<p class=muted>학습된 모델이 없습니다 — Training 탭에서 학습하거나, 다른 기기에서 내보낸 모델을 가져오세요.</p>'
+    return f"""{CSS}{nav_html('md')}<div class=wrap>
+    <p class=eyebrow>Models</p><h2>모델</h2>
+    <div class=card style="margin-bottom:14px">
+      <div class=formgrid>
+        <label class=f style="min-width:320px">모델 가져오기 (.tar / .zip)
+          <input type=file id=upf accept=".tar,.gz,.tgz,.zip"></label>
+        <button class=primary onclick="upload('model')">가져오기</button>
+        <span class=muted id=upmsg></span>
+      </div>
+      <p class=muted style="margin:6px 0 0">다른 기기(예: Thor 에서 학습 → Intel NPU 기기에서 추론)의 <b>내보내기</b> 파일을 그대로 넣으면
+      같은 폴더 구조로 들어옵니다. OpenVINO 변환본이 들어 있으면 같이 옵니다.</p>
+    </div>
+    {empty}{cards}</div>
+    <script>
+    {UPLOAD_JS}
+    async function delCk(rel,scope,run){{
+      if(scope==='run'){{ const t=prompt('모델 "'+run+'" 을 통째로 삭제합니다 (복구 불가).\\n확인을 위해 이름을 그대로 입력하세요:'); if(t!==run) return; }}
+      else if(!confirm('체크포인트 삭제:\\n'+rel.replace('/pretrained_model','')+'\\n삭제할까요?')) return;
+      const r=await fetch('/api/delete_checkpoint',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{rel:rel,scope:scope}})}});
+      const d=await r.json(); if(d.error) alert(d.error); else location.reload();
+    }}
+    async function resume(run,done,target){{
+      const v=prompt('"'+run+'" 를 step '+done+' 에서 이어서 학습합니다.\\n목표 step (지금 '+target+'):', String(Math.max(target, done*2)));
+      if(!v) return;
+      const r=await fetch('/api/train/resume',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{run:run,steps:v}})}});
+      const d=await r.json(); if(d.error) alert(d.error); else location.href='/train';
+    }}
+    </script>"""
+
+
+# 업로드 공용 (Models·Datasets): 원본 바이트를 그대로 POST — python-multipart 의존성 없이 스트리밍
+UPLOAD_JS = r"""
+function upload(what){
+  const f=document.getElementById('upf').files[0], msg=document.getElementById('upmsg');
+  if(!f){ alert('파일을 고르세요'); return; }
+  const x=new XMLHttpRequest();
+  x.open('POST','/api/import/'+what+'?filename='+encodeURIComponent(f.name));
+  x.setRequestHeader('Content-Type','application/octet-stream');
+  x.upload.onprogress=e=>{ if(e.lengthComputable) msg.textContent='올리는 중 '+Math.round(100*e.loaded/e.total)+'%'; };
+  x.onload=()=>{ let d={}; try{ d=JSON.parse(x.responseText); }catch(e){}
+    if(d.error){ msg.textContent=''; alert(d.error); return; }
+    msg.textContent='완료: '+(d.items||[]).join(', '); setTimeout(()=>location.reload(),900); };
+  x.onerror=()=>{ msg.textContent=''; alert('업로드 실패 (연결 끊김)'); };
+  msg.textContent='올리는 중…'; x.send(f);
+}
+"""
+
+
+@app.get("/api/model/download")
+def api_model_download(ckpt: str = ""):
+    ck = ov_ckpt_ok(ckpt)
+    if ck is None:
+        return JSONResponse({"error": "체크포인트 없음"}, status_code=400)
+    # 받는 쪽에서 같은 폴더 구조(<run>/checkpoints/<step>/pretrained_model)로 풀리도록 tar 안 경로를 맞춥니다.
+    # OpenVINO 컴파일 캐시는 장치별이라 뺍니다.
+    run, _, rest = ckpt.partition("/checkpoints/")
+    step = rest.split("/")[0]
+    return StreamingResponse(_tar_stream(ck, ckpt, skip=("openvino/cache",)), media_type="application/x-tar",
+                             headers={"Content-Disposition": f'attachment; filename="{run}_{step}.tar"',
+                                      "Cache-Control": "no-store"})
+
+
+def _safe_extract(arc, out):
+    """tar/zip 을 out 에 풉니다. 절대경로·'..'·링크·장치 파일은 거부하고, 풀린 총량이 디스크 여유를 넘으면 거부."""
+    free = shutil.disk_usage(out).free
+    total = 0
+    if tarfile.is_tarfile(arc):
+        with tarfile.open(arc, "r:*") as t:
+            for m in t.getmembers():
+                if m.name.startswith("/") or ".." in Path(m.name).parts:
+                    raise ValueError(f"위험한 경로: {m.name}")
+                if not (m.isfile() or m.isdir()):
+                    raise ValueError(f"링크·특수 파일은 받지 않습니다: {m.name}")
+                total += m.size
+            if total > free * 0.9:
+                raise ValueError("풀린 크기가 디스크 여유 공간보다 큽니다")
+            t.extractall(out, filter="data")
+    elif zipfile.is_zipfile(arc):
+        with zipfile.ZipFile(arc) as z:
+            for i in z.infolist():
+                n = i.filename
+                if n.startswith("/") or "\\" in n or ".." in Path(n).parts:
+                    raise ValueError(f"위험한 경로: {n}")
+                if (i.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise ValueError(f"링크는 받지 않습니다: {n}")
+                total += i.file_size
+            if total > free * 0.9:
+                raise ValueError("풀린 크기가 디스크 여유 공간보다 큽니다")
+            z.extractall(out)
+    else:
+        raise ValueError("tar 또는 zip 파일이 아닙니다")
+
+
+def _clean_name(s, fallback):
+    s = re.sub(r"[^A-Za-z0-9._-]", "_", s or "").strip("._-")[:80]
+    return s if safe_name(s) else fallback
+
+
+def _free_name(root, name):
+    if not (root / name).exists():
+        return name
+    for i in range(2, 1000):
+        if not (root / f"{name}_{i}").exists():
+            return f"{name}_{i}"
+    raise ValueError(f"{name}_2 ~ _999 가 모두 존재합니다")
+
+
+def _place_models(tmp, stem, filename):
+    found = sorted({p.parent for p in tmp.rglob("model.safetensors") if (p.parent / "config.json").is_file()})
+    if not found:
+        raise ValueError("모델이 없습니다 — pretrained_model 폴더(config.json + model.safetensors)가 들어 있어야 합니다")
+    runs, placed = {}, []
+    for pm in found:
+        parts = pm.relative_to(tmp).parts
+        if len(parts) >= 4 and parts[-3] == "checkpoints":           # <run>/checkpoints/<step>/pretrained_model
+            orig_run, step = parts[-4], parts[-2]
+        else:
+            orig_run, step = stem, ("imported" if len(found) == 1 else _clean_name(pm.name, "imported"))
+        orig_run, step = _clean_name(orig_run, stem), _clean_name(step, "imported")
+        if orig_run not in runs:
+            runs[orig_run] = _free_name(OUT_ROOT, orig_run)
+            (OUT_ROOT / runs[orig_run] / "checkpoints").mkdir(parents=True)
+            save_json(OUT_ROOT / runs[orig_run] / "lrweb_import.json",
+                      {"imported": time.strftime("%F %T"), "from": filename, "original_name": orig_run})
+        dest = OUT_ROOT / runs[orig_run] / "checkpoints" / step
+        if dest.exists():
+            raise ValueError(f"같은 체크포인트가 두 번 들어 있습니다: {orig_run}/{step}")
+        dest.mkdir(parents=True)
+        shutil.move(str(pm), str(dest / "pretrained_model"))
+        if pm.name == "pretrained_model" and (pm.parent / "training_state").is_dir():
+            shutil.move(str(pm.parent / "training_state"), str(dest / "training_state"))
+        # 묶음 안의 OpenVINO 변환본은 같은 가중치에서 나온 것으로 봅니다 (크기가 같을 때만).
+        # 압축을 풀면 파일 시각이 바뀌어 '다시 변환 필요' 로 보이는 것을 막습니다.
+        mp = dest / "pretrained_model" / lrweb_ov.OV_SUBDIR / lrweb_ov.META
+        meta = load_json(mp, None)
+        if meta and (meta.get("source") or {}).get("size") == (dest / "pretrained_model" / "model.safetensors").stat().st_size:
+            meta["source"] = lrweb_ov.fingerprint(dest / "pretrained_model")
+            save_json(mp, meta)
+        placed.append(f"{runs[orig_run]}/{step}")
+    pname, _ = active_project()
+    if pname:
+        for r in runs.values():
+            assign_to_project("models", r, pname)
+    return placed
+
+
+def _place_datasets(tmp, stem):
+    roots = sorted({p.parent.parent for p in tmp.rglob("meta/info.json")}, key=lambda p: len(p.parts))
+    tops = [r for r in roots if not any(o != r and r.is_relative_to(o) for o in roots)]
+    if not tops:
+        raise ValueError("데이터셋이 없습니다 — meta/info.json 이 들어 있는 LeRobot 데이터셋 폴더여야 합니다")
+    placed = []
+    for r in tops:
+        name = _free_name(DATA_ROOT, _clean_name(r.name if r != tmp else stem, stem))
+        shutil.move(str(r), str(DATA_ROOT / name))
+        placed.append(name)
+    pname, _ = active_project()
+    if pname:
+        for n in placed:
+            assign_to_project("datasets", n, pname)
+    return placed
+
+
+@app.post("/api/import/{what}")
+async def api_import(what: str, req: Request, filename: str = ""):
+    if what not in ("model", "dataset"):
+        return JSONResponse({"error": "model 또는 dataset"}, status_code=400)
+    root = OUT_ROOT if what == "model" else DATA_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = root / f".import_{secrets.token_hex(4)}"
+    tmp.mkdir()
+    try:
+        limit = shutil.disk_usage(root).free * IMPORT_DISK_SHARE
+        clen = int(req.headers.get("content-length") or 0)
+        if clen > limit:
+            return JSONResponse({"error": "파일이 디스크 여유 공간에 비해 너무 큽니다 (압축 해제 공간 포함)"}, status_code=400)
+        arc = tmp / "upload.bin"
+        n = 0
+        with open(arc, "wb") as fh:
+            async for chunk in req.stream():
+                n += len(chunk)
+                if n > limit:
+                    return JSONResponse({"error": "파일이 디스크 여유 공간에 비해 너무 큽니다"}, status_code=400)
+                fh.write(chunk)
+        if n == 0:
+            return JSONResponse({"error": "빈 파일"}, status_code=400)
+        out = tmp / "x"
+        out.mkdir()
+        stem = _clean_name(re.sub(r"(\.tar)?\.(tar|gz|tgz|zip)$", "", Path(filename).name),
+                           "imported_model" if what == "model" else "imported_dataset")
+
+        def work():
+            _safe_extract(arc, out)
+            arc.unlink()
+            return _place_models(out, stem, Path(filename).name) if what == "model" else _place_datasets(out, stem)
+
+        items = await asyncio.get_running_loop().run_in_executor(None, work)
+        return {"ok": True, "items": items}
+    except (ValueError, OSError, tarfile.TarError, zipfile.BadZipFile) as e:
+        return JSONResponse({"error": f"가져오기 실패: {e}"}, status_code=400)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@app.post("/api/train/resume")
+async def api_train_resume(req: Request):
+    b = await req.json()
+    run = b.get("run", "")
+    if not safe_name(run) or not (OUT_ROOT / run / "checkpoints").is_dir():
+        return JSONResponse({"error": "모델 없음"}, status_code=400)
+    busy = gpu_or_loop_busy()
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 종료 후 시작하세요"}, status_code=400)
+    last = OUT_ROOT / run / "checkpoints" / "last"
+    tc = last / "pretrained_model" / "train_config.json"
+    if not tc.is_file() or not (last / "training_state").is_dir():
+        return JSONResponse({"error": "이어서 학습할 체크포인트가 없습니다 (last/training_state 없음 — 가져온 모델은 학습 상태가 빠져 있을 수 있습니다)"},
+                            status_code=400)
+    done = load_json(last / "training_state" / "training_step.json", {}).get("step") or 0
+    steps = _clamp_int(b.get("steps"), 0, 1, 100000000)
+    if steps <= done:
+        return JSONResponse({"error": f"목표 step 은 지금({done})보다 커야 합니다"}, status_code=400)
+    argv = [sys.executable, "-m", "lerobot.scripts.lerobot_train", f"--config_path={tc}", "--resume=true",
+            f"--steps={steps}", f"--output_dir={OUT_ROOT / run}"]
+    try:
+        jid = start_job("train", argv)
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "job": jid}
 
 
 # ----------------------------- 페이지: 추론 (Rollout) ------------------------
+# ----------------------------- 롤아웃 실시간 모니터 · 시도 기록 -------------------
+# 롤아웃은 lrweb_rollout.py 로 띄웁니다. 그 프로세스가 RUN_DIR/<jid>/ 에 status.json · cam_*.jpg 를 씁니다.
+# 시도 기록(성공/실패)은 lrweb_trials.json 에 체크포인트별로 쌓습니다 — 실기 성공률로 모델을 비교하려고.
+ROLLOUT_PY = Path(__file__).resolve().parent / "lrweb_rollout.py"
+TRIALS_FILE = PROJ / "lrweb_trials.json"
+TRIAL_RESULTS = ("success", "fail")
+
+
+def job_ckpt_rel(j):
+    """롤아웃 작업 → 체크포인트 상대경로 (outputs 기준). 모르면 ''."""
+    for a in j.get("argv") or []:
+        if a.startswith("--policy.path="):
+            p = Path(a.split("=", 1)[1])
+            try:
+                return str(p.resolve().relative_to(OUT_ROOT.resolve()))
+            except ValueError:
+                return ""
+    return ""
+
+
+def load_trials():
+    return load_json(TRIALS_FILE, {})
+
+
+def trial_summary(rel, trials=None):
+    t = (trials if trials is not None else load_trials()).get(rel) or []
+    ok = sum(1 for x in t if x.get("result") == "success")
+    n = len(t)
+    return {"n": n, "ok": ok, "fail": n - ok, "rate": round(100 * ok / n) if n else None}
+
+
+def trial_label(rel, trials=None):
+    s = trial_summary(rel, trials)
+    return f" · 성공 {s['ok']}/{s['n']}" if s["n"] else ""
+
+
+@app.get("/api/rollout/status/{jid}")
+def api_rollout_status(jid: str):
+    if not safe_name(jid):
+        return JSONResponse({"error": "잘못된 작업 id"}, status_code=400)
+    j = load_json(JOB_DIR / f"{jid}.json", {})
+    if j.get("kind") != "rollout":
+        return JSONResponse({"error": "롤아웃 작업이 아닙니다"}, status_code=404)
+    rel = job_ckpt_rel(j)
+    trials = load_trials()
+    mine = [x for x in trials.get(rel, []) if x.get("job") == jid]
+    alive = job_alive(j)
+    st = load_json(run_dir(jid) / "status.json", {})
+    if not alive and st.get("phase") not in ("done", "error"):
+        st["phase"] = "ended"           # 강제 종료 등으로 마지막 상태를 못 쓴 경우
+    return {"alive": alive, "status": st, "tail": log_tail(jid), "ckpt": rel,
+            "engine": rollout_engine_label(j), "started": j.get("started"),
+            "trials": {"run": {"n": len(mine), "ok": sum(1 for x in mine if x["result"] == "success")},
+                       "ckpt": trial_summary(rel, trials)}}
+
+
+@app.get("/api/runstream/{jid}/{cam}")
+def api_runstream(jid: str, cam: str):
+    if not safe_name(jid) or not safe_name(cam):
+        return JSONResponse({"error": "잘못된 이름"}, status_code=400)
+    return _mjpeg_from_files(jid, cam)
+
+
+@app.post("/api/rollout/trial")
+async def api_rollout_trial(req: Request):
+    b = await req.json()
+    jid, res = b.get("job", ""), b.get("result", "")
+    if not safe_name(jid) or res not in TRIAL_RESULTS + ("undo",):
+        return JSONResponse({"error": "잘못된 요청"}, status_code=400)
+    j = load_json(JOB_DIR / f"{jid}.json", {})
+    rel = job_ckpt_rel(j) if j.get("kind") == "rollout" else ""
+    if not rel:
+        return JSONResponse({"error": "체크포인트를 알 수 없는 작업"}, status_code=400)
+    with META_LOCK:
+        trials = load_trials()
+        lst = trials.setdefault(rel, [])
+        if res == "undo":
+            idx = next((i for i in range(len(lst) - 1, -1, -1) if lst[i].get("job") == jid), None)
+            if idx is None:
+                return JSONResponse({"error": "이 실행에서 기록한 시도가 없습니다"}, status_code=400)
+            lst.pop(idx)
+        else:
+            lst.append({"t": time.strftime("%F %T"), "result": res, "job": jid,
+                        "engine": rollout_engine_label(j), "env": env_name()})
+        save_json(TRIALS_FILE, trials)
+    return {"ok": True, "ckpt": trial_summary(rel, trials)}
+
+
+# IMPORTMAP_HTML · ARM3D_JS 는 파일 뒤쪽에 정의되므로 조립은 rollout_run_page() 에서 합니다
+ROLLOUT_RUN_BODY = """
+<style>
+.rgrid{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:14px;align-items:start}
+.rcams{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px}
+.rcams figure{margin:0;position:relative;background:#000;border-radius:8px;overflow:hidden}
+.rcams img{width:100%;display:block;aspect-ratio:4/3;object-fit:contain}
+.rcams figcaption{position:absolute;top:6px;left:10px;font-family:var(--mono);font-size:11px;color:#cfd8e3;text-shadow:0 0 4px #000;text-transform:uppercase}
+#r3d{aspect-ratio:4/3;border-radius:8px;overflow:hidden;background:#0a0d10;position:relative}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+.kv b{font-family:var(--mono);font-weight:500}
+.big{font-family:var(--mono);font-size:22px;font-weight:600}
+.trial{display:flex;gap:8px;margin:10px 0 6px}
+.trial button{flex:1;font-size:15px;padding:12px 0}
+.ok-btn{border-color:var(--ok);color:var(--ok)} .ng-btn{border-color:var(--bad);color:var(--bad)}
+.jt td,.jt th{padding:3px 6px;font-size:12px} .jt td.num{font-family:var(--mono)}
+.jt tr.far td{color:var(--warn)}
+.ph{font-family:var(--mono);font-size:13px;letter-spacing:.06em}
+@media(max-width:900px){ .rgrid{grid-template-columns:1fr} }
+</style>
+<div class=wrap>
+<p class=eyebrow>Autonomous · 실시간</p><h2>추론 실행</h2>
+<div class=runbar><span class="badge b-run" id=phb>…</span><span class=mono id=jid></span>
+  <span class=badge id=engb></span><span class=mono id=el></span>
+  <button class=danger id=stopb onclick="stopRo()">중지</button>
+  <a class=btnlink id=newb href="/rollout" style="display:none">새 추론 설정</a>
+  <span class=muted id=stopnote>중지(SIGINT) 시 시작 자세로 복귀 후 토크 해제됩니다</span></div>
+<div class=rgrid>
+  <div>
+    <div class=rcams><div id=cams style="display:contents"><p class=muted>카메라 대기 중…</p></div>
+      <div id=r3d style="display:none"></div></div>
+  </div>
+  <div>
+    <div class=card>
+      <p class=eyebrow>시도 결과</p>
+      <div class=trial><button class=ok-btn onclick="trial('success')">성공 (S)</button>
+        <button class=ng-btn onclick="trial('fail')">실패 (F)</button></div>
+      <div class=kv><span>이번 실행</span><b id=trun>0 / 0</b><span>이 체크포인트 누적</span><b id=tck>-</b></div>
+      <p class=muted style="margin:8px 0 0">물체를 놓고 한 번 시도할 때마다 결과를 누르세요. 체크포인트별 실기 성공률로 모델을 비교합니다.
+        <a href="#" onclick="trial('undo');return false">마지막 기록 취소 (U)</a></p>
+    </div>
+    <div class=card style="margin-top:10px">
+      <p class=eyebrow>성능</p>
+      <div class=kv>
+        <span>제어 주기</span><b id=hz>-</b>
+        <span>추론 (청크 계산)</span><b id=chunk>-</b>
+        <span>추론 (보통 틱)</span><b id=tick>-</b>
+        <span>프레임 예산</span><b id=budget>-</b>
+      </div>
+      <p class=muted id=perfwarn style="margin:6px 0 0"></p>
+    </div>
+    <div class=card style="margin-top:10px">
+      <p class=eyebrow>관절 — 실측 / 명령</p>
+      <table class=jt id=jt></table>
+      <p class=muted style="margin:6px 0 0">차이가 크게 유지되면 막힘·과부하 또는 정책이 학습 범위를 벗어난 것입니다.</p>
+    </div>
+  </div>
+</div>
+<details style="margin-top:12px"><summary class=muted>로그</summary><pre id=tail>...</pre></details>
+</div>
+"""
+ROLLOUT_RUN_JS = """
+const $=id=>document.getElementById(id);
+const E=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const PH={loading:'모델 로드 중',connecting:'로봇 연결 중',running:'추론 중',returning:'시작 자세로 복귀 중',
+          done:'종료',error:'오류로 종료',ended:'종료'};
+let ARM=null, camsShown='', ALIVE=true;
+$('jid').textContent=RO.jid;
+window.stopRo=async function(){
+  if(!confirm('추론을 중지할까요? (시작 자세로 돌아간 뒤 토크를 끕니다)'))return;
+  await fetch('/api/kill/'+RO.jid,{method:'POST'});
+};
+window.trial=async function(r){
+  const res=await fetch('/api/rollout/trial',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({job:RO.jid,result:r})});
+  const d=await res.json(); if(d.error){ alert(d.error); return; }
+  refresh();
+};
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'||e.repeat) return;
+  const k=e.key.toLowerCase();
+  if(k==='s') trial('success'); else if(k==='f') trial('fail'); else if(k==='u') trial('undo');
+});
+async function mount3d(){
+  if(!RO.urdf_ok) return;
+  $('r3d').style.display='';
+  const views={}; RO.sides.forEach(s=>{ views[s]=RO.views[s]||{x:0,y:(s==='left'?0.12:s==='right'?-0.12:0),yaw_deg:0}; });
+  try{ ARM=await window.mountArm3D($('r3d'), RO.sides, views, RO.k3); }catch(e){ $('r3d').style.display='none'; }
+}
+function fmtT(t){ t=Math.max(0,t||0); return String(Math.floor(t/60)).padStart(2,'0')+':'+String(Math.floor(t%60)).padStart(2,'0'); }
+function joints(st){
+  const o=st.obs||{}, a=st.act||{}; let h='<tr><th>관절</th><th class=num>실측</th><th class=num>명령</th><th class=num>차이</th></tr>';
+  for(const side of Object.keys(o)){
+    for(const j of Object.keys(o[side])){
+      const ov=o[side][j], av=(a[side]||{})[j], d=(av==null)?null:av-ov;
+      const far=d!=null && Math.abs(d)>(j==='gripper'?15:8);
+      h+='<tr class="'+(far?'far':'')+'"><td>'+E((side==='main'?'':side+' ')+j)+'</td><td class=num>'+ov.toFixed(1)
+        +'</td><td class=num>'+(av==null?'-':av.toFixed(1))+'</td><td class=num>'+(d==null?'-':d.toFixed(1))+'</td></tr>';
+    }
+  }
+  $('jt').innerHTML=h;
+  if(ARM) for(const side of Object.keys(o)) ARM.update(side, o[side]);
+}
+let SEQ=0, APPLIED=0;
+async function refresh(){
+  const my=++SEQ;      // 응답이 순서를 바꿔 도착하면 이미 반영한 것보다 옛 응답은 버립니다
+  let d; try{ d=await (await fetch('/api/rollout/status/'+RO.jid)).json(); }catch(e){ return; }
+  if(my<APPLIED) return; APPLIED=my;
+  if(d.error){ $('phb').textContent=d.error; return; }
+  const st=d.status||{}; ALIVE=d.alive;
+  $('phb').textContent=PH[st.phase]||st.phase||'시작 중';
+  $('phb').className='badge '+(st.phase==='running'?'b-run':st.phase==='error'?'b-bad':(!d.alive?'':'b-warn'));
+  $('engb').textContent=d.engine+(st.device&&d.engine.indexOf(st.device)<0?' → '+st.device:'');
+  $('el').textContent=st.elapsed?fmtT(st.elapsed):'';
+  $('stopb').style.display=d.alive?'':'none'; $('stopnote').style.display=d.alive?'':'none';
+  $('newb').style.display=d.alive?'none':'';
+  const cams=(st.cams||[]).join(',');
+  if(cams && cams!==camsShown){
+    camsShown=cams;
+    $('cams').innerHTML=(st.cams||[]).map(c=>{ const n=c.replace('observation.images.','');
+      return '<figure><img src="/api/runstream/'+RO.jid+'/'+encodeURIComponent(c)+'"><figcaption>'+E(n)+'</figcaption></figure>'; }).join('');
+  }
+  if(!d.alive && camsShown && st.phase!=='running'){ /* 마지막 프레임 유지 */ }
+  const b=1000/RO.fps;
+  $('hz').textContent=st.hz?st.hz+' Hz (목표 '+RO.fps+')':'-';
+  $('chunk').textContent=st.chunk_ms!=null?st.chunk_ms+' ms':'-';
+  $('tick').textContent=st.tick_ms!=null?st.tick_ms+' ms':'-';
+  $('budget').textContent=b.toFixed(0)+' ms';
+  let w='';
+  if(st.chunk_ms!=null && st.chunk_ms>b) w+='청크 계산이 프레임 예산보다 깁니다 — 청크가 바뀌는 순간 한 박자 멈출 수 있습니다. ';
+  if(st.hz && st.hz<RO.fps*0.85) w+='제어 주기가 목표보다 낮습니다 (카메라·USB 대역폭·CPU 부하 확인).';
+  $('perfwarn').textContent=w;
+  joints(st);
+  const tr=d.trials||{}, run=tr.run||{n:0,ok:0}, ck=tr.ckpt||{};
+  $('trun').textContent=run.ok+' 성공 / '+run.n+' 시도';
+  $('tck').textContent=ck.n?(ck.ok+' / '+ck.n+' ('+ck.rate+'%)'):'기록 없음';
+  $('tail').textContent=(st.err?'!! '+st.err+'\\n\\n':'')+(d.tail||'');
+}
+// 주기 갱신은 앞 요청이 끝난 뒤에 다음을 보냅니다 (서버가 느려도 요청이 쌓이지 않게)
+async function loop(){ await refresh(); setTimeout(loop, 500); }
+mount3d(); loop();
+"""
+
+
+def rollout_run_page(j):
+    k3 = kind3d()
+    views = {sd: (a.get("view") or {"x": 0.0, "y": 0.0, "yaw_deg": 0.0}) for sd, a in ARM_CFGS.items()}
+    ro = {"jid": j["id"], "fps": CFG["fps"], "sides": SIDES, "views": views, "k3": k3,
+          "urdf_ok": (URDF_DIR / k3["urdf"][len("/urdf/"):]).exists()}
+    return (CSS + nav_html("ro") + f"<script>const RO={js(ro)};</script>" + ROLLOUT_RUN_BODY + IMPORTMAP_HTML
+            + '<script type="module">' + ARM3D_JS + ROLLOUT_RUN_JS + "</script>")
+
+
 def rollout_engine_label(j):
     for a in j.get("argv") or []:
         if a.startswith("--ov.device="):
@@ -3565,30 +4260,14 @@ def rollout_engine_label(j):
 
 
 @app.get("/rollout", response_class=HTMLResponse)
-def rollout_page():
+def rollout_page(job: str = "", ckpt: str = ""):
     ro = next((j for j in jobs_index() if j["kind"] == "rollout" and j["alive"]), None)
     if ro:
-        return f"""{CSS}{nav_html('ro')}<div class=wrap>
-        <p class=eyebrow>Autonomous</p><h2>추론 실행 중</h2>
-        <div class=runbar><span class="badge b-run">rollout</span>
-          <span class=mono>{esc(ro["id"])}</span>
-          <span class=badge>{esc(rollout_engine_label(ro))}</span>
-          <button class=danger onclick="stopRo()">중지</button>
-          <span class=muted>중지(SIGINT) 시 시작 자세로 복귀 후 토크 해제됩니다</span></div>
-        <p class=eyebrow>Log</p><pre id=tail>...</pre></div>
-        <script>
-        const JID={js(ro["id"])};
-        async function stopRo(){{
-          if(!confirm('추론을 중지할까요?'))return;
-          await fetch('/api/kill/'+JID,{{method:'POST'}}); setTimeout(()=>location.reload(),1500);
-        }}
-        async function refresh(){{
-          const r=await fetch('/api/joblog/'+JID); const d=await r.json();
-          document.getElementById('tail').textContent=d.tail||'';
-          if(!d.alive) location.reload();
-        }}
-        refresh(); setInterval(refresh,2000);
-        </script>"""
+        return rollout_run_page(ro)
+    if job and safe_name(job):
+        j = load_json(JOB_DIR / f"{job}.json", {})
+        if j.get("kind") == "rollout":
+            return rollout_run_page(j)
     busy = exclusive_busy()
     busywarn = (f'<p class="badge b-warn">실행 중: {esc(busy["id"])} — 끝나야 추론을 시작할 수 있습니다</p>'
                 if busy else "") + setup_needed_html()
@@ -3596,13 +4275,24 @@ def rollout_page():
     mine = set(pr["models"]) if pr else set()
     ckpts = sorted(list_checkpoints(), key=lambda c: c.split("/checkpoints/")[0] not in mine)   # 안정 정렬
     ck_opts = ""
+    trials = load_trials()
     for c in ckpts:
         rt = checkpoint_robot_type(c)
         bad = not robot_type_ok(rt)
         other = pname and c.split("/checkpoints/")[0] not in mine
-        ck_opts += (f'<option value="{esc(c)}" {"disabled" if bad else ""}>{esc(c)}'
+        ck_opts += (f'<option value="{esc(c)}" {"disabled" if bad else ""} {"selected" if c == ckpt and not bad else ""}>{esc(c)}'
                     f'{" · " + esc(rt) + " — 모드 불일치" if bad else (" · " + esc(rt) if rt else "")}'
-                    f'{" · 다른 프로젝트/미분류" if other else ""}{esc(ov_label(c))}</option>')
+                    f'{" · 다른 프로젝트/미분류" if other else ""}{esc(ov_label(c))}{esc(trial_label(c, trials))}</option>')
+    recent = [j for j in jobs_index() if j["kind"] == "rollout"][:6]
+    recent_html = "".join(
+        f'<tr><td><a href="/rollout?job={esc(j["id"])}" class=mono>{esc(j["id"])}</a></td>'
+        f'<td class=mono>{esc(job_ckpt_rel(j).replace("/pretrained_model", ""))}</td><td>{esc(rollout_engine_label(j))}</td>'
+        f'<td class=num>{sum(1 for x in trials.get(job_ckpt_rel(j), []) if x.get("job") == j["id"] and x["result"] == "success")}'
+        f' / {sum(1 for x in trials.get(job_ckpt_rel(j), []) if x.get("job") == j["id"])}</td></tr>'
+        for j in recent)
+    recent_html = (f'<p class=eyebrow style="margin-top:22px">최근 실행</p><div class=card><table>'
+                   f'<tr><th>작업</th><th>체크포인트</th><th>엔진</th><th class=num>성공 / 시도</th></tr>{recent_html}</table></div>'
+                   if recent else "")
     ovd = ov_devices()
     fams = ov_families()
     eng_opts = '<option value=torch>PyTorch (기본)</option>'
@@ -3635,7 +4325,7 @@ def rollout_page():
       <button class=danger onclick="delCkpt('run')" {'disabled' if not ckpts else ''}>출력 전체 삭제</button>
       <span class=muted>선택 = 해당 step 폴더만 · 출력 전체 = outputs/&lt;run&gt; 통째 (복구 불가)</span>
     </div>
-    </div></div>
+    </div>{recent_html}</div>
     <script>
     {OV_JS}
     const ENG=document.getElementById('engine'), PREC=document.getElementById('prec');
@@ -3703,8 +4393,10 @@ async def api_rollout(req: Request):
                                       "pip install --no-deps " + " ".join(f"-e plugins/{m}" for m in miss)},
                             status_code=400)
     engine = b.get("engine") or "torch"
+    # 어느 엔진이든 lrweb_rollout.py 로 띄웁니다 — lerobot-rollout 을 그대로 돌리면서 실시간 화면용 상태를 씁니다
+    mon = [sys.executable, str(ROLLOUT_PY), f"--lrweb.run_dir={RUN_DIR}/{{jid}}"]
     if engine == "torch":
-        head = [sys.executable, "-m", "lerobot.scripts.lerobot_rollout"]
+        head = mon + ["--lrweb.engine=torch"]
     else:
         dev = engine[3:] if engine.startswith("ov:") else ""
         prec = b.get("precision") or "fp16"
@@ -3726,7 +4418,7 @@ async def api_rollout(req: Request):
         if conv:
             return JSONResponse({"error": f"{conv['id']} 변환 중 — 끝난 뒤 시작하세요"}, status_code=400)
         # 요청 장치가 없으면 lrweb_ov 가 NPU → GPU → CPU 순으로 대체하고 로그에 크게 알립니다
-        head = [sys.executable, str(OV_PY), "rollout", f"--ov.dir={lrweb_ov.ov_dir(ck)}",
+        head = mon + ["--lrweb.engine=ov", f"--ov.dir={lrweb_ov.ov_dir(ck)}",
                 f"--ov.device={dev}", f"--ov.precision={prec}", f"--ov.fps={CFG['fps']}"]
     try:
         argv = (head + [f"--policy.path={ck}"] + robot_cli_args()

@@ -47,6 +47,8 @@ source activate.sh
 # OMX 를 처음 쓸 때 한 번만
 pip install "dynamixel-sdk>=3.7.31,<3.9.0"
 pip install --no-deps -e plugins/lerobot_robot_bi_omx -e plugins/lerobot_teleoperator_bi_omx
+# Training 에서 Diffusion / SmolVLA 를 처음 쓸 때 한 번만
+(cd lerobot-src && pip install -e ".[diffusion,smolvla]")
 # Intel 기기에서 OpenVINO 를 처음 쓸 때 한 번만
 pip install "openvino>=2025.4" "nncf>=2.19"
 ```
@@ -89,7 +91,7 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 
 ### Projects
 
-태스크 하나를 묶는 단위입니다 (기본 태스크 설명, 기준 환경, 데이터셋, 모델). 프로젝트를 열면 Datasets·Collect·Training·Rollout 이
+태스크 하나를 묶는 단위입니다 (기본 태스크 설명, 기준 환경, 데이터셋, 모델). 프로젝트를 열면 Datasets·Collect·Training·Models·Rollout 이
 그 프로젝트 기준으로 보이고, 새 데이터셋·모델이 자동으로 들어갑니다. '전체' 를 고르면 모두 보입니다. 없어도 다른 기능은 그대로 됩니다.
 
 ![Projects](docs/img/projects.png)
@@ -159,6 +161,7 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 - 단축키: ← / → 에피소드 이동, Space 재생/정지, X 불량 표시
 - 불량 표시한 에피소드 일괄 삭제, 이름 변경, **v3.0 형식으로 다운로드**(tar), 에피소드 추가(이어서 수집)
 - **짧음** 배지 = 길이가 중앙값의 절반도 안 되는 에피소드
+- 목록 아래 **데이터셋 가져오기** — 다운로드한 tar(또는 LeRobot 데이터셋 폴더를 묶은 tar/zip)를 다른 기기에 그대로 넣습니다
 
 | 목록 | 리뷰 |
 |---|---|
@@ -166,11 +169,33 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 
 ### Training
 
-데이터셋을 골라 ACT 학습을 시작합니다. loss 그래프와 로그가 실시간으로 보입니다. 학습 중에도 Control 은 쓸 수 있습니다.
+데이터셋과 **정책**을 골라 학습을 시작합니다. 학습 중에도 Control 은 쓸 수 있습니다.
+
+| 정책 | 언제 | 참고 |
+|---|---|---|
+| **ACT** (기본) | 데모 50개 안팎, 가볍고 빠름 | OpenVINO(NPU) 변환 가능 |
+| **Diffusion** | 동작이 여러 갈래인 태스크 | 추론이 느림 (디노이징 반복) |
+| **SmolVLA** | 태스크 설명(언어)을 쓰는 450M 사전학습 모델 미세조정 | 처음 한 번 인터넷으로 내려받음, GPU 메모리 많이 씀 |
+
+- loss 그래프 + **grad norm·학습률** 그래프, **진행률·남은 시간**이 실시간으로 보입니다
+- **AMP** 를 켜면 CUDA 에서 메모리·시간을 아낍니다 (손실이 튀면 끄세요)
+- Diffusion / SmolVLA 에 필요한 패키지가 없으면 목록에 "패키지 미설치" 로 나오고, 시작하면 설치 명령을 알려 줍니다
 
 ![Training](docs/img/training.png)
 
 화면 아래 **OpenVINO 변환** 은 Intel 기기용입니다 — [Intel Core Ultra 에서 추론](#intel-core-ultra-에서-추론--openvino) 참고.
+
+### Models
+
+학습한 모델(출력 폴더) 하나가 카드 하나입니다.
+
+- 정책 · 데이터셋 · 진행 step · 마지막 loss · 학습 시간
+- 체크포인트별 **OpenVINO 변환 상태**와 **실기 성공률** (Rollout 에서 기록한 성공/실패)
+- **롤아웃** (그 체크포인트를 골라 Rollout 으로), **내보내기**(tar), 삭제
+- **이어서 학습** — 중단했거나 더 돌리고 싶은 학습을 마지막 체크포인트에서 목표 step 까지 이어서 돌립니다
+- 맨 위 **모델 가져오기** — 다른 기기에서 내보낸 tar 를 넣으면 같은 폴더 구조로 들어옵니다 (OpenVINO 변환본 포함)
+
+![Models](docs/img/models.png)
 
 ### Rollout
 
@@ -181,6 +206,16 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 
 **추론 엔진** 에서 PyTorch(기본) 또는 OpenVINO NPU / GPU / CPU 를 고릅니다. OpenVINO 는 Intel 기기에서
 체크포인트를 먼저 변환해 둬야 보입니다. 중지하면 어느 엔진이든 시작 자세로 돌아간 뒤 토크를 끕니다.
+
+시작하면 **실시간 화면**으로 바뀝니다.
+
+- 카메라와 3D 팔, 관절별 **실측 / 명령 / 차이** (차이가 크게 유지되면 노란색 — 막힘·과부하·학습 범위 밖)
+- **제어 주기(Hz)** 와 **추론 시간** (청크 계산 · 보통 틱) — 프레임 예산을 넘으면 경고
+- **성공 (S) / 실패 (F)** 버튼 — 물체를 놓고 한 번 시도할 때마다 누릅니다. 체크포인트별 실기 성공률이 쌓여
+  Models 탭·체크포인트 목록에 나옵니다 (U 로 마지막 기록 취소)
+- 끝난 실행도 아래 **최근 실행** 에서 다시 열어 결과를 기록할 수 있습니다
+
+![Rollout 실시간](docs/img/rollout_live.png)
 
 ### Jobs
 
@@ -199,8 +234,9 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 - GPU(내장 Arc): [compute-runtime](https://github.com/intel/compute-runtime/releases) (`intel-opencl-icd`, level-zero)
 - 설치 후 `render` 그룹 반영을 위해 재로그인
 
-**2. 체크포인트 가져오기** — 학습 기기의 `~/project/lerobot/outputs/<이름>/` 을 Intel 기기 같은 위치에 복사합니다.
-학습에 쓴 데이터셋(`data/hf/lerobot/local/<이름>/`)도 같이 복사하면 실제 프레임으로 검증하고 INT8 도 만들 수 있습니다.
+**2. 모델 가져오기** — 학습 기기의 **Models** 탭에서 체크포인트를 **내보내기** 하고, Intel 기기의 **Models → 모델 가져오기** 로 넣습니다.
+학습에 쓴 데이터셋도 **Datasets** 에서 다운로드 → 가져오기 하면 실제 프레임으로 검증하고 INT8 도 만들 수 있습니다.
+(폴더를 직접 복사해도 됩니다: `outputs/<이름>/`, `data/hf/lerobot/local/<이름>/`)
 
 **3. 변환** — **Training** 탭 아래 **OpenVINO 변환** 에서 체크포인트를 고르고 변환합니다 (수십 초).
 이 기기의 장치마다 PyTorch 결과와의 **최대 오차(관절 단위)** 와 **추론 시간(평균·p95)** 을 재서 표로 보여 줍니다.
@@ -213,6 +249,7 @@ p95 가 프레임 예산(30 fps 면 33 ms) 안이고 오차가 작으면 **OK** 
 ![Rollout — OpenVINO](docs/img/rollout_ov.png)
 
 (위 캡처는 NPU 없는 시험 서버라 CPU 행만 보입니다. Core Ultra 에서는 NPU · GPU 행이 함께 나옵니다.)
+실행 중 화면에서 엔진 배지(예: `OpenVINO · NPU · fp16`)와 실제 추론 시간을 확인할 수 있습니다.
 
 알아 둘 것
 - 고른 장치를 못 쓰면 **NPU → GPU → CPU** 순으로 대신 실행하고, 작업 로그에 `요청한 NPU 대신 CPU 로 실행합니다` 라고 크게 남깁니다.
