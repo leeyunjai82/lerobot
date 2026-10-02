@@ -11,7 +11,7 @@
 #
 #  새 기기에서:
 #     mkdir -p ~/project && cd ~/project
-#     git clone https://github.com/leeyunjai82/arm-lab.git arm-lab
+#     git clone https://github.com/themakerrobot/arm-lab.git arm-lab
 #     cd arm-lab
 #     chmod +x lerobot_conda.sh
 #     sudo -v
