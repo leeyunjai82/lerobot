@@ -28,7 +28,16 @@ nohup ./lerobot_conda.sh > /dev/null 2>&1 &
 tail -f lerobot_conda.log          # 끝날 때까지 지켜보기
 ```
 
-conda 환경, PyTorch(Jetson Thor / x86 자동 분기), lerobot, OMX 용 Dynamixel 패키지와 양팔 OMX 플러그인까지 설치합니다.
+conda 환경, PyTorch, lerobot, OMX 용 Dynamixel 패키지와 양팔 OMX 플러그인까지 설치합니다. 기기 종류는 자동으로 고릅니다.
+
+| 플랫폼 | 고르는 조건 | PyTorch | 추론 |
+|---|---|---|---|
+| `thor` | aarch64 (Jetson Thor) | CUDA 13 휠 | PyTorch (GPU) |
+| `cuda` | x86_64 + NVIDIA GPU | CUDA 13 휠 | PyTorch (GPU) |
+| `intel` | x86_64 + NVIDIA 없음 (Core Ultra 권장) | CPU 휠 + **OpenVINO / NNCF** | OpenVINO **NPU / GPU / CPU** |
+
+자동 판정이 틀리면 `LRWEB_PLATFORM=intel ./lerobot_conda.sh` 처럼 지정합니다. Intel 쪽은 아래
+[Intel Core Ultra 에서 추론](#intel-core-ultra-에서-추론--openvino) 을 보세요.
 
 ### 이미 설치된 기기 업데이트
 
@@ -38,6 +47,8 @@ source activate.sh
 # OMX 를 처음 쓸 때 한 번만
 pip install "dynamixel-sdk>=3.7.31,<3.9.0"
 pip install --no-deps -e plugins/lerobot_robot_bi_omx -e plugins/lerobot_teleoperator_bi_omx
+# Intel 기기에서 OpenVINO 를 처음 쓸 때 한 번만
+pip install "openvino>=2025.4" "nncf>=2.19"
 ```
 
 ## 실행
@@ -159,6 +170,8 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 
 ![Training](docs/img/training.png)
 
+화면 아래 **OpenVINO 변환** 은 Intel 기기용입니다 — [Intel Core Ultra 에서 추론](#intel-core-ultra-에서-추론--openvino) 참고.
+
 ### Rollout
 
 학습된 체크포인트를 골라 자율 구동합니다. 지금 기종·모드와 다른 데이터로 학습한 체크포인트는 막힙니다.
@@ -166,9 +179,49 @@ nohup python lrweb.py > lrweb.log 2>&1 &
 
 ![Rollout](docs/img/rollout.png)
 
+**추론 엔진** 에서 PyTorch(기본) 또는 OpenVINO NPU / GPU / CPU 를 고릅니다. OpenVINO 는 Intel 기기에서
+체크포인트를 먼저 변환해 둬야 보입니다. 중지하면 어느 엔진이든 시작 자세로 돌아간 뒤 토크를 끕니다.
+
 ### Jobs
 
 수집·학습·추론 같은 백그라운드 작업 목록과 로그. 여기서 중지할 수 있습니다.
+
+## Intel Core Ultra 에서 추론 — OpenVINO
+
+학습은 NVIDIA 기기(Thor 등)에서 하고, 추론만 Intel Core Ultra 노트북·미니PC 의 **NPU** 로 돌리는 구성입니다.
+**Meteor Lake (Core Ultra 1세대) 이상**을 기준으로 합니다. 지금은 **ACT** 정책만 지원합니다.
+
+**1. 설치** — Intel 기기에서 위 [설치](#설치) 그대로 실행하면 `intel` 플랫폼으로 잡혀 OpenVINO 까지 설치됩니다.
+스크립트는 NPU·GPU 드라이버를 **설치하지 않고 점검만** 합니다. 로그에 경고가 나오면 직접 설치하세요.
+
+- NPU: `/dev/accel/accel0` 이 있어야 합니다. 커널 `intel_vpu` 드라이버 + [linux-npu-driver](https://github.com/intel/linux-npu-driver/releases)
+  (Ubuntu·커널 버전 조합은 릴리스 노트로 확인 필요)
+- GPU(내장 Arc): [compute-runtime](https://github.com/intel/compute-runtime/releases) (`intel-opencl-icd`, level-zero)
+- 설치 후 `render` 그룹 반영을 위해 재로그인
+
+**2. 체크포인트 가져오기** — 학습 기기의 `~/project/lerobot/outputs/<이름>/` 을 Intel 기기 같은 위치에 복사합니다.
+학습에 쓴 데이터셋(`data/hf/lerobot/local/<이름>/`)도 같이 복사하면 실제 프레임으로 검증하고 INT8 도 만들 수 있습니다.
+
+**3. 변환** — **Training** 탭 아래 **OpenVINO 변환** 에서 체크포인트를 고르고 변환합니다 (수십 초).
+이 기기의 장치마다 PyTorch 결과와의 **최대 오차(관절 단위)** 와 **추론 시간(평균·p95)** 을 재서 표로 보여 줍니다.
+p95 가 프레임 예산(30 fps 면 33 ms) 안이고 오차가 작으면 **OK** 입니다.
+
+![OpenVINO 변환](docs/img/training_ov.png)
+
+**4. 추론** — **Rollout** 탭에서 추론 엔진 **OpenVINO · NPU** 를 고르고 시작합니다.
+
+![Rollout — OpenVINO](docs/img/rollout_ov.png)
+
+(위 캡처는 NPU 없는 시험 서버라 CPU 행만 보입니다. Core Ultra 에서는 NPU · GPU 행이 함께 나옵니다.)
+
+알아 둘 것
+- 고른 장치를 못 쓰면 **NPU → GPU → CPU** 순으로 대신 실행하고, 작업 로그에 `요청한 NPU 대신 CPU 로 실행합니다` 라고 크게 남깁니다.
+- 카메라 해상도는 **학습 데이터 기준으로 고정**됩니다 (NPU 는 고정 크기만 받습니다). Setup 의 카메라 이름·해상도가 다르면
+  팔이 움직이기 전에 시작이 거부됩니다.
+- 체크포인트를 다시 학습·덮어쓰면 **OV(다시 변환 필요)** 로 표시되고 시작이 막힙니다 — 다시 변환하세요.
+- 추론 중 로그에 `[ov] 추론 … ms` 가 주기적으로 찍힙니다. 프레임 예산을 넘으면 청크가 바뀌는 순간 한 박자 멈출 수 있습니다.
+- INT8 은 더 빠를 수 있지만 오차가 커집니다. 표의 오차·판정을 보고 고르세요. 기본은 FP16 입니다.
+- Intel 기기에서 학습은 CPU 로만 돌아 매우 느립니다 — 학습은 NVIDIA 기기에서 하세요.
 
 ## 팔 없이 시험하기 — 가상 팔
 

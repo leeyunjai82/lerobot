@@ -44,6 +44,8 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
+import lrweb_ov  # OpenVINO 변환·롤아웃. openvino 자체는 필요할 때 별도 프로세스에서만 import 합니다
+
 # ------------------------------- 경로 ---------------------------------------
 HOME = Path.home()
 PROJ = HOME / "project/lerobot"
@@ -289,7 +291,7 @@ _START_PATHS = {"/api/record", "/api/rollout", "/api/train", "/api/setup/probe",
                 "/api/setup/motors/start", "/api/setup/armcheck/start", "/api/wizard/assign",
                 "/api/wizard/verify/start", "/api/wizard/import_calib", "/api/wizard/mode",
                 "/api/setup/config", "/api/calib/start", "/api/calib/factory", "/api/wizard/robot",
-                "/api/envs/activate", "/api/envs/save_as",
+                "/api/envs/activate", "/api/envs/save_as", "/api/ov/convert",
                 "/api/envs/rename", "/api/envs/delete"}
 _START_GATE = asyncio.Lock()
 
@@ -3228,6 +3230,140 @@ def api_joblog(jid: str):
     return JSONResponse({"tail": log_tail(jid), "alive": job_alive(j)})
 
 
+# ----------------------------- OpenVINO (Intel NPU · GPU · CPU) --------------
+# 변환·검증·롤아웃 본체는 lrweb_ov.py 입니다. 여기는 화면과 API 만 둡니다.
+OV_PY = Path(__file__).resolve().parent / "lrweb_ov.py"
+OV_DEVICES = ("NPU", "GPU", "CPU")
+_OV_DEV = {"t": 0.0, "v": None}
+
+
+def ov_devices(refresh=False):
+    """{"ok", "devices": [{id, name}], "error"} — openvino 는 별도 프로세스에서 조회합니다
+    (lrweb 프로세스가 NPU 를 붙잡고 있지 않게). 2분 캐시."""
+    now = time.monotonic()
+    if not refresh and _OV_DEV["v"] is not None and now - _OV_DEV["t"] < 120:
+        return _OV_DEV["v"]
+    try:
+        r = subprocess.run([sys.executable, str(OV_PY), "devices"], capture_output=True, text=True, timeout=60)
+        v = json.loads((r.stdout.strip().splitlines() or ["{}"])[-1])
+        if "ok" not in v:
+            v = {"ok": False, "error": (r.stderr.strip().splitlines() or ["조회 실패"])[-1][:200]}
+    except Exception as e:       # noqa: BLE001 — 화면은 떠야 합니다
+        v = {"ok": False, "error": f"조회 실패: {type(e).__name__}"}
+    _OV_DEV.update(t=now, v=v)
+    return v
+
+
+def ov_families():
+    """{"NPU": "Intel(R) AI Boost", ...} — 장치 계열별 이름"""
+    d = ov_devices()
+    out = {}
+    for x in d.get("devices", []) if d.get("ok") else []:
+        out.setdefault(x["id"].split(".")[0], x["name"])
+    return out
+
+
+def ov_ckpt_ok(rel):
+    """요청의 체크포인트 상대경로 → 절대경로 (검증 실패 시 None)"""
+    ck = (OUT_ROOT / (rel or "")).resolve()
+    if not rel or not _within(ck, OUT_ROOT) or not (ck / "config.json").is_file():
+        return None
+    return ck
+
+
+def ov_shape_problem(rel):
+    """변환 때 고정한 카메라 입력과 지금 Setup 의 카메라(이름·해상도)가 맞는지 — 팔이 움직이기 전에 거릅니다.
+    NPU 는 정적 shape 라 해상도가 다르면 첫 추론에서 멈춥니다."""
+    meta = lrweb_ov.load_meta(OUT_ROOT / rel) or {}
+    pre = "observation.images."
+    have = {pre + n: [1, 3, int(s["height"]), int(s["width"])] for n, s in CAM_SPECS.items()}
+    for i in meta.get("inputs", []):
+        if not i["name"].startswith(pre):
+            continue
+        cam = i["name"][len(pre):]
+        if i["name"] not in have:
+            return f"카메라 '{cam}' 가 지금 Setup 에 없습니다 (학습 데이터에는 있던 카메라)"
+        if have[i["name"]] != i["shape"]:
+            h, w = have[i["name"]][2:]
+            return (f"카메라 '{cam}' 해상도 {w}x{h} ≠ 학습 {i['shape'][3]}x{i['shape'][2]} — "
+                    "Setup 에서 해상도를 맞추거나 다시 변환하세요")
+    return None
+
+
+def ov_label(rel):
+    st = lrweb_ov.status(OUT_ROOT / rel)
+    return {"ok": " · OV✓", "stale": " · OV(다시 변환 필요)"}.get(st["state"], "")
+
+
+def ov_last_job(rel):
+    j = next((j for j in jobs_index() if j["kind"] == "ovconvert" and (j.get("spec") or {}).get("ckpt") == rel), None)
+    return {"id": j["id"], "alive": j["alive"], "tail": log_tail(j["id"])} if j else None
+
+
+@app.get("/api/ov/status")
+def api_ov_status(ckpt: str = "", refresh: int = 0):
+    ck = ov_ckpt_ok(ckpt)
+    if ck is None:
+        return JSONResponse({"error": "체크포인트 없음"}, status_code=400)
+    st = lrweb_ov.status(ck)
+    return {"status": st, "devices": ov_devices(bool(refresh)), "job": ov_last_job(ckpt),
+            "fps": CFG["fps"], "shape_problem": ov_shape_problem(ckpt) if st["state"] != "none" else None}
+
+
+@app.post("/api/ov/convert")
+async def api_ov_convert(req: Request):
+    b = await req.json()
+    rel = b.get("ckpt", "")
+    ck = ov_ckpt_ok(rel)
+    if ck is None:
+        return JSONResponse({"error": "체크포인트 없음 — 목록에서 고르세요"}, status_code=400)
+    d = ov_devices(refresh=True)
+    if not d.get("ok"):
+        return JSONResponse({"error": f"OpenVINO 를 쓸 수 없습니다 ({d.get('error')}) — Intel 기기에서 "
+                                      "LRWEB_PLATFORM=intel ./lerobot_conda.sh 로 설치하거나 "
+                                      "pip install openvino nncf"}, status_code=400)
+    # 추론 중엔 NPU·CPU 를 같이 써서 지연 측정이 틀어지고, 같은 IR 을 덮어쓰게 됩니다
+    busy = busy_with(("rollout", "ovconvert"))
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 끝난 뒤 변환하세요"}, status_code=400)
+    argv = [sys.executable, str(OV_PY), "convert", f"--ckpt={ck}", f"--fps={CFG['fps']}"]
+    if b.get("int8"):
+        argv.append("--int8")
+    try:
+        jid = start_job("ovconvert", argv, spec={"ckpt": rel})
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "job": jid}
+
+
+# 두 화면(Training·Rollout)이 같이 쓰는 결과 표
+OV_JS = r"""
+function ovTable(d){
+  const st=d.status||{}, m=st.meta||{}, res=m.results||{};
+  if(st.state==='none') return '<p class=muted>OpenVINO 변환 없음</p>';
+  let h='<p class=muted>'+(st.state==='stale'
+      ? '<span class="badge b-warn">체크포인트가 변환 후 바뀜 — 다시 변환 필요</span> '
+      : '<span class="badge b-ok">변환됨</span> ')
+    +'정밀도 '+(st.precisions||[]).join(', ')+' · '+(m.created||'')+' · 검증 입력: '
+    +(m.parity_source==='dataset'?'학습 데이터셋 프레임':'임의 입력')
+    +' · PyTorch CPU '+(m.torch_cpu_ms??'?')+' ms · 프레임 예산 '+(m.budget_ms??'?')+' ms</p>';
+  h+='<table><tr><th>정밀도</th><th>장치</th><th class=num>컴파일 s</th><th class=num>평균 ms</th>'
+    +'<th class=num>p95 ms</th><th class=num>최대오차(관절 단위)</th><th>판정</th></tr>';
+  for(const p of Object.keys(res)) for(const dev of Object.keys(res[p])){
+    const r=res[p][dev];
+    if(!r.ok){ h+='<tr><td>'+p+'</td><td>'+dev+'</td><td colspan=4 class=muted>'+ovEsc(r.error||'실패')
+      +'</td><td><span class="badge b-bad">실패</span></td></tr>'; continue; }
+    const good=r.parity&&r.realtime;
+    h+='<tr><td>'+p+'</td><td>'+dev+'</td><td class=num>'+r.compile_s+'</td><td class=num>'+r.mean_ms
+      +'</td><td class=num>'+r.p95_ms+'</td><td class=num>'+r.max_abs_units+'</td><td>'
+      +'<span class="badge '+(good?'b-ok':'b-warn')+'">'+(good?'OK':(!r.parity?'오차 큼':'예산 초과'))+'</span></td></tr>';
+  }
+  return h+'</table>'+(d.shape_problem?'<p class="badge b-warn">'+ovEsc(d.shape_problem)+'</p>':'');
+}
+function ovEsc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+"""
+
+
 # ----------------------------- 페이지: 학습 ----------------------------------
 @app.get("/train", response_class=HTMLResponse)
 def train_page():
@@ -3239,6 +3375,9 @@ def train_page():
                       for d in dsets)
     projline = (f'<p class=muted>프로젝트 <b class=mono>{esc(pname)}</b> — 이 프로젝트의 데이터셋이 위에 오고, '
                 f'학습 출력은 이 프로젝트의 모델로 들어갑니다.</p>' if pname else "")
+    pmodels = set(pr["models"]) if pr else set()
+    ov_cks = sorted(list_checkpoints(), key=lambda c: c.split("/checkpoints/")[0] not in pmodels)
+    ov_opts = "".join(f'<option value="{esc(c)}">{esc(c)}{esc(ov_label(c))}</option>' for c in ov_cks)
     running = [j for j in jobs_index() if j["kind"] == "train" and j["alive"]]
     run_html = "".join(
         f'<div class=runbar><span class="badge b-run">running</span> '
@@ -3257,7 +3396,45 @@ def train_page():
     </form>
     <div class="muted mono" id=which style="margin-bottom:8px"></div>
     <div class=chartbox><canvas id=chart height=90></canvas></div>
-    <p class=eyebrow>Log tail</p><pre id=tail>...</pre></div>
+    <p class=eyebrow>Log tail</p><pre id=tail>...</pre>
+    <p class=eyebrow style="margin-top:22px">OpenVINO 변환 · Intel NPU / GPU / CPU</p>
+    <div class=card>
+      <p class=muted>학습이 끝난 체크포인트를 OpenVINO 로 바꾸고, 이 기기의 장치마다 PyTorch 결과와의 오차·추론 시간을 잽니다.
+      변환 결과는 체크포인트 폴더 안 <span class=mono>openvino/</span> 에 저장되고, Rollout 탭에서 추론 엔진으로 고를 수 있습니다.
+      카메라 해상도는 학습 데이터 기준으로 고정됩니다.</p>
+      <div class=formgrid>
+        <label class=f style="min-width:380px">체크포인트
+          <select id=ovck onchange="ovRefresh()">{ov_opts}</select></label>
+        <label class=f><span><input type=checkbox id=ovint8> INT8 도 만들기 (학습 데이터셋으로 보정)</span></label>
+        <button class=primary onclick="ovConvert()" {'disabled' if not ov_cks else ''}>OpenVINO 변환</button>
+      </div>
+      {'' if ov_cks else '<p class=muted>체크포인트가 없습니다 — 학습을 먼저 완료하세요</p>'}
+      <div id=ovres style="margin-top:10px"></div>
+      <pre id=ovtail style="display:none;margin-top:10px"></pre>
+    </div></div>
+    <script>{OV_JS}
+    let ovTimer=null;
+    async function ovRefresh(){{
+      const ck=document.getElementById('ovck').value; if(!ck) return;
+      const r=await fetch('/api/ov/status?ckpt='+encodeURIComponent(ck)); const d=await r.json();
+      if(d.error){{document.getElementById('ovres').textContent=d.error;return;}}
+      const dev=d.devices||{{}};
+      const devline='<p class=muted>이 기기 OpenVINO 장치: '+(dev.ok?(dev.devices||[]).map(x=>ovEsc(x.id+' ('+x.name+')')).join(', ')||'없음'
+        :'<span class="badge b-warn">'+ovEsc(dev.error||'사용 불가')+'</span>')+'</p>';
+      document.getElementById('ovres').innerHTML=devline+ovTable(d);
+      const t=document.getElementById('ovtail');
+      if(d.job){{t.style.display='';t.textContent=(d.job.alive?'[변환 중 '+d.job.id+']\\n':'['+d.job.id+']\\n')+(d.job.tail||'');}}
+      else t.style.display='none';
+      clearTimeout(ovTimer); if(d.job&&d.job.alive) ovTimer=setTimeout(ovRefresh,2500);
+    }}
+    async function ovConvert(){{
+      const b={{ckpt:document.getElementById('ovck').value,int8:document.getElementById('ovint8').checked}};
+      const r=await fetch('/api/ov/convert',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
+      const d=await r.json(); if(d.error){{alert(d.error);return;}}
+      setTimeout(ovRefresh,800);
+    }}
+    ovRefresh();
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
     async function startTrain(e){{
@@ -3379,6 +3556,14 @@ def api_trainlog():
 
 
 # ----------------------------- 페이지: 추론 (Rollout) ------------------------
+def rollout_engine_label(j):
+    for a in j.get("argv") or []:
+        if a.startswith("--ov.device="):
+            prec = next((x.split("=", 1)[1] for x in j["argv"] if x.startswith("--ov.precision=")), "fp16")
+            return f"OpenVINO · {a.split('=', 1)[1]} · {prec}"
+    return "PyTorch"
+
+
 @app.get("/rollout", response_class=HTMLResponse)
 def rollout_page():
     ro = next((j for j in jobs_index() if j["kind"] == "rollout" and j["alive"]), None)
@@ -3387,6 +3572,7 @@ def rollout_page():
         <p class=eyebrow>Autonomous</p><h2>추론 실행 중</h2>
         <div class=runbar><span class="badge b-run">rollout</span>
           <span class=mono>{esc(ro["id"])}</span>
+          <span class=badge>{esc(rollout_engine_label(ro))}</span>
           <button class=danger onclick="stopRo()">중지</button>
           <span class=muted>중지(SIGINT) 시 시작 자세로 복귀 후 토크 해제됩니다</span></div>
         <p class=eyebrow>Log</p><pre id=tail>...</pre></div>
@@ -3416,7 +3602,16 @@ def rollout_page():
         other = pname and c.split("/checkpoints/")[0] not in mine
         ck_opts += (f'<option value="{esc(c)}" {"disabled" if bad else ""}>{esc(c)}'
                     f'{" · " + esc(rt) + " — 모드 불일치" if bad else (" · " + esc(rt) if rt else "")}'
-                    f'{" · 다른 프로젝트/미분류" if other else ""}</option>')
+                    f'{" · 다른 프로젝트/미분류" if other else ""}{esc(ov_label(c))}</option>')
+    ovd = ov_devices()
+    fams = ov_families()
+    eng_opts = '<option value=torch>PyTorch (기본)</option>'
+    if ovd.get("ok"):
+        for dev in OV_DEVICES:
+            eng_opts += (f'<option value="ov:{dev}" {"" if dev in fams else "disabled"}>OpenVINO · {dev}'
+                         f'{" — " + esc(fams[dev]) if dev in fams else " — 없음"}</option>')
+    else:
+        eng_opts += f'<option disabled>OpenVINO — {esc(ovd.get("error") or "사용 불가")} (Intel 기기 전용)</option>'
     empty = "" if ckpts else '<p class=muted>체크포인트가 없습니다 — Training에서 학습을 먼저 완료하세요</p>'
     return f"""{CSS}{nav_html('ro')}<div class=wrap>
     <p class=eyebrow>Autonomous run · {esc(kind()["label"])} · {"양팔 " + kind()["cli"]["bi_follower"] if BIMANUAL else "한팔 " + kind()["cli"]["follower"]}</p><h2>Rollout</h2>
@@ -3425,11 +3620,14 @@ def rollout_page():
     <div class=formgrid>
       <label class=f style="min-width:380px">체크포인트
         <select id=ckpt>{ck_opts}</select></label>
+      <label class=f>추론 엔진 <select id=engine onchange="ovInfo()">{eng_opts}</select></label>
+      <label class=f>정밀도 <select id=prec onchange="ovInfo()"><option>fp16</option><option>int8</option></select></label>
       <label class=f>실행 시간(초, 0=무한) <input id=dur value=60 size=6></label>
       <label class=f style="flex:1;min-width:260px">태스크 설명
         <input id=task value="{esc(pr["task"] if pr and pr["task"] else CFG['default_task'])}"></label>
       <button class=primary onclick="startRo()" {'disabled' if not ckpts else ''}>추론 시작</button>
     </div>
+    <div id=ovinfo style="margin-top:8px"></div>
     <p class=muted>시작 즉시 팔이 움직입니다 — 팔 주변을 비우고, 물체를 시연 위치에 놓으세요.
     카메라 배치는 학습 데이터 수집 때와 동일해야 합니다.</p>
     <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -3439,11 +3637,30 @@ def rollout_page():
     </div>
     </div></div>
     <script>
+    {OV_JS}
+    const ENG=document.getElementById('engine'), PREC=document.getElementById('prec');
+    try{{ const v=localStorage.getItem('lrweb_engine');
+          if(v && [...ENG.options].some(o=>o.value===v && !o.disabled)) ENG.value=v;
+          const p=localStorage.getItem('lrweb_prec'); if(p) PREC.value=p; }}catch(e){{}}
+    async function ovInfo(){{
+      try{{ localStorage.setItem('lrweb_engine',ENG.value); localStorage.setItem('lrweb_prec',PREC.value); }}catch(e){{}}
+      PREC.disabled = ENG.value==='torch';
+      const box=document.getElementById('ovinfo'), ck=document.getElementById('ckpt').value;
+      if(ENG.value==='torch' || !ck){{ box.innerHTML=''; return; }}
+      const r=await fetch('/api/ov/status?ckpt='+encodeURIComponent(ck)); const d=await r.json();
+      if(d.error){{ box.textContent=d.error; return; }}
+      box.innerHTML = d.status.state==='none'
+        ? '<p class="badge b-warn">이 체크포인트는 OpenVINO 변환이 없습니다 — Training 탭 아래 "OpenVINO 변환" 을 먼저 하세요</p>'
+        : ovTable(d);
+    }}
+    document.getElementById('ckpt').addEventListener('change', ovInfo);
+    ovInfo();
     async function startRo(){{
       if(!confirm('팔이 즉시 자율 구동됩니다. 주변이 안전한가요?'))return;
       const b={{ckpt:document.getElementById('ckpt').value,
                duration:document.getElementById('dur').value,
-               task:document.getElementById('task').value}};
+               task:document.getElementById('task').value,
+               engine:ENG.value, precision:PREC.value}};
       const r=await fetch('/api/rollout',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
       const d=await r.json(); if(d.error)alert(d.error); else location.reload();
     }}
@@ -3485,8 +3702,34 @@ async def api_rollout(req: Request):
         return JSONResponse({"error": "양팔 OMX 플러그인이 설치돼 있지 않습니다 — 터미널에서: "
                                       "pip install --no-deps " + " ".join(f"-e plugins/{m}" for m in miss)},
                             status_code=400)
+    engine = b.get("engine") or "torch"
+    if engine == "torch":
+        head = [sys.executable, "-m", "lerobot.scripts.lerobot_rollout"]
+    else:
+        dev = engine[3:] if engine.startswith("ov:") else ""
+        prec = b.get("precision") or "fp16"
+        if dev not in OV_DEVICES or prec not in lrweb_ov.PRECISIONS:
+            return JSONResponse({"error": "추론 엔진 값이 잘못됐습니다"}, status_code=400)
+        st = lrweb_ov.status(ck)
+        if st["state"] == "none":
+            return JSONResponse({"error": "OpenVINO 변환이 없습니다 — Training 탭에서 먼저 변환하세요"}, status_code=400)
+        if st["state"] == "stale":
+            return JSONResponse({"error": "변환 이후 체크포인트가 바뀌었습니다 — Training 탭에서 다시 변환하세요"},
+                                status_code=400)
+        if prec not in st["precisions"]:
+            return JSONResponse({"error": f"{prec} 변환본이 없습니다 — 변환 시 INT8 을 체크했는지 확인하세요"},
+                                status_code=400)
+        prob = ov_shape_problem(rel)
+        if prob:
+            return JSONResponse({"error": prob}, status_code=400)
+        conv = busy_with(("ovconvert",))
+        if conv:
+            return JSONResponse({"error": f"{conv['id']} 변환 중 — 끝난 뒤 시작하세요"}, status_code=400)
+        # 요청 장치가 없으면 lrweb_ov 가 NPU → GPU → CPU 순으로 대체하고 로그에 크게 알립니다
+        head = [sys.executable, str(OV_PY), "rollout", f"--ov.dir={lrweb_ov.ov_dir(ck)}",
+                f"--ov.device={dev}", f"--ov.precision={prec}", f"--ov.fps={CFG['fps']}"]
     try:
-        argv = ([sys.executable, "-m", "lerobot.scripts.lerobot_rollout", f"--policy.path={ck}"] + robot_cli_args()
+        argv = (head + [f"--policy.path={ck}"] + robot_cli_args()
                 + ["--strategy.type=base", f"--duration={dur}", f"--task={task}",
                    f"--fps={CFG['fps']}"])
     except (NotImplementedError, ValueError) as e:
@@ -3512,7 +3755,7 @@ async def api_delete_checkpoint(req: Request):
         # 학습(--output_dir)·추론(--policy.path) 인자를 실제 경로로 비교 (act_x 가 act_x_2 에 걸리지 않게)
         for a in j.get("argv") or (j.get("cmd") or "").split():
             k, sep, v = a.partition("=")
-            if k in ("--output_dir", "--policy.path") and v:
+            if k in ("--output_dir", "--policy.path", "--ckpt") and v:
                 rv = os.path.realpath(v)
                 if rv == run_path or rv.startswith(run_path + os.sep):
                     return True

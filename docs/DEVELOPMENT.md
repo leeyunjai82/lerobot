@@ -13,6 +13,7 @@
 - [수집 worker](#수집-worker)
 - [팔 불량 점검 판정 근거](#팔-불량-점검-판정-근거)
 - [보안·동시성](#보안동시성)
+- [OpenVINO (Intel NPU / GPU / CPU)](#openvino-intel-npu--gpu--cpu)
 - [lerobot 버전·설치](#lerobot-버전설치)
 - [테스트](#테스트)
 
@@ -23,6 +24,7 @@
 | `lrweb.py` | 웹 툴 전체 (FastAPI 한 파일, port 8080). `python lrweb.py --worker record <jid>` 로 수집 worker 도 겸함 |
 | `tools_armcheck.py` | SO-ARM101(STS3215) 팔 점검 — Setup 탭·마법사 진단과 CLI 공용 |
 | `tools_dxlcheck.py` | OMX(Dynamixel X) 팔 점검 — 같은 함수 이름·결과 형식 |
+| `lrweb_ov.py` | ACT → OpenVINO 변환·검증(`convert`), 장치 조회(`devices`), OpenVINO 추론으로 lerobot-rollout 실행(`rollout`). lrweb 는 이 파일을 별도 프로세스로 띄웁니다 |
 | `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
 | `tools_simarms.py` | 가상 팔 — PTY 위에서 STS3215 / Dynamixel X 를 흉내. 켜 있으면 `lrweb_sim.json` 에 포트를 알리고 lrweb 포트 목록에 추가됨 |
 | `plugins/lerobot_robot_bi_omx/` | 양팔 OMX 팔로워 `bi_omx_follower` (lerobot 플러그인) |
@@ -232,12 +234,55 @@ worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/lrweb/<jid>/`): `status.j
 - JSON 파일은 임시 파일 + `os.replace` 로 원자적으로 씀
 - 작업 PID 재사용 방지 (`/proc/<pid>/stat` starttime 비교)
 
+## OpenVINO (Intel NPU / GPU / CPU)
+
+목표: NVIDIA 기기에서 학습한 ACT 체크포인트를 Intel Core Ultra(Meteor Lake 이상)의 NPU 로 추론.
+
+**바꾸는 범위는 신경망 하나뿐입니다.** lerobot 체크포인트에서 정규화/역정규화는 모델 밖
+(`policy_preprocessor*.json` / `policy_postprocessor*.json`)에 있으므로, 그 파이프라인은 lerobot 것을 그대로 쓰고
+`ACTPolicy.model` 의 추론 경로만 IR 로 바꿉니다. 관절 순서·단위·카메라 키가 PyTorch 경로와 같다는 게 보장됩니다.
+(physical-ai-studio 의 export 는 정규화가 모델 안에 있던 예전 lerobot 형식을 가정해서 이 커밋과 맞지 않습니다)
+
+변환 (`lrweb_ov.py convert`)
+- `ACTCore(state, [env_state], *images) → actions (1, chunk, A)` 로 감싼 뒤 `openvino.convert_model` (정적 shape).
+  추론 때 VAE 인코더는 안 쓰므로(잠재 = 0) IR 에도 없습니다.
+- 정적 shape = 학습 데이터의 `input_features` shape. NPU 는 동적 shape 를 못 받습니다.
+- FP16 가중치로 저장(`compress_to_fp16`). `--int8` 이면 NNCF `quantize(model_type=TRANSFORMER)` — 보정 데이터는
+  학습 데이터셋 64 프레임을 preprocessor 에 통과시킨 것. 데이터셋을 못 찾으면 INT8 은 만들지 않습니다(임의 입력 보정은 의미 없음).
+- 검증: 데이터셋 8 프레임(없으면 정규분포 임의 입력)으로 PyTorch CPU 출력과 비교. 정규화 공간 최대 오차 ≤ 0.05(FP16) / 0.25(INT8)
+  이면 `parity`. 화면에는 postprocessor 로 되돌린 **관절 단위** 오차를 보여 줍니다. p95 ≤ 1000/fps 면 `realtime`.
+- 산출물 `<pretrained_model>/openvino/` : `act_fp16.*`, `act_int8.*`, `ov_meta.json`(입력 이름·shape, 장치별 결과,
+  `model.safetensors` 의 크기·mtime 지문), `cache/`(컴파일 캐시 — NPU 첫 컴파일 이후 빨라짐).
+- 모델 생성 시 `pretrained_backbone_weights=None` — ImageNet 가중치를 내려받지 않습니다(어차피 체크포인트 가중치로 덮어씀).
+
+추론 (`lrweb_ov.py rollout --ov.* <lerobot-rollout 인자>`)
+- 같은 프로세스에서 `lerobot.scripts.lerobot_rollout.main()` 을 그대로 실행하고 `ACTPolicy.predict_action_chunk` 만 교체합니다.
+  `select_action` 의 액션 큐·`n_action_steps`·temporal ensemble, `max_relative_target`, 중지(SIGINT) 시 시작 자세 복귀 + 토크 해제는
+  PyTorch 경로와 같은 코드입니다.
+- IR 컴파일은 로봇 연결 **전**에 끝냅니다(NPU 첫 컴파일이 길어도 팔이 연결된 채 멈춰 있지 않게).
+- 장치 대체: 요청 장치 → 그보다 뒤의 NPU → GPU → CPU. 대체되면 로그에 `!!` 로 남깁니다.
+- `--device=cpu`, `--policy.pretrained_backbone_weights=null` 을 붙입니다. 후자가 없으면 오프라인 기기에서 torchvision 다운로드로 죽습니다
+  (PyTorch 경로는 기존 동작 유지).
+- 입력 shape 가 변환 때와 다르면 첫 추론에서 예외 → lerobot teardown(시작 자세 복귀) 후 종료. lrweb 는 그 전에
+  `ov_shape_problem()` 으로 Setup 카메라 이름·해상도를 대조해 시작 자체를 막습니다.
+
+lrweb 쪽
+- `openvino` 는 lrweb 프로세스에서 import 하지 않습니다. 장치 조회도 `lrweb_ov.py devices` 를 띄워서 합니다(2분 캐시) —
+  웹 프로세스가 NPU 를 붙잡지 않게, 그리고 openvino 가 없는 Thor 에서도 그대로 뜨게.
+- 작업 종류 `ovconvert` (spec 에 체크포인트). 롤아웃·다른 변환과 동시 실행 금지(지연 측정이 틀어지고 IR 을 덮어씀).
+  OV 롤아웃은 작업 종류가 그대로 `rollout` 이라 배타·중지·체크포인트 삭제 보호가 기존 규칙을 따릅니다.
+- `/api/ov/status?ckpt=` · `/api/ov/convert` · `/api/rollout` 의 `engine: torch | ov:NPU | ov:GPU | ov:CPU`, `precision: fp16 | int8`.
+
 ## lerobot 버전·설치
 
 - lerobot commit `e40b58a8dfa9e7b86918c374791599d070518d11` 에 맞춰져 있습니다 (`lerobot_conda.sh` 의 `LEROBOT_COMMIT`)
 - `pip install -e "lerobot-src[feetech,dynamixel,training]"`, 그다음 `torchcodec` 제거 + `av>=15,<16` (pyav 디코딩)
 - 양팔 OMX: `pip install --no-deps -e plugins/lerobot_robot_bi_omx -e plugins/lerobot_teleoperator_bi_omx`
 - Python 3.12, torch 2.9 cu130 (Thor 는 `https://pypi.jetson-ai-lab.io/sbsa/cu130`)
+- lerobot 이 `torch<2.12, torchvision<0.27` 을 요구합니다. `cuda`·`intel` 플랫폼은 이 범위로 받습니다(`thor` 는 기존 인덱스 그대로).
+- torch 고정용 `PIP_CONSTRAINT` 에서 로컬 버전 꼬리표(`+cu130`, `+cpu`)는 뗍니다 — 붙어 있으면 pip 가
+  `Cannot install None … ResolutionImpossible` 로 lerobot 설치를 포기합니다. `torch==2.11.0` 은 설치된 `2.11.0+cu130` 을 그대로 만족합니다.
+- `intel` 플랫폼: `openvino>=2025.4`, `nncf>=2.19`, `render`·`video` 그룹. NPU/GPU 드라이버는 점검·안내만 합니다.
 
 ## 테스트
 
@@ -248,3 +293,6 @@ worker ↔ 웹은 파일로 통신합니다 (`/dev/shm/lrweb/<jid>/`): `status.j
 - lerobot API 스텁 — Collect 상태 기계, 양팔 녹화 worker, 강제 종료, 환경·프로젝트
 - 헤드리스 Chromium — SO 한팔·양팔, OMX 한팔·양팔 네 구성에서 전 페이지 JS 오류 0
 - `tools_jscheck.py` — 인라인 JS 문법
+- OpenVINO: 실제 lerobot(e40b58a)·torch 2.11·OpenVINO 2026.4 로 합성 데이터셋 → CPU 학습 20 step 체크포인트 → 변환(FP16/INT8, CPU) →
+  가상 SO-ARM101 팔 + 가상 카메라로 lrweb 에서 OV 롤아웃(정상 종료·SIGINT 중지·NPU/GPU 없음 → CPU 대체·해상도 불일치·낡은 IR 거부),
+  PyTorch 롤아웃 회귀. **NPU·내장 GPU 실측은 하지 못했습니다** (시험 서버에 장치 없음)
