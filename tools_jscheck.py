@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-PAGES = ("/projects", "/", "/collect", "/train", "/models", "/rollout", "/control", "/calib", "/setup", "/setup/wizard", "/jobs")
+PAGES = ("/projects", "/", "/collect", "/train", "/models", "/rollout", "/hub", "/control", "/calib", "/setup", "/setup/wizard", "/jobs")
 
 
 def main():

@@ -293,7 +293,8 @@ _START_PATHS = {"/api/record", "/api/rollout", "/api/train", "/api/setup/probe",
                 "/api/wizard/verify/start", "/api/wizard/import_calib", "/api/wizard/mode",
                 "/api/setup/config", "/api/calib/start", "/api/calib/factory", "/api/wizard/robot",
                 "/api/envs/activate", "/api/envs/save_as", "/api/ov/convert",
-                "/api/envs/rename", "/api/envs/delete"}
+                "/api/envs/rename", "/api/envs/delete", "/api/hub/push", "/api/hub/pull"}
+_START_PREFIXES = ("/api/install/", "/api/dataset/repair/")
 _START_GATE = asyncio.Lock()
 
 
@@ -302,7 +303,7 @@ async def guard_middleware(request: Request, call_next):
     if request.method == "POST":
         if not _same_origin(request.headers):
             return JSONResponse({"error": "다른 사이트에서 온 요청은 받지 않습니다"}, status_code=403)
-        if request.url.path in _START_PATHS:
+        if request.url.path in _START_PATHS or request.url.path.startswith(_START_PREFIXES):
             async with _START_GATE:
                 return await call_next(request)
     return await call_next(request)
@@ -657,6 +658,36 @@ def list_datasets():
     return out
 
 
+def dataset_unfinalized(ds):
+    """녹화가 끊겨 meta/episodes 색인이 없는 데이터셋 (수집 중인 것은 제외 — 그건 끝날 때 씀)"""
+    root = DATA_ROOT / ds
+    if not (root / "meta/info.json").is_file() or dataset_busy(ds):
+        return False
+    # v2.x 는 meta/episodes.jsonl 이 원래 형식이라 대상이 아닙니다 (v3.0 만 meta/episodes/*.parquet)
+    if load_json(root / "meta/info.json", {}).get("codebase_version") != "v3.0":
+        return False
+    ep = root / "meta" / "episodes"
+    return not (ep.is_dir() and any(ep.rglob("*.parquet")))
+
+
+REPAIR_PY = Path(__file__).resolve().parent / "tools_dsrepair.py"
+
+
+@app.post("/api/dataset/repair/{ds}")
+def api_dataset_repair(ds: str):
+    if not safe_name(ds) or not (DATA_ROOT / ds / "meta/info.json").is_file():
+        return JSONResponse({"error": "데이터셋 없음"}, status_code=400)
+    busy = dataset_busy(ds)
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 가 이 데이터셋을 쓰는 중"}, status_code=400)
+    try:
+        jid = start_job("repair", [sys.executable, str(REPAIR_PY), str(DATA_ROOT / ds)],
+                        spec={"root": str(DATA_ROOT / ds)})
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "job": jid}
+
+
 def checkpoint_robot_type(rel):
     """pretrained_model/train_config.json → dataset.repo_id → 로컬 데이터셋 robot_type (best-effort)."""
     tc = load_json(OUT_ROOT / rel / "train_config.json", {})
@@ -733,8 +764,10 @@ def _cam_cli(specs):
     for name, s in specs.items():
         idx = s["index_or_path"]
         idx = idx if isinstance(idx, int) else str(idx)
+        fc = cam_fourcc(s)
         items.append(f"{name}: {{type: opencv, index_or_path: {idx}, "
-                     f"width: {int(s['width'])}, height: {int(s['height'])}, fps: {int(s['fps'])}}}")
+                     f"width: {int(s['width'])}, height: {int(s['height'])}, fps: {int(s['fps'])}"
+                     + (f", fourcc: {fc}" if fc else "") + "}")
     return "{" + ", ".join(items) + "}"
 
 
@@ -1151,6 +1184,9 @@ def kill_job(jid, force=False):
         return False
     j["kill_requested"] = True
     save_json(jf, j)
+    if j.get("kind") == "cloudtrain":
+        # lerobot 은 Ctrl-C 를 '로그 분리' 로만 처리해 원격 학습이 계속 돌고 과금됩니다 — 원격도 취소
+        threading.Thread(target=cancel_cloud, args=(j,), daemon=True).start()
     return True
 
 
@@ -1571,6 +1607,7 @@ class CamStreamer:
                     index_or_path=idx, fps=int(spec["fps"]),
                     width=int(spec["width"]), height=int(spec["height"]),
                     color_mode="bgr",   # imencode 가 BGR 을 기대 — 변환 한 번 아낍니다
+                    **cam_fourcc_kw(spec),
                 ))
                 cam.connect()
                 self.cams[name] = cam
@@ -2473,7 +2510,7 @@ def nav_html(active=""):
 
     return (f'<div class=appbar><div class=brand>LRWEB <a href="/setup/wizard" title="기종 바꾸기 — 셋업 마법사"><small>/ {esc(kind()["label"])}</small></a></div>'
             f'<div class=nav>{tab("/projects", "Projects", "pj")}{tab("/", "Datasets", "ds")}{tab("/collect", "Collect", "co")}'
-            f'{tab("/train", "Training", "tr")}{tab("/models", "Models", "md")}{tab("/rollout", "Rollout", "ro")}'
+            f'{tab("/train", "Training", "tr")}{tab("/models", "Models", "md")}{tab("/rollout", "Rollout", "ro")}{tab("/hub", "Hub", "hb")}'
             f'{tab("/control", "Control", "ct")}{tab("/calib", "Calib", "cb")}{tab("/setup", "Setup", "st")}'
             f'{tab("/jobs", "Jobs", "jb")}</div>{cluster}'
             f'<button class=fsbtn title="전체화면" aria-label="전체화면" onclick="toggleFS()">'
@@ -2648,6 +2685,10 @@ def index(all: int = 0):
         n = d["name"]
         mismatch = ' <span class="badge b-warn">모드 불일치</span>' \
             if not robot_type_ok(d["robot_type"]) else ""
+        broken = dataset_unfinalized(n)
+        if broken:
+            mismatch += (' <span class="badge b-bad" title="녹화가 끊겨 에피소드 색인이 없습니다 — 열리지 않습니다">마무리 안 됨</span>'
+                         f' <button onclick="repairDs({jsattr(n)})">복구</button>')
         ver = d["version"]
         verbadge = (f'<span class=badge>{esc(ver)}</span>' if ver == "v3.0"
                     else f'<span class="badge b-warn">{esc(ver)}</span>')
@@ -2711,6 +2752,11 @@ def index(all: int = 0):
     </div>
     <script>
     {UPLOAD_JS}
+    async function repairDs(name){{
+      if(!confirm('"'+name+'" 를 복구합니다.\\n남아 있는 온전한 에피소드로 색인을 다시 만듭니다 (끊긴 마지막 에피소드는 잃을 수 있습니다).\\n고치기 전 meta·data 를 백업합니다. 계속할까요?')) return;
+      const r=await fetch('/api/dataset/repair/'+encodeURIComponent(name),{{method:'POST'}}); const d=await r.json();
+      if(d.error) alert(d.error); else location.href='/jobs/'+d.job;
+    }}
     async function delDs(name){{
       const typed = prompt('데이터셋 "'+name+'" 을 통째로 삭제합니다.\\n확인을 위해 이름을 그대로 입력하세요:');
       if(typed !== name){{ if(typed!==null) alert('이름 불일치 — 취소됨'); return; }}
@@ -3282,6 +3328,63 @@ def ov_ckpt_ok(rel):
     return ck
 
 
+LANG_POLICIES = {"smolvla", "pi0", "pi0_fast", "pi05", "groot", "xvla"}
+
+
+def policy_needs_task(rel):
+    return load_json(OUT_ROOT / rel / "config.json", {}).get("type") in LANG_POLICIES
+
+
+def policy_fit(rel):
+    """체크포인트가 기대하는 입력(카메라 이름·해상도, 관절 수)과 지금 Setup 을 대조 — 팔이 움직이기 전에.
+    (errors, warnings). 가져온 모델처럼 학습 데이터셋 정보가 없어도 config.json 만으로 판단합니다."""
+    cfg = load_json(OUT_ROOT / rel / "config.json", {})
+    feats = cfg.get("input_features") or {}
+    errs, warns = [], []
+    pre = "observation.images."
+    for key, f in feats.items():
+        shape = list(f.get("shape") or [])
+        if key.startswith(pre):
+            cam = key[len(pre):]
+            spec = CAM_SPECS.get(cam)
+            if spec is None:
+                errs.append(f"정책이 카메라 '{cam}' 를 씁니다 — 지금 Setup 에 없습니다 (있는 것: {', '.join(CAM_SPECS) or '없음'})")
+            elif len(shape) == 3 and [int(spec["height"]), int(spec["width"])] != shape[1:]:
+                warns.append(f"카메라 '{cam}' 해상도 {spec['width']}x{spec['height']} ≠ 학습 {shape[2]}x{shape[1]}")
+        elif key == "observation.state" and shape:
+            want = len(CTL_JOINTS) * len(SIDES)
+            if shape[0] != want:
+                errs.append(f"정책의 관절 수 {shape[0]}개 ≠ 지금 구성 {want}개 ({'양팔' if BIMANUAL else '한팔'}) — "
+                            "한팔/양팔 또는 기종이 학습 때와 다릅니다")
+    return errs, warns
+
+
+# 롤아웃 실패 로그 → 사람이 읽을 원인 (위에서부터 처음 맞는 것)
+FAILURE_HINTS = [
+    (r"Overload|overload", "모터 과부하 — 팔이 막혔거나 너무 무거운 걸 들었습니다. 전원을 껐다 켜고 Control 에서 토크를 끈 뒤 확인하세요."),
+    (r"motor check failed|Missing motor|missing motors|There is no status packet",
+     "모터가 응답하지 않습니다 — 케이블·전원·모터 ID 를 확인하세요 (Setup → 팔 점검)."),
+    (r"Permission denied.*tty|PermissionError.*tty", "포트 권한이 없습니다 — dialout 그룹에 추가 후 다시 로그인하세요."),
+    (r"could not open port|No such file or directory: '/dev|Failed to open port|SerialException",
+     "시리얼 포트를 열지 못했습니다 — 포트 경로(Setup), USB 연결, 다른 프로그램(Control 탭 등)이 잡고 있는지 확인하세요."),
+    (r"failed to set capture_(width|height|fps)", "카메라가 그 해상도/fps 를 지원하지 않습니다 — Setup 카메라 설정을 바꾸세요."),
+    (r"OpenCVCamera.*(read failed|Timed out|timeout|not connected)|frames? too old|Failed to capture",
+     "카메라 프레임을 못 받았습니다 — 카메라 연결, USB 대역폭(허브에 여러 대), 다른 프로그램 점유를 확인하세요."),
+    (r"Mismatch between calibration|EOFError", "캘리브레이션 파일과 모터 값이 다릅니다 — Calib 탭에서 다시 캘리브레이션하세요."),
+    (r"CUDA out of memory|OutOfMemoryError", "GPU 메모리 부족 — 학습 등 다른 GPU 작업을 멈추세요."),
+    (r"shape .* ≠ 변환 시", "카메라 해상도·관절 수가 OpenVINO 변환 때와 다릅니다 — 맞추거나 다시 변환하세요."),
+    (r"ConnectionError|Connection refused|Tunnel connection failed|URLError",
+     "네트워크 접속이 필요했지만 실패했습니다 (모델 구성요소 다운로드 등)."),
+]
+
+
+def failure_hint(text):
+    for rx, hint in FAILURE_HINTS:
+        if re.search(rx, text or ""):
+            return hint
+    return ""
+
+
 def ov_shape_problem(rel):
     """변환 때 고정한 카메라 입력과 지금 Setup 의 카메라(이름·해상도)가 맞는지 — 팔이 움직이기 전에 거릅니다.
     NPU 는 정적 shape 라 해상도가 다르면 첫 추론에서 멈춥니다."""
@@ -3385,10 +3488,12 @@ TRAIN_POLICIES = {
     "act": {"label": "ACT", "args": ["--policy.type=act"], "needs": [], "extra": "",
             "hint": "ACT — 기본. 데모 50개 안팎으로도 잘 배우고 가볍습니다. OpenVINO(NPU) 변환 가능."},
     "diffusion": {"label": "Diffusion", "args": ["--policy.type=diffusion"], "needs": ["diffusers"], "extra": "diffusion",
+                  "pip": ["diffusers>=0.27.2,<0.36.0"],
                   "hint": "Diffusion Policy — 동작이 여러 갈래인 태스크에 강하지만 추론이 느립니다(디노이징 반복). "
                           "OpenVINO 변환은 아직 ACT 만 됩니다."},
     "smolvla": {"label": "SmolVLA (사전학습 미세조정)", "args": ["--policy.path=lerobot/smolvla_base"],
                 "needs": ["transformers", "num2words"], "extra": "smolvla",
+                "pip": ["transformers>=5.4.0,<5.6.0", "num2words>=0.5.14,<0.6.0", "accelerate>=1.14.0,<2.0.0"],
                 "hint": "SmolVLA — 450M 비전-언어-행동 모델을 미세조정합니다. 태스크 설명(언어)을 씁니다. "
                         "처음 한 번 HuggingFace 에서 lerobot/smolvla_base 를 내려받고(인터넷 필요), GPU 메모리를 많이 씁니다."},
 }
@@ -3396,8 +3501,38 @@ TRAIN_POLICIES = {
 
 def policy_missing(pol):
     """정책에 필요한 파이썬 패키지 중 없는 것 — lerobot 이 학습 시작 수십 초 뒤에야 ImportError 로 죽기 전에 알려 줍니다."""
+    import importlib
     import importlib.util
+    importlib.invalidate_caches()        # 설치 작업 직후에도 lrweb 재시작 없이 보이게
     return [m for m in TRAIN_POLICIES[pol]["needs"] if importlib.util.find_spec(m) is None]
+
+
+@app.post("/api/install/{pol}")
+def api_install_policy(pol: str):
+    """정책 extra 설치 (pip). torch·torchvision 은 지금 버전으로 고정해 CUDA 휠이 CPU 휠로 바뀌지 않게 합니다."""
+    if pol not in TRAIN_POLICIES or not TRAIN_POLICIES[pol].get("pip"):
+        return JSONResponse({"error": "설치할 것이 없는 정책"}, status_code=400)
+    busy = busy_with(("record", "rollout", "train", "install", "ovconvert"))
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 실행 중 — 패키지를 바꾸는 동안 돌던 작업이 깨질 수 있어 끝난 뒤 설치하세요"},
+                            status_code=400)
+    from importlib import metadata
+    pins = []
+    for pkg in ("torch", "torchvision"):
+        try:
+            pins.append(f"{pkg}=={metadata.version(pkg).split('+')[0]}")
+        except metadata.PackageNotFoundError:
+            pass
+    cons = PROJ / "lrweb_pip_constraint.txt"
+    _atomic_write(cons, "\n".join(pins) + "\n")
+    # lerobot[extra] 대신 그 extra 의 패키지만 설치합니다 (lerobot e40b58a pyproject 의 범위 그대로).
+    # 'lerobot[...]' 로 설치하면 소스 설치가 아닌 환경에서 PyPI 의 다른 lerobot 버전이 덮어쓸 수 있습니다.
+    argv = [sys.executable, "-m", "pip", "install", "-c", str(cons), *TRAIN_POLICIES[pol]["pip"]]
+    try:
+        jid = start_job("install", argv, spec={"policy": pol})
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "job": jid}
 
 
 @app.get("/train", response_class=HTMLResponse)
@@ -3429,6 +3564,7 @@ def train_page():
       <input id=steps value=80000 size=7> <span class=muted>steps</span>
       <input id=batch value=8 size=3> <span class=muted>batch</span>
       <label class=muted title="CUDA 에서 메모리·시간 절약. 손실이 튀면 끄세요"><input type=checkbox id=amp> AMP</label>
+      <select id=target title="실행 위치"><option value=local>이 기기</option></select>
       <button class=primary>학습 시작</button>
     </form>
     <p class=muted id=polhint style="margin:-4px 0 10px"></p>
@@ -3477,13 +3613,37 @@ def train_page():
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
     const POL={js({k: v["hint"] for k, v in TRAIN_POLICIES.items()})};
-    function polHint(){{ document.getElementById('polhint').textContent=POL[document.getElementById('policy').value]||''; }}
+    const MISS={js({k: policy_missing(k) for k in TRAIN_POLICIES})};
+    async function installPol(){{
+      const p=document.getElementById('policy').value;
+      if(!confirm(p+' 에 필요한 패키지('+MISS[p].join(', ')+')를 설치합니다. 몇 분 걸릴 수 있습니다. 계속할까요?')) return;
+      const r=await fetch('/api/install/'+p,{{method:'POST'}}); const d=await r.json();
+      if(d.error) alert(d.error); else location.href='/jobs/'+d.job;
+    }}
+    (async()=>{{   // HF Jobs 하드웨어(가격 포함) — 오프라인이면 '이 기기' 만
+      try{{
+        const [f,s]=await Promise.all([fetch('/api/hub/flavors').then(r=>r.json()), fetch('/api/hub/state').then(r=>r.json())]);
+        const sel=document.getElementById('target');
+        (f.flavors||[]).filter(x=>x.accelerator).forEach(x=>{{
+          const o=document.createElement('option'); o.value=x.name; o.disabled=!s.ok;
+          o.textContent='HF Jobs · '+x.label+(x.accelerator?' · '+x.accelerator:'')+(x.usd_h!=null?' · $'+x.usd_h.toFixed(2)+'/h':'')+(s.ok?'':' (Hub 로그인 필요)');
+          sel.appendChild(o); }});
+      }}catch(e){{}}
+    }})();
+    function polHint(){{
+      const p=document.getElementById('policy').value, h=document.getElementById('polhint');
+      h.textContent=POL[p]||'';
+      if((MISS[p]||[]).length){{ const b=document.createElement('button'); b.textContent='필요한 패키지 설치 ('+MISS[p].join(', ')+')';
+        b.style.marginLeft='8px'; b.onclick=e=>{{ e.preventDefault(); installPol(); }}; h.appendChild(b); }}
+    }}
     polHint();
     async function startTrain(e){{
       e.preventDefault();
       const b={{dataset:document.getElementById('ds').value,name:document.getElementById('name').value,
                steps:document.getElementById('steps').value,batch:document.getElementById('batch').value,
-               policy:document.getElementById('policy').value,amp:document.getElementById('amp').checked}};
+               policy:document.getElementById('policy').value,amp:document.getElementById('amp').checked,
+               target:document.getElementById('target').value}};
+      if(b.target!=='local' && !confirm('HF Jobs 에서 학습합니다 (유료, 시간당 요금).\\n데이터셋 "'+b.dataset+'" 이 내 계정 비공개 repo 로 먼저 올라갑니다.\\n끝나면 Hub 탭에서 모델을 받으세요. 계속할까요?')) return;
       const r=await fetch('/api/train',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
       const d=await r.json();
       if(d.error){{alert(d.error);return;}}
@@ -3533,6 +3693,9 @@ def train_page():
 @app.post("/api/train")
 async def api_train(req: Request):
     b = await req.json()
+    target = b.get("target") or "local"
+    if target != "local":
+        return await asyncio.get_running_loop().run_in_executor(None, _cloud_train, b, target)
     busy = gpu_or_loop_busy()   # Control 수동 제어는 학습과 동시 가능
     if busy:
         return JSONResponse({"error": f"{busy['id']} 실행 중 — 종료 후 시작하세요"}, status_code=400)
@@ -3584,6 +3747,45 @@ async def api_train(req: Request):
     return {"ok": True, "job": jid, "name": name}
 
 
+def _cloud_train(b, flavor):
+    """HF Jobs 로 학습. 로컬 데이터셋은 lrweb_hub.py 가 내 계정 비공개 repo 로 먼저 올립니다.
+    이 기기 GPU 를 쓰지 않으므로 수집·추론·로컬 학습과 동시에 돌 수 있습니다."""
+    ds = (b.get("dataset") or "").strip()
+    if not safe_name(ds) or not (DATA_ROOT / ds / "meta/info.json").is_file():
+        return JSONResponse({"error": "데이터셋 없음"}, status_code=400)
+    pol = b.get("policy") or "act"
+    if pol not in TRAIN_POLICIES:
+        return JSONResponse({"error": f"정책은 {', '.join(TRAIN_POLICIES)} 중 하나"}, status_code=400)
+    st = _hub().status(refresh=True)
+    if not st.get("ok"):
+        return JSONResponse({"error": "HF Jobs 는 Hugging Face 로그인이 필요합니다 — Hub 탭에서 토큰을 넣으세요"},
+                            status_code=400)
+    try:
+        names = {f["name"] for f in _hub().flavors()}
+    except Exception as e:     # noqa: BLE001
+        return JSONResponse({"error": f"HF Jobs 하드웨어 목록을 못 받았습니다: {e}"}, status_code=400)
+    if flavor not in names:
+        return JSONResponse({"error": f"알 수 없는 하드웨어: {flavor}"}, status_code=400)
+    busy = dataset_busy(ds)
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 가 이 데이터셋을 쓰는 중"}, status_code=400)
+    steps = _clamp_int(b.get("steps"), 80000, 1, 100000000)
+    batch = _clamp_int(b.get("batch"), 8, 1, 4096)
+    name = (b.get("name") or "").strip()
+    argv = [sys.executable, str(HUB_PY), "cloud-train", f"--root={DATA_ROOT / ds}", f"--name={ds}",
+            f"--flavor={flavor}", "--", *TRAIN_POLICIES[pol]["args"], f"--steps={steps}", f"--batch_size={batch}",
+            "--num_workers=4", "--save_freq=10000"]
+    if safe_name(name):
+        argv.append(f"--job_name={name}")          # Hub 모델 repo 이름의 앞부분
+    if b.get("amp"):
+        argv.append("--policy.use_amp=true")
+    try:
+        jid = start_job("cloudtrain", argv, spec={"runner": "hf", "flavor": flavor, "dataset": ds, "policy": pol})
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "job": jid, "cloud": True}
+
+
 _BIG_SUFFIX = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
 
 
@@ -3600,7 +3802,7 @@ def _parse_step(tok):
 
 @app.get("/api/trainlog")
 def api_trainlog():
-    trains = [j for j in jobs_index() if j["kind"] == "train"]
+    trains = [j for j in jobs_index() if j["kind"] in ("train", "cloudtrain")]
     if not trains:
         return JSONResponse({"points": [], "tail": "", "current": None})
     j = next((t for t in trains if t["alive"]), trains[0])
@@ -4009,6 +4211,256 @@ async def api_train_resume(req: Request):
     return {"ok": True, "job": jid}
 
 
+# ----------------------------- Hugging Face Hub · HF Jobs 클라우드 학습 -------------
+# 본체는 lrweb_hub.py. 업로드·다운로드·클라우드 학습은 작업(job)으로 띄워 로그로 진행을 봅니다.
+# 클라우드 학습 작업 종류는 'cloudtrain' — 이 기기의 GPU·팔을 쓰지 않으므로 수집·추론·학습과 배타가 아닙니다.
+HUB_PY = Path(__file__).resolve().parent / "lrweb_hub.py"
+_HF_JOB_RE = re.compile(r"Job submitted:\s*(\S+)")
+_HF_PAGE_RE = re.compile(r"Job page:\s*(\S+)")
+_HF_REPO_RE = re.compile(r"Model repo:\s*https://huggingface\.co/(\S+)")
+
+
+def _hub():
+    import lrweb_hub
+    return lrweb_hub
+
+
+def cloud_job_info(j):
+    """클라우드 학습 작업 로그에서 HF 작업 id·페이지·모델 repo"""
+    out = {"hf_job": None, "page": None, "repo": None}
+    try:
+        with open(j["log"], errors="ignore") as f:
+            head = f.read(200_000)
+    except OSError:
+        return out
+    for key, rx in (("hf_job", _HF_JOB_RE), ("page", _HF_PAGE_RE), ("repo", _HF_REPO_RE)):
+        m = rx.search(head)
+        if m:
+            out[key] = m.group(1)
+    return out
+
+
+def cancel_cloud(j):
+    """로컬 제출 프로세스를 멈춰도 원격 작업은 계속 돕니다(lerobot 은 Ctrl-C 를 '분리' 로 처리). 원격도 취소합니다."""
+    hid = cloud_job_info(j)["hf_job"]
+    if not hid:
+        return False
+    try:
+        _hub().cancel_job(hid)
+        return True
+    except Exception as e:     # noqa: BLE001 — 이미 끝난 작업이면 404
+        print(f"[hub] cancel {hid}: {e}", file=sys.stderr)
+        return False
+
+
+@app.get("/api/hub/state")
+def api_hub_state(refresh: int = 0):
+    try:
+        return _hub().status(bool(refresh))
+    except Exception as e:     # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/hub/flavors")
+def api_hub_flavors():
+    try:
+        return {"flavors": _hub().flavors()}
+    except Exception as e:     # noqa: BLE001 — 오프라인이면 빈 목록 (이 기기 학습만)
+        return {"flavors": [], "error": f"하드웨어 목록을 못 받았습니다: {type(e).__name__}"}
+
+
+@app.post("/api/hub/login")
+async def api_hub_login(req: Request):
+    b = await req.json()
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, _hub().login, b.get("token", ""))
+    except Exception as e:     # noqa: BLE001
+        return JSONResponse({"error": f"로그인 실패: {str(e)[:200]}"}, status_code=400)
+
+
+@app.post("/api/hub/logout")
+def api_hub_logout():
+    _hub().logout()
+    return {"ok": True}
+
+
+@app.get("/api/hub/mine")
+def api_hub_mine():
+    st = _hub().status()
+    if not st.get("ok"):
+        return {"datasets": [], "models": []}
+    try:
+        return {"datasets": _hub().list_mine(st["user"], "datasets"), "models": _hub().list_mine(st["user"], "models")}
+    except Exception as e:     # noqa: BLE001
+        return {"datasets": [], "models": [], "error": f"{type(e).__name__}: {e}"}
+
+
+_HUB_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+@app.post("/api/hub/push")
+async def api_hub_push(req: Request):
+    b = await req.json()
+    ds = b.get("dataset", "")
+    if not safe_name(ds) or not (DATA_ROOT / ds / "meta/info.json").is_file():
+        return JSONResponse({"error": "데이터셋 없음"}, status_code=400)
+    busy = dataset_busy(ds)
+    if busy:
+        return JSONResponse({"error": f"{busy['id']} 가 이 데이터셋을 쓰는 중"}, status_code=400)
+    st = _hub().status(refresh=True)
+    if not st.get("ok"):
+        return JSONResponse({"error": "Hugging Face 로그인이 필요합니다"}, status_code=400)
+    owner = b.get("owner") or st["user"]
+    if owner != st["user"] and owner not in st.get("orgs", []):
+        return JSONResponse({"error": "내 계정이나 소속 조직에만 올릴 수 있습니다"}, status_code=400)
+    argv = [sys.executable, str(HUB_PY), "push-dataset", f"--root={DATA_ROOT / ds}", f"--repo={owner}/{ds}"]
+    if b.get("public"):
+        argv.append("--public")
+    try:
+        return {"ok": True, "job": start_job("hub", argv, spec={"op": "push", "dataset": ds, "repo": f"{owner}/{ds}"})}
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.post("/api/hub/pull")
+async def api_hub_pull(req: Request):
+    b = await req.json()
+    what, repo = b.get("kind"), (b.get("repo") or "").strip().removeprefix("https://huggingface.co/")
+    repo = repo.removeprefix("datasets/").strip("/")
+    if what not in ("dataset", "model") or not _HUB_REPO_RE.fullmatch(repo):
+        return JSONResponse({"error": "repo id 는 '조직/이름' 형식입니다 (예: lerobot/svla_so101_pickplace)"}, status_code=400)
+    if what == "dataset":
+        argv = [sys.executable, str(HUB_PY), "pull-dataset", f"--repo={repo}", f"--dest={DATA_ROOT}"]
+    else:
+        argv = [sys.executable, str(HUB_PY), "pull-model", f"--repo={repo}", f"--dest={OUT_ROOT}"]
+        step = (b.get("step") or "").strip()
+        if step:
+            if not safe_name(step):
+                return JSONResponse({"error": "체크포인트 이름이 잘못됐습니다"}, status_code=400)
+            argv.append(f"--step={step}")
+    try:
+        return {"ok": True, "job": start_job("hub", argv, spec={"op": "pull", "kind": what, "repo": repo})}
+    except JobStartError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.post("/api/hub/cancel/{jid}")
+def api_hub_cancel(jid: str):
+    if not safe_name(jid):
+        return JSONResponse({"error": "잘못된 작업 id"}, status_code=400)
+    j = load_json(JOB_DIR / f"{jid}.json", {})
+    if j.get("kind") != "cloudtrain":
+        return JSONResponse({"error": "클라우드 학습 작업이 아닙니다"}, status_code=400)
+    kill_job(jid)
+    ok = cancel_cloud(j)
+    return {"ok": True, "remote_cancelled": ok}
+
+
+@app.get("/hub", response_class=HTMLResponse)
+def hub_page():
+    dsets = list_datasets()
+    ds_opts = "".join(f'<option value="{esc(d["name"])}">{esc(d["name"])} ({esc(d["episodes"])}ep)</option>' for d in dsets)
+    hubjobs = [j for j in jobs_index() if j["kind"] in ("hub", "cloudtrain")][:12]
+    rows = ""
+    for j in hubjobs:
+        sp = j.get("spec") or {}
+        if j["kind"] == "cloudtrain":
+            ci = cloud_job_info(j)
+            what = f'클라우드 학습 · {esc(sp.get("flavor", ""))} · {esc(sp.get("dataset", ""))}'
+            links = ((f'<a href="{esc(ci["page"])}" target=_blank rel=noopener>HF 작업</a> ' if ci["page"] else '')
+                     + (f'<a href="https://huggingface.co/{esc(ci["repo"])}" target=_blank rel=noopener>모델 repo</a> '
+                        f'<button onclick="pull(\'model\',{jsattr(ci["repo"])})">모델 받기</button> ' if ci["repo"] else '')
+                     + (f'<button class=danger onclick="cancelCloud({jsattr(j["id"])})">원격 취소</button>' if ci["hf_job"] else ''))
+        else:
+            what = f'{"올리기" if sp.get("op") == "push" else "받기"} · {esc(sp.get("repo", ""))}'
+            links = ''
+        run = '<span class="badge b-run">진행 중</span>' if j["alive"] else ""
+        rows += (f'<tr><td><a class=mono href="/jobs/{esc(j["id"])}">{esc(j["id"])}</a></td><td>{what}</td>'
+                 f'<td>{run}</td><td style="text-align:right">{links}</td></tr>')
+    jobs_html = (f'<p class=eyebrow style="margin-top:20px">Hub 작업</p><div class=card><table>{rows}</table></div>'
+                 if rows else "")
+    return f"""{CSS}{nav_html('hb')}<div class=wrap>
+    <p class=eyebrow>Hugging Face Hub</p><h2>Hub</h2>
+    <div class=card>
+      <div id=hfstate class=muted>로그인 상태 확인 중…</div>
+      <div class=formgrid id=loginbox style="display:none;margin-top:8px">
+        <label class=f style="min-width:360px">액세스 토큰 (write 권한)
+          <input type=password id=tok placeholder="hf_..." autocomplete=off></label>
+        <button class=primary onclick="login()">로그인</button>
+        <span class=muted>토큰은 <a href="https://huggingface.co/settings/tokens" target=_blank rel=noopener>huggingface.co/settings/tokens</a> 에서 만듭니다.
+        터미널의 <span class=mono>hf auth login</span> 과 같은 곳에 저장됩니다.</span>
+      </div>
+    </div>
+    <div class=card style="margin-top:12px">
+      <p class=eyebrow>데이터셋 올리기</p>
+      <div class=formgrid>
+        <label class=f style="min-width:300px">로컬 데이터셋 <select id=pds>{ds_opts}</select></label>
+        <label class=muted><input type=checkbox id=pub> 공개 (기본은 비공개)</label>
+        <button onclick="push()">Hub 에 올리기</button>
+      </div>
+      <p class=muted style="margin:6px 0 0">내 계정의 <span class=mono>사용자/데이터셋이름</span> 으로 올라갑니다. 같은 이름이 있으면 바뀐 파일만 갱신합니다.</p>
+    </div>
+    <div class=card style="margin-top:12px">
+      <p class=eyebrow>받기</p>
+      <div class=formgrid>
+        <label class=f style="min-width:360px">Hub repo id
+          <input id=prepo placeholder="lerobot/svla_so101_pickplace" list=minelist></label>
+        <datalist id=minelist></datalist>
+        <label class=f>체크포인트 (모델, 비우면 마지막) <input id=pstep size=10></label>
+        <button onclick="pull('dataset')">데이터셋으로 받기</button>
+        <button onclick="pull('model')">모델로 받기</button>
+      </div>
+      <p class=muted style="margin:6px 0 0">커뮤니티 데이터셋으로 학습하거나, 다른 곳(HF Jobs 등)에서 학습한 정책을 이 기기 팔로 돌릴 때 씁니다.
+      받은 데이터셋은 Datasets, 모델은 Models 탭에 나옵니다. 데이터셋은 LeRobot v3.0 형식이어야 합니다.</p>
+      <div id=mine class=muted style="margin-top:6px"></div>
+    </div>
+    {jobs_html}
+    <p class=muted style="margin-top:14px">클라우드 학습(HF Jobs)은 Training 탭의 <b>실행 위치</b> 에서 고릅니다. 로컬 데이터셋은 시작할 때 내 계정 비공개 repo 로 먼저 올라갑니다.</p>
+    </div>
+    <script>
+    async function post(u,b){{ const r=await fetch(u,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b||{{}})}}); return r.json(); }}
+    function ovEsc(s){{return String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}
+    async function state(refresh){{
+      const d=await (await fetch('/api/hub/state'+(refresh?'?refresh=1':''))).json();
+      const box=document.getElementById('hfstate');
+      if(d.ok){{
+        box.innerHTML='<span class="badge b-ok">로그인됨</span> <b class=mono>'+ovEsc(d.user)+'</b>'
+          +(d.orgs&&d.orgs.length?' · 조직 '+d.orgs.map(ovEsc).join(', '):'')+' <button onclick="logout()">로그아웃</button>';
+        document.getElementById('loginbox').style.display='none';
+        const m=await (await fetch('/api/hub/mine')).json();
+        const all=[...(m.datasets||[]).map(x=>[x,'dataset']),...(m.models||[]).map(x=>[x,'model'])];
+        document.getElementById('minelist').innerHTML=all.map(x=>'<option value="'+ovEsc(x[0])+'">').join('');
+        document.getElementById('mine').textContent=all.length?'내 Hub: 데이터셋 '+(m.datasets||[]).length+'개 · 모델 '+(m.models||[]).length+'개 (위 입력칸에서 고를 수 있습니다)':'';
+      }} else {{
+        box.innerHTML='<span class="badge b-warn">로그인 안 됨</span> '+(d.error&&d.error!=='로그인 안 됨'?ovEsc(d.error):'');
+        document.getElementById('loginbox').style.display='';
+      }}
+    }}
+    async function login(){{
+      const d=await post('/api/hub/login',{{token:document.getElementById('tok').value}});
+      document.getElementById('tok').value='';
+      if(d.error) alert(d.error); else state(true);
+    }}
+    async function logout(){{ if(!confirm('이 기기에서 Hugging Face 로그아웃할까요?')) return; await post('/api/hub/logout'); state(true); }}
+    async function push(){{
+      const ds=document.getElementById('pds').value; if(!ds) return;
+      const pub=document.getElementById('pub').checked;
+      if(pub && !confirm('공개로 올리면 누구나 볼 수 있습니다. 계속할까요?')) return;
+      const d=await post('/api/hub/push',{{dataset:ds,public:pub}}); if(d.error) alert(d.error); else location.href='/jobs/'+d.job;
+    }}
+    async function pull(kind,repo){{
+      repo=repo||document.getElementById('prepo').value;
+      const d=await post('/api/hub/pull',{{kind:kind,repo:repo,step:kind==='model'?document.getElementById('pstep').value:''}});
+      if(d.error) alert(d.error); else location.href='/jobs/'+d.job;
+    }}
+    async function cancelCloud(jid){{
+      if(!confirm('HF Jobs 원격 학습을 취소할까요? (지금까지 올라간 체크포인트는 남습니다)')) return;
+      const d=await post('/api/hub/cancel/'+jid); if(d.error) alert(d.error); else location.reload();
+    }}
+    state();
+    </script>"""
+
+
 # ----------------------------- 페이지: 추론 (Rollout) ------------------------
 # ----------------------------- 롤아웃 실시간 모니터 · 시도 기록 -------------------
 # 롤아웃은 lrweb_rollout.py 로 띄웁니다. 그 프로세스가 RUN_DIR/<jid>/ 에 status.json · cam_*.jpg 를 씁니다.
@@ -4046,6 +4498,16 @@ def trial_label(rel, trials=None):
     return f" · 성공 {s['ok']}/{s['n']}" if s["n"] else ""
 
 
+@app.get("/api/rollout/check")
+def api_rollout_check(ckpt: str = ""):
+    ck = ov_ckpt_ok(ckpt)
+    if ck is None:
+        return JSONResponse({"error": "체크포인트 없음"}, status_code=400)
+    errs, warns = policy_fit(ckpt)
+    return {"errors": errs, "warnings": warns, "needs_task": policy_needs_task(ckpt),
+            "policy": load_json(ck / "config.json", {}).get("type", "?")}
+
+
 @app.get("/api/rollout/status/{jid}")
 def api_rollout_status(jid: str):
     if not safe_name(jid):
@@ -4060,7 +4522,9 @@ def api_rollout_status(jid: str):
     st = load_json(run_dir(jid) / "status.json", {})
     if not alive and st.get("phase") not in ("done", "error"):
         st["phase"] = "ended"           # 강제 종료 등으로 마지막 상태를 못 쓴 경우
-    return {"alive": alive, "status": st, "tail": log_tail(jid), "ckpt": rel,
+    tail = log_tail(jid)
+    hint = failure_hint(tail) if (not alive and st.get("phase") in ("error", "ended")) or st.get("phase") == "error" else ""
+    return {"alive": alive, "status": st, "tail": tail, "ckpt": rel, "hint": hint,
             "engine": rollout_engine_label(j), "started": j.get("started"),
             "trials": {"run": {"n": len(mine), "ok": sum(1 for x in mine if x["result"] == "success")},
                        "ckpt": trial_summary(rel, trials)}}
@@ -4124,6 +4588,7 @@ ROLLOUT_RUN_BODY = """
   <span class=badge id=engb></span><span class=mono id=el></span>
   <button class=danger id=stopb onclick="stopRo()">중지</button>
   <a class=btnlink id=newb href="/rollout" style="display:none">새 추론 설정</a>
+  <span class="badge b-bad" id=hint style="display:none;white-space:normal"></span>
   <span class=muted id=stopnote>중지(SIGINT) 시 시작 자세로 복귀 후 토크 해제됩니다</span></div>
 <div class=rgrid>
   <div>
@@ -4235,6 +4700,8 @@ async function refresh(){
   $('trun').textContent=run.ok+' 성공 / '+run.n+' 시도';
   $('tck').textContent=ck.n?(ck.ok+' / '+ck.n+' ('+ck.rate+'%)'):'기록 없음';
   $('tail').textContent=(st.err?'!! '+st.err+'\\n\\n':'')+(d.tail||'');
+  $('hint').style.display=d.hint?'':'none'; $('hint').textContent=d.hint?'원인 추정: '+d.hint:'';
+  if(d.hint) document.querySelector('details').open=true;
 }
 // 주기 갱신은 앞 요청이 끝난 뒤에 다음을 보냅니다 (서버가 느려도 요청이 쌓이지 않게)
 async function loop(){ await refresh(); setTimeout(loop, 500); }
@@ -4317,6 +4784,7 @@ def rollout_page(job: str = "", ckpt: str = ""):
         <input id=task value="{esc(pr["task"] if pr and pr["task"] else CFG['default_task'])}"></label>
       <button class=primary onclick="startRo()" {'disabled' if not ckpts else ''}>추론 시작</button>
     </div>
+    <div id=fitinfo style="margin-top:8px"></div>
     <div id=ovinfo style="margin-top:8px"></div>
     <p class=muted>시작 즉시 팔이 움직입니다 — 팔 주변을 비우고, 물체를 시연 위치에 놓으세요.
     카메라 배치는 학습 데이터 수집 때와 동일해야 합니다.</p>
@@ -4343,8 +4811,18 @@ def rollout_page(job: str = "", ckpt: str = ""):
         ? '<p class="badge b-warn">이 체크포인트는 OpenVINO 변환이 없습니다 — Training 탭 아래 "OpenVINO 변환" 을 먼저 하세요</p>'
         : ovTable(d);
     }}
-    document.getElementById('ckpt').addEventListener('change', ovInfo);
-    ovInfo();
+    async function fitInfo(){{
+      const ck=document.getElementById('ckpt').value, box=document.getElementById('fitinfo');
+      if(!ck){{ box.innerHTML=''; return; }}
+      const d=await (await fetch('/api/rollout/check?ckpt='+encodeURIComponent(ck))).json();
+      if(d.error){{ box.textContent=d.error; return; }}
+      box.innerHTML='<span class=badge>'+ovEsc(d.policy)+'</span> '
+        +(d.errors||[]).map(x=>'<p class="badge b-bad" style="white-space:normal">'+ovEsc(x)+'</p>').join('')
+        +(d.warnings||[]).map(x=>'<p class="badge b-warn" style="white-space:normal">'+ovEsc(x)+' — 학습 때와 같게 맞추길 권합니다</p>').join('')
+        +(d.needs_task?'<span class=muted> 언어 지시를 쓰는 정책입니다 — 태스크 설명이 동작을 바꿉니다.</span>':'');
+    }}
+    document.getElementById('ckpt').addEventListener('change', ()=>{{ ovInfo(); fitInfo(); }});
+    ovInfo(); fitInfo();
     async function startRo(){{
       if(!confirm('팔이 즉시 자율 구동됩니다. 주변이 안전한가요?'))return;
       const b={{ckpt:document.getElementById('ckpt').value,
@@ -4386,6 +4864,11 @@ async def api_rollout(req: Request):
     if not robot_type_ok(rt):
         return JSONResponse({"error": f"체크포인트는 {rt} 데이터로 학습됨 — 현재 모드({robot_name()})와 다릅니다"},
                             status_code=400)
+    errs, _warns = policy_fit(rel)
+    if errs:
+        return JSONResponse({"error": " / ".join(errs)}, status_code=400)
+    if policy_needs_task(rel) and not (b.get("task") or "").strip():
+        return JSONResponse({"error": "이 정책은 태스크 설명(언어 지시)을 씁니다 — 태스크 설명을 넣으세요"}, status_code=400)
     miss = plugin_missing() if BIMANUAL else []
     if miss:
         # lrweb 자신은 plugins/ 를 직접 읽지만, lerobot CLI 는 설치된 패키지만 찾습니다
@@ -5098,7 +5581,25 @@ def _validate_cam(name, spec, seen):
         v = spec.get(k)
         if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
             return f"카메라 {name} 의 {k} 값이 잘못됨"
+    if spec.get("fourcc") not in (None, "", *CAM_FOURCCS):
+        return f"카메라 {name} 의 FOURCC 는 {', '.join(CAM_FOURCCS)} 중 하나"
     return None
+
+
+# 카메라 픽셀 형식. USB 카메라 여러 대를 한 허브에 꽂으면 YUYV(무압축)는 대역폭이 모자라 프레임이 끊깁니다 —
+# 그때 MJPG 로 바꾸면 됩니다. 비우면 드라이버 기본값(lerobot 자동).
+CAM_FOURCCS = ("MJPG", "YUYV")
+
+
+def cam_fourcc(spec):
+    f = (spec or {}).get("fourcc") or None
+    return f if f in CAM_FOURCCS else None
+
+
+def cam_fourcc_kw(spec):
+    """정했을 때만 넘깁니다 — 지정 안 한 카메라는 예전과 똑같이 만들어집니다."""
+    f = cam_fourcc(spec)
+    return {"fourcc": f} if f else {}
 
 
 def validate_config(cfg):
@@ -6035,6 +6536,8 @@ REVIEW_HTML = """
         <button id=b_play style="min-width:46px">&#9654;</button>
         <span class=mono id=tnow>0.0 / 0.0 s</span>
         <input type=range id=scrub min=0 max=1000 value=0>
+        <select id=rate title="재생 속도">
+          <option value=0.25>0.25×</option><option value=0.5>0.5×</option><option value=1 selected>1×</option><option value=2>2×</option></select>
         <label class=tiny style="display:flex;gap:5px;align-items:center"><input type=checkbox id=showact> 명령(action) 겹쳐 보기</label>
       </div>
       <div id=charts></div>
@@ -6042,7 +6545,7 @@ REVIEW_HTML = """
   </div>
   <div class=eplist id=eplist></div>
 </div>
-<p class=muted style="margin-top:12px">&larr; / &rarr; 이전·다음 에피소드 · Space 재생/정지 · X 불량 표시.
+<p class=muted style="margin-top:12px">&larr; / &rarr; 이전·다음 에피소드 · Space 재생/정지 · <b>,</b> / <b>.</b> 한 프레임 앞뒤 · X 불량 표시.
 불량으로 표시한 에피소드는 위의 <b>삭제 실행</b>으로 한 번에 지웁니다 (결과는 새 폴더, 원본 유지).
 그래프는 observation.state(실측)입니다 — 한 관절이 평평하게 멈춰 있거나 갑자기 튀면 그 에피소드를 의심하세요.
 <b>짧음</b>은 길이가 중앙값의 절반도 안 되는 에피소드입니다.</p>
@@ -6126,15 +6629,18 @@ function vfrom(v){ return parseFloat(v.dataset.from)||0; }
 function vpos(v,t){ return vfrom(v)+Math.max(0, Math.min(t, DUR-0.5/(INFO.fps||30))); }
 /* 시계: 재생 가능한 첫 영상. 모두 못 읽으면(404·코덱) 벽시계로 — 그래야 그래프·3D 가 멈추지 않습니다 */
 function master(){ return VIDS.find(v=>!v.error && v.readyState>=2); }
-function curT(){ const m=master(); if(m) return m.currentTime-vfrom(m); return PLAYING?(performance.now()-clock0)/1000:T; }
+let RATE=1;
+function curT(){ const m=master(); if(m) return m.currentTime-vfrom(m); return PLAYING?(performance.now()-clock0)/1000*RATE:T; }
+function setRate(r){ RATE=r; VIDS.forEach(v=>{ v.playbackRate=RATE; }); clock0=performance.now()-T*1000/RATE; $('rate').value=String(r); }
+function step(n){ pause(); seek(T+n/(INFO.fps||30)); }      // 한 프레임씩 (, .)
 function play(){
   if(T>=DUR-0.05) seek(0);
-  PLAYING=true; clock0=performance.now()-T*1000;
-  VIDS.forEach(v=>{ const p=v.play(); if(p&&p.catch) p.catch(()=>{}); });
+  PLAYING=true; clock0=performance.now()-T*1000/RATE;
+  VIDS.forEach(v=>{ v.playbackRate=RATE; const p=v.play(); if(p&&p.catch) p.catch(()=>{}); });
   $('b_play').innerHTML='&#10074;&#10074;'; tick();
 }
 function pause(){ PLAYING=false; VIDS.forEach(v=>v.pause()); $('b_play').innerHTML='&#9654;'; cancelAnimationFrame(raf); }
-function seek(t){ T=Math.max(0,Math.min(DUR,t)); VIDS.forEach(v=>{ v.currentTime=vpos(v,T); }); clock0=performance.now()-T*1000; render(); }
+function seek(t){ T=Math.max(0,Math.min(DUR,t)); VIDS.forEach(v=>{ v.currentTime=vpos(v,T); }); clock0=performance.now()-T*1000/RATE; render(); }
 function tick(){
   if(!PLAYING) return;
   T=Math.max(0,curT());
@@ -6228,6 +6734,7 @@ async function toggleBad(){
 }
 $('epbad').addEventListener('change',toggleBad);
 $('b_play').onclick=()=>PLAYING?pause():play();
+$('rate').addEventListener('change',e=>setRate(parseFloat(e.target.value)));   // 모듈 스크립트라 인라인 onchange 로는 못 부릅니다
 $('showact').onchange=()=>{ if(DATA) CH.forEach(drawBase); };
 $('scrub').addEventListener('input',()=>{ scrubbing=true; seek($('scrub').value/1000*DUR); });
 $('scrub').addEventListener('change',()=>{ scrubbing=false; });
@@ -6255,6 +6762,8 @@ document.addEventListener('keydown',ev=>{
   else if(ev.key==='ArrowRight'){ ev.preventDefault(); select(IDX+1); }
   else if(ev.key===' '){ ev.preventDefault(); PLAYING?pause():play(); }
   else if(ev.key==='x'||ev.key==='X'){ toggleBad(); }
+  else if(ev.key===','){ ev.preventDefault(); step(-1); }
+  else if(ev.key==='.'){ ev.preventDefault(); step(1); }
 });
 
 (async()=>{
@@ -7476,7 +7985,8 @@ function addCam(dev,target,name){
 }
 function renderCurCams(){
   const t=$('curcamtbl');
-  t.innerHTML='<tr><th>화면</th><th>키</th><th>device</th><th class=num>해상도</th><th class=num>fps</th><th></th></tr>';
+  t.innerHTML='<tr><th>화면</th><th>키</th><th>device</th><th class=num>해상도</th><th class=num>fps</th>'
+    +'<th title="USB 카메라 여러 대가 한 허브에서 끊기면 MJPG">형식</th><th></th></tr>';
   const ts=Date.now();
   let n=0;
   const groups=[];
@@ -7503,13 +8013,19 @@ function renderCurCams(){
         s.width=parseInt(ins[0].value)||640; s.height=parseInt(ins[1].value)||480;
         s.fps=parseInt(ins[2].value)||30; dump(); dirty('카메라 변경');
       });
+      const cf=document.createElement('td');
+      const fs=document.createElement('select');
+      [['','자동'],['MJPG','MJPG'],['YUYV','YUYV']].forEach(o=>{ const op=document.createElement('option'); op.value=o[0]; op.textContent=o[1]; fs.appendChild(op); });
+      fs.value=s.fourcc||'';
+      fs.onchange=()=>{ if(fs.value) s.fourcc=fs.value; else delete s.fourcc; dump(); dirty('카메라 형식 변경'); };
+      cf.appendChild(fs);
       const c5=document.createElement('td'); c5.style.textAlign='right';
       c5.appendChild(btn('삭제',()=>{ delete obj[name]; renderCurCams(); dump(); dirty('카메라 삭제'); },'danger'));
-      [c0,c1,c2,c3,c4,c5].forEach(x=>tr.appendChild(x));
+      [c0,c1,c2,c3,c4,cf,c5].forEach(x=>tr.appendChild(x));
       t.appendChild(tr);
     });
   });
-  if(!n) t.innerHTML+='<tr><td colspan=6 class=muted>등록된 카메라 없음 — 위에서 스캔 후 추가하세요</td></tr>';
+  if(!n) t.innerHTML+='<tr><td colspan=7 class=muted>등록된 카메라 없음 — 위에서 스캔 후 추가하세요</td></tr>';
 }
 
 /* ---------- 캘리브레이션 상태 ---------- */
@@ -8153,7 +8669,7 @@ def _cam_configs(specs):
     for name, sp in specs.items():
         idx = sp["index_or_path"]
         idx = idx if isinstance(idx, int) else Path(str(idx))
-        out[name] = OpenCVCameraConfig(index_or_path=idx, fps=int(sp["fps"]),
+        out[name] = OpenCVCameraConfig(index_or_path=idx, fps=int(sp["fps"]), **cam_fourcc_kw(sp),
                                        width=int(sp["width"]), height=int(sp["height"]))
     return out
 
@@ -8509,7 +9025,8 @@ COLLECT_RUN_HTML = """
 <div class=runbar><span class="badge b-run" id=rbadge>session</span>
   <span class=mono id=jid></span>
   <span class=mono id=repo style="color:var(--muted)"></span>
-  <button class=danger onclick="stopRec()" style="margin-left:auto"
+  <button id=mute onclick="toggleMute()" style="margin-left:auto" title="녹화 시작·저장·마지막 3초 신호음">소리 켜짐</button>
+  <button class=danger onclick="stopRec()"
           title="워커 프로세스를 죽입니다. 정상 종료는 아래 '수집 끝내기'">강제 종료</button></div>
 <div class=rec>
   <div class=card>
@@ -8526,12 +9043,12 @@ COLLECT_RUN_HTML = """
   </div>
   <div class=cams id=cams></div>
   <div class=bigkeys id=keys_ready style="display:none">
-    <button class=go onclick="key('s')">&#9679;&nbsp; 녹화 시작 <span class=muted>(s)</span></button>
-    <button class=danger onclick="endRec()">&#9632;&nbsp; 수집 끝내기</button>
+    <button class=go onclick="key('s')">&#9679;&nbsp; 녹화 시작 <span class=muted>(Space · s)</span></button>
+    <button class=danger onclick="endRec()">&#9632;&nbsp; 수집 끝내기 <span class=muted>(Esc)</span></button>
   </div>
   <div class=bigkeys id=keys_rec style="display:none">
-    <button class=go onclick="key('n')">&#10003;&nbsp; 저장하고 다음 <span class=muted>(n)</span></button>
-    <button onclick="key('r')">&#10007;&nbsp; 버리고 다시 <span class=muted>(r)</span></button>
+    <button class=go onclick="key('n')">&#10003;&nbsp; 저장하고 다음 <span class=muted>(Space · n)</span></button>
+    <button onclick="key('r')">&#10007;&nbsp; 버리고 다시 <span class=muted>(&larr; · r)</span></button>
   </div>
   <p class=muted id=hint></p>
   <p class=eyebrow>Log</p><pre id=tail>...</pre>
@@ -8539,8 +9056,25 @@ COLLECT_RUN_HTML = """
 <script>
 const $=id=>document.getElementById(id);
 $('jid').textContent=JID;
-let camsBuilt=false;
+let camsBuilt=false, PH='', lastBeep=-1;
 async function key(k){ await fetch('/api/sendkey/'+JID+'/'+k,{method:'POST'}); }
+/* 신호음 — 화면을 안 보고 팔을 움직이는 동안에도 단계를 알 수 있게 (WebAudio, 파일 없음) */
+let AC=null, MUTE=false;
+try{ MUTE=localStorage.getItem('lrweb_mute')==='1'; }catch(e){}
+function paintMute(){ $('mute').textContent=MUTE?'소리 꺼짐':'소리 켜짐'; }
+function toggleMute(){ MUTE=!MUTE; try{ localStorage.setItem('lrweb_mute',MUTE?'1':'0'); }catch(e){} paintMute(); if(!MUTE) tone([880],0.08); }
+function tone(freqs, dur){
+  if(MUTE) return;
+  try{
+    AC=AC||new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==='suspended') AC.resume();
+    let t=AC.currentTime;
+    freqs.forEach(f=>{ const o=AC.createOscillator(), g=AC.createGain(); o.frequency.value=f; o.type='sine';
+      g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.25,t+0.01); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+      o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t+dur+0.02); t+=dur; });
+  }catch(e){}
+}
+document.addEventListener('click',()=>{ if(AC&&AC.state==='suspended') AC.resume(); });   // 브라우저 자동재생 정책
 async function endRec(){
   if(!confirm('수집을 끝낼까요? 지금까지 저장된 에피소드는 그대로 남습니다.'))return;
   await key('q');
@@ -8611,6 +9145,15 @@ function paint(d){
       ? '기록 중입니다. 에피소드 최대(초)가 지나면 자동으로 저장됩니다.'
       : '';
   }
+  if(ph!==PH){
+    if(ph==='record') tone([660,880],0.12);          // 녹화 시작 ↑
+    else if(PH==='record' && ph==='saving') tone([660,440],0.12);   // 저장 ↓
+    PH=ph; lastBeep=-1;
+  }
+  if(ph==='record' && s.phase_len && s.elapsed!=null){
+    const left=Math.ceil(s.phase_len-s.elapsed);
+    if(left<=3 && left>=1 && left!==lastBeep){ lastBeep=left; tone([880],0.07); }   // 마지막 3초
+  }
   if(s.last){ $('lastbox').style.display=''; $('last').textContent=s.last; }
   else { $('lastbox').style.display='none'; }
   const tb=$('temps'), t=s.temp||{};
@@ -8657,10 +9200,16 @@ async function refresh(){
   finally{ polling=false; }
 }
 refresh(); setInterval(refresh,500);
+paintMute();
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
   if(e.ctrlKey||e.metaKey||e.altKey||e.repeat)return;      // Ctrl+R(새로고침) 이 '버리고 다시' 로 가지 않게
-  if(['s','n','r'].includes(e.key)) key(e.key);            // 단계에 맞지 않는 키는 워커가 무시합니다
+  if(AC&&AC.state==='suspended') AC.resume();
+  if(['s','n','r'].includes(e.key)){ key(e.key); return; } // 단계에 맞지 않는 키는 워커가 무시합니다
+  // 큰 키 한 벌: Space/→ = 다음 단계(대기→녹화, 녹화→저장), ←/Backspace = 버리고 다시, Esc = 수집 끝내기
+  if(e.key===' '||e.key==='ArrowRight'){ e.preventDefault(); if(PH==='ready') key('s'); else if(PH==='record') key('n'); }
+  else if(e.key==='ArrowLeft'||e.key==='Backspace'){ e.preventDefault(); if(PH==='record') key('r'); }
+  else if(e.key==='Escape'){ if(PH==='ready') endRec(); }
 });
 </script>"""
 

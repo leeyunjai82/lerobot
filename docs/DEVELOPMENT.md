@@ -16,6 +16,8 @@
 - [OpenVINO (Intel NPU / GPU / CPU)](#openvino-intel-npu--gpu--cpu)
 - [롤아웃 실행기·실시간 모니터·시도 기록](#롤아웃-실행기실시간-모니터시도-기록)
 - [모델·데이터셋 내보내기/가져오기, 이어서 학습, 정책](#모델데이터셋-내보내기가져오기-이어서-학습-정책)
+- [Hugging Face Hub · HF Jobs](#hugging-face-hub--hf-jobs)
+- [LeLab 대비 보강 (복구·사전 점검·수집 신호음 등)](#lelab-대비-보강-복구사전-점검수집-신호음-등)
 - [lerobot 버전·설치](#lerobot-버전설치)
 - [테스트](#테스트)
 
@@ -27,6 +29,8 @@
 | `tools_armcheck.py` | SO-ARM101(STS3215) 팔 점검 — Setup 탭·마법사 진단과 CLI 공용 |
 | `tools_dxlcheck.py` | OMX(Dynamixel X) 팔 점검 — 같은 함수 이름·결과 형식 |
 | `lrweb_rollout.py` | 롤아웃 실행기 — lerobot-rollout 을 같은 프로세스에서 돌리며 실시간 상태(카메라·관절·추론 ms·Hz)를 `RUN_DIR/<jid>/` 에 씀. `--lrweb.engine=ov` 면 lrweb_ov 로 신경망 교체 |
+| `lrweb_hub.py` | Hugging Face Hub — 로그인 상태(whoami 캐시)·하드웨어 목록, 데이터셋 올리기/받기, 모델 받기, HF Jobs 클라우드 학습 래퍼 |
+| `tools_dsrepair.py` | 마무리 안 된(끊긴) 데이터셋 복구 — huggingface/leLab `dataset_repair.py`(Apache-2.0)를 옮겨 와 백업·CLI 추가 |
 | `lrweb_ov.py` | ACT → OpenVINO 변환·검증(`convert`), 장치 조회(`devices`), OpenVINO 추론으로 lerobot-rollout 실행(`rollout`). lrweb 는 이 파일을 별도 프로세스로 띄웁니다 |
 | `tools_jscheck.py` | 모든 페이지의 인라인 JS 를 `node --check` 로 파싱 검증 |
 | `tools_simarms.py` | 가상 팔 — PTY 위에서 STS3215 / Dynamixel X 를 흉내. 켜 있으면 `lrweb_sim.json` 에 포트를 알리고 lrweb 포트 목록에 추가됨 |
@@ -316,6 +320,51 @@ lrweb 는 둘 다 넣었습니다.
 - **학습 그래프** — lerobot 로그 줄의 `loss`·`grdn`·`lr`·`smp/s` 를 읽어 loss, grad norm·학습률 그래프와 진행률·남은 시간
   (남은 step ÷ (samples/s ÷ batch))을 보여 줍니다.
 
+## Hugging Face Hub · HF Jobs
+
+LeLab(huggingface/leLab) 에 있고 lrweb 에 없던 것 중 가장 큰 것. 구현은 `lrweb_hub.py`.
+
+- 토큰: `huggingface_hub.login(add_to_git_credential=False)` — `HF_HOME/token`(activate.sh 가 `data/hf` 로 지정). `/whoami-v2` 는 사용량
+  제한이 있어 5 분 캐시, 하드웨어 목록(`HfApi.list_jobs_hardware`, 로그인 없이도 됨)은 10 분 캐시. `unit_cost_usd`·`unit_label` 로 $/h 계산.
+- 오래 걸리는 일은 작업으로: `hub`(push-dataset / pull-dataset / pull-model), `cloudtrain`.
+- **클라우드 학습**: lerobot e40b58a 의 원격 학습(`lerobot-train --job.target=<flavor>`)을 씁니다. 그 경로의
+  `ensure_dataset_available` 은 `HF_LEROBOT_HOME/<repo_id>` 의 로컬 데이터셋을 그 repo id 로 올리는데, lrweb 데이터셋은 `local/<이름>` 이라
+  남의 네임스페이스(`local`)로 올리려다 실패합니다. 그래서 `cloud-train` 이 먼저 `LeRobotDataset(<user>/<이름>, root=...).push_to_hub(private=True)`
+  로 내 계정에 올리고(매번 — 이어서 수집한 에피소드 반영), `--dataset.repo_id=<user>/<이름>` 으로 `lerobot_train` 을 **exec** 합니다
+  (PID 유지 → 작업 추적·중지 그대로). `--output_dir`·`--dataset.root` 는 뺍니다(파드에 없는 경로). `--save_checkpoint_to_hub=true`,
+  `--job.tags=["lrweb"]`.
+- lerobot 은 Ctrl-C 를 "로그 분리" 로 처리해 원격 학습이 계속 과금됩니다. `kill_job` 이 `cloudtrain` 이면 로그의 `Job submitted: <id>` 를 찾아
+  `HfApi.cancel_job` 도 부릅니다. 작업 종류를 `train` 과 나눈 이유: 이 기기 GPU·팔을 안 쓰므로 수집·추론·로컬 학습과 배타가 아님.
+  학습 그래프(`/api/trainlog`)는 원격 로그 줄이 같은 형식이라 그대로 그려집니다.
+- **모델 받기**: repo 파일 목록에서 `checkpoints/<step>/pretrained_model/config.json` 을 찾아 마지막(또는 지정) step 만
+  `snapshot_download(allow_patterns=...)`, 없으면 루트의 `config.json + model.safetensors` 를 step `hub` 로. `outputs/<repo이름>/checkpoints/<step>/`
+  에 놓고 `lrweb_import.json` 에 출처 기록.
+- **데이터셋 받기**: `LeRobotDataset(repo_id, root=임시)` 로 받아(코드베이스 버전 태그 기준) 끝나면 `DATA_ROOT/<이름>` 으로 옮깁니다.
+  실패하면 임시 폴더를 지웁니다.
+- 실패 로그 끝에 원인 한 줄(네트워크면 `huggingface.co`·`*.xethub.hf.co` 접속 확인, 권한이면 토큰).
+
+## LeLab 대비 보강 (복구·사전 점검·수집 신호음 등)
+
+- **데이터셋 복구** (`tools_dsrepair.py`, LeLab 코드 기반): `finalize()` 전에 끊긴 v3.0 데이터셋은 `meta/episodes/` 가 없어 열리지 않습니다.
+  읽을 수 있는 parquet·영상 길이로 색인을 다시 만들고, 꼬리 없는 parquet 는 `.unreadable` 로 치우고, 잃은 에피소드가 있으면 data 를 잘라내고
+  stats 를 다시 계산합니다. lrweb 쪽 변경: 백업(`DATA_ROOT/.repair_backup/<이름>_<시각>/` — 폴더 밖이라 다운로드·업로드에 안 섞임), 작업(`repair`)으로 실행,
+  목록에서 v3.0 이고 수집 중이 아닌데 `meta/episodes/*.parquet` 가 없으면 **마무리 안 됨** 표시.
+- **롤아웃 사전 점검** `policy_fit()`: 체크포인트 `config.json` 의 `input_features` 로 카메라 이름(없으면 거부)·해상도(다르면 경고)·
+  `observation.state` 차원(한팔 6 / 양팔 12, 다르면 거부)을 대조. 가져온 모델처럼 학습 데이터셋 정보가 없어도 됩니다.
+  언어 정책(smolvla·pi0·pi05 등)은 태스크 설명 필수.
+- **실패 원인 추정** `FAILURE_HINTS`: 로그 끝의 예외 문구 → 한국어 안내 (정규식 표, 위에서부터 첫 일치).
+- **캘리브레이션 프롬프트**: lerobot 이 모터 값 ≠ 파일일 때 `input()` 으로 묻는 것을 `lrweb_rollout.py` 가 "파일을 모터에 쓰기"(ENTER) 로만 답합니다.
+  Control 탭 연결과 같은 동작. 처음부터 하는 캘리브레이션 질문이면 `EOFError` 로 멈추고 Calib 탭 안내.
+- **수집 신호음·키**: WebAudio 사인파(파일 없음). 녹화 시작 660→880 Hz, 저장 660→440 Hz, 최대 길이 마지막 3 초 880 Hz.
+  Space/→ = 다음 단계, ←/Backspace = 버리고 다시, Esc = 수집 끝내기(대기 중). 음소거는 localStorage.
+- **리뷰**: 재생 속도(영상 `playbackRate` + 벽시계 보정), `,` `.` 한 프레임.
+- **패키지 설치 버튼** `/api/install/<정책>`: `lerobot[extra]` 대신 그 extra 의 패키지만(e40b58a pyproject 범위) 설치 — 소스 설치가 아닌 환경에서
+  PyPI 의 다른 lerobot 이 덮어쓰지 않게. torch·torchvision 은 `-c` 제약 파일로 지금 버전 고정. 끝나면 `importlib.invalidate_caches()` 로 재시작 없이 반영.
+- **카메라 FOURCC**: `fourcc: MJPG|YUYV` (선택). Control 미리보기·수집 worker·롤아웃 CLI 모두 전달하고, 안 정했으면 아예 넘기지 않아 예전과 같습니다.
+
+LeLab 에 있지만 넣지 않은 것: 온보딩 투어(셋업 마법사가 대신), 자체 업데이트(git checkout 이라 `git pull`), W&B, 단일 탭 강제
+(Control 은 이미 소유권으로 막음), OS 별 카메라 이름 매칭(Linux 전용 도구).
+
 ## lerobot 버전·설치
 
 - lerobot commit `e40b58a8dfa9e7b86918c374791599d070518d11` 에 맞춰져 있습니다 (`lerobot_conda.sh` 의 `LEROBOT_COMMIT`)
@@ -339,5 +388,9 @@ lrweb 는 둘 다 넣었습니다.
 - OpenVINO: 실제 lerobot(e40b58a)·torch 2.11·OpenVINO 2026.4 로 합성 데이터셋 → CPU 학습 20 step 체크포인트 → 변환(FP16/INT8, CPU) →
   가상 SO-ARM101 팔 + 가상 카메라로 lrweb 에서 OV 롤아웃(정상 종료·SIGINT 중지·NPU/GPU 없음 → CPU 대체·해상도 불일치·낡은 IR 거부),
   PyTorch 롤아웃 회귀. **NPU·내장 GPU 실측은 하지 못했습니다** (시험 서버에 장치 없음)
+- Hub: 실제 Hub API 로 하드웨어·가격 목록, 잘못된 토큰 거부, 체크포인트 찾기(루트형), 클라우드 학습 인자를 lerobot 이 받아 제출 직전
+  ("Not logged in")까지 진행 확인(과금 없음). 대용량 파일 다운로드는 시험 환경에서 `*.xethub.hf.co` 가 막혀 실제 전송은 확인 못 함(실패 시 정리는 확인)
+- 복구(색인 삭제 → 2 에피소드 복구 → LeRobotDataset 로드), 사전 점검(해상도 경고·양팔 거부), 실패 힌트(포트 없음), 공장 상태 가상 팔에서
+  캘리브레이션 프롬프트 자동 응답, 패키지 설치(transformers 설치 후 torch 2.11 유지), FOURCC 가 lerobot 카메라 설정까지 전달
 - 롤아웃 모니터·시도 기록(브라우저: 카메라·3D·관절표·S/F/U 키·중지 후 화면), 모델 내보내기→가져오기 왕복(OV 상태 유지),
   악성 tar/zip(경로 탈출·링크) 거부, 데이터셋 왕복, 이어서 학습(20→30 step, 데이터 순서 이어짐), Diffusion 학습·롤아웃(오프라인)

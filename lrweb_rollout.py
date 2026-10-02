@@ -223,6 +223,7 @@ def main(argv=None):
         elif engine != "torch":
             raise SystemExit(f"--lrweb.engine 은 torch | ov: {engine}")
         rest = _skip_backbone_download(rest)
+        _answer_calibration_prompt()
         if mon:
             mon.install()
         sys.argv = ["lerobot-rollout"] + rest
@@ -239,6 +240,22 @@ def main(argv=None):
     if mon:
         mon.stop("done")
     return 0
+
+
+def _answer_calibration_prompt():
+    """lerobot 은 모터 값이 캘리브레이션 파일과 다르면 input() 으로 묻습니다. 웹 작업은 stdin 이 없어 EOFError 로 죽습니다.
+    'ENTER = 파일을 모터에 쓰기' 만 자동으로 답합니다 — lrweb Control 탭의 연결(토크 OFF → 파일 캘리브레이션 쓰기)과
+    같은 동작입니다. 처음부터 하는 캘리브레이션(팔을 움직여야 함)이 필요하면 멈추고 Calib 탭으로 안내합니다."""
+    import builtins
+
+    def _input(prompt=""):
+        say(prompt)
+        if "use provided calibration file" in str(prompt):
+            say("[lrweb] 모터 값이 캘리브레이션 파일과 달라 파일 값을 모터에 씁니다 (Control 탭 연결과 같은 동작)")
+            return ""
+        raise EOFError("캘리브레이션 파일이 없습니다 — Calib 탭에서 먼저 캘리브레이션하세요")
+
+    builtins.input = _input
 
 
 def _skip_backbone_download(rest):
