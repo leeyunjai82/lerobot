@@ -28,3 +28,10 @@ armlab_config.json
 # 가상 팔 (tools_simarms.py 실행 중에만 생김)
 armlab_sim/
 armlab_sim.json
+
+# 예전 이름(lrweb) 시절의 런타임 파일 — 옛 기기에서 복사해 와도 커밋되지 않게
+lrweb_*.json
+lrweb_jobs/
+lrweb_run/
+lrweb_envs/
+lrweb_sim/
