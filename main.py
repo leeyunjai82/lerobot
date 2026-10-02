@@ -311,6 +311,68 @@ async def guard_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# ----------------------------- 한/영 전환 ------------------------------------
+# 화면 문자열은 소스에 한국어로 있습니다. 영어를 고르면(쿠키 armlab_lang=en) 서버가 내보내는 HTML·JS·JSON 에서
+# 한국어 조각을 armlab_i18n_en.json 사전으로 바꿉니다 (긴 조각부터 한 번에). 사전 값에는 따옴표·<>{}·역슬래시가
+# 없어서 JS 문자열·JSON 안에서 바꿔도 문법이 깨지지 않습니다. 사전에 없는 조각은 한국어 그대로 남습니다.
+I18N_FILE = Path(__file__).resolve().parent / "armlab_i18n_en.json"
+LANG_COOKIE = "armlab_lang"
+DEFAULT_LANG = "en" if os.environ.get("ARMLAB_LANG", "").lower().startswith("en") else "ko"
+_I18N = {"mtime": None, "rx": None, "map": {}}
+
+
+def _i18n():
+    try:
+        m = I18N_FILE.stat().st_mtime
+    except OSError:
+        return None
+    if _I18N["mtime"] != m:            # 사전을 고치면 재시작 없이 반영
+        d = load_json(I18N_FILE, {})
+        keys = sorted((k for k in d if k and d[k] is not None), key=len, reverse=True)
+        _I18N.update(mtime=m, map=d, rx=re.compile("|".join(map(re.escape, keys))) if keys else None)
+    return _I18N
+
+
+def to_en(text):
+    t = _i18n()
+    if not t or t["rx"] is None:
+        return text
+    return t["rx"].sub(lambda mt: t["map"][mt.group(0)], text)
+
+
+def lang_of(cookies):
+    v = (cookies or {}).get(LANG_COOKIE)
+    return v if v in ("ko", "en") else DEFAULT_LANG
+
+
+@app.middleware("http")
+async def i18n_middleware(request: Request, call_next):
+    resp = await call_next(request)
+    if lang_of(request.cookies) != "en":
+        return resp
+    ct = resp.headers.get("content-type", "")
+    if not (ct.startswith("text/html") or ct.startswith("application/json")):
+        return resp                    # 영상·MJPEG·tar 다운로드 등은 그대로 흘림
+    body = b"".join([chunk async for chunk in resp.body_iterator])
+    out = to_en(body.decode("utf-8", "replace")).encode("utf-8")
+    headers = {k: v for k, v in resp.headers.items() if k.lower() != "content-length"}
+    return Response(out, status_code=resp.status_code, headers=headers)
+
+
+@app.get("/lang")
+def switch_lang(request: Request, to: str = ""):
+    """한/영 버튼 — 지금과 반대로(또는 to=ko|en) 바꾸고 보던 화면으로 돌아갑니다."""
+    from urllib.parse import urlsplit
+    new = to if to in ("ko", "en") else ("ko" if lang_of(request.cookies) == "en" else "en")
+    ref = urlsplit(request.headers.get("referer") or "/")
+    back = (ref.path or "/") + (f"?{ref.query}" if ref.query else "")
+    if not back.startswith("/") or back.startswith("//") or back.startswith("/lang"):
+        back = "/"
+    r = RedirectResponse(back, status_code=303)
+    r.set_cookie(LANG_COOKIE, new, max_age=10 * 365 * 86400, samesite="lax")
+    return r
+
+
 def ws_authed(sock: WebSocket):
     if not _same_origin(sock.headers):
         return False
@@ -2370,6 +2432,8 @@ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 .statuscluster{margin-left:auto;display:flex;align-items:center;gap:10px;min-width:0;white-space:nowrap;
   font-family:var(--mono);font-size:12px;color:var(--muted)}
 .jobtxt{color:inherit;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.langbtn{font-family:var(--mono);font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:2px 7px;text-decoration:none}
+.langbtn:hover{color:var(--text);border-color:var(--accent);text-decoration:none}
 /* 탭이 11개라 1600px 아래에서는 작업 id 를 숨기고(마우스를 올리면 보임) 탭 간격을 줄입니다 */
 @media(max-width:1600px){ .statuscluster .jobid{display:none} .nav a{padding:0 10px} .appbar{gap:18px} }
 .dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
@@ -2502,6 +2566,8 @@ def nav_html(active=""):
     mode_badge = (f'<a href="/projects" title="프로젝트"><span class="badge b-run">{esc(pname)}</span></a> '
                   if pname else '<a href="/projects" title="프로젝트"><span class=badge>전체</span></a> ')
     mode_badge += f'<a href="/setup#envcard" title="환경"><span class=badge>{esc(env_name())}</span></a> '
+    if I18N_FILE.is_file():            # 영어 사전이 있을 때만 한/영 버튼
+        mode_badge = '<a href="/lang" class=langbtn title="한국어 / English">한/EN</a> ' + mode_badge
     mode_badge += ('<span class="badge b-run">양팔</span>' if BIMANUAL
                    else '<span class="badge">한팔</span>')
     if not ports_configured():
@@ -5325,6 +5391,17 @@ def _arms_state():
 async def ws_control(sock: WebSocket):
     global CTL_OWNER
     await sock.accept()
+    if lang_of(sock.cookies) == "en":
+        _send = sock.send_text
+
+        async def _send_en(t):          # json.dumps 기본값은 한글을 \uXXXX 로 내보내므로 풀어서 바꿉니다
+            try:
+                t = to_en(json.dumps(json.loads(t), ensure_ascii=False))
+            except ValueError:
+                t = to_en(t)
+            await _send(t)
+
+        sock.send_text = _send_en
     if not ws_authed(sock):
         msg = ("다른 사이트에서 온 연결은 받지 않습니다" if not _same_origin(sock.headers)
                else "인증 필요 — 페이지를 새로고침하세요")
@@ -9086,16 +9163,16 @@ async function endRec(){
 }
 async function stopRec(){
   const L=[
-   '\uc6cc\ucee4\ub97c SIGKILL \ub85c \uc989\uc2dc \uc8fd\uc785\ub2c8\ub2e4.','',
-   '\u2022 \ub179\ud654 \uc911\uc774\ub358 \uc5d0\ud53c\uc18c\ub4dc\uc640 \uc544\uc9c1 \uc778\ucf54\ub529\ub418\uc9c0 \uc54a\uc740 \uc601\uc0c1\uc774 \uc0ac\ub77c\uc9d1\ub2c8\ub2e4.',
-   '\u2022 \uba54\ud0c0\uac00 \ub9c8\ubb34\ub9ac\ub418\uc9c0 \uc54a\uc544 \ub370\uc774\ud130\uc14b\uc774 \uc548 \uc5f4\ub9b4 \uc218 \uc788\uc2b5\ub2c8\ub2e4.',
-   '\u2022 \ud314 \ud1a0\ud06c\uac00 \ucf1c\uc9c4 \ucc44 \ub0a8\uc2b5\ub2c8\ub2e4 \u2014 Control \ud0ed\uc5d0\uc11c \ud1a0\ud06c OFF \ud558\uac70\ub098 \uc804\uc6d0\uc744 \ub0b4\ub9ac\uc138\uc694.','',
-   '\uc751\ub2f5 \uc5c6\ub294 \uc6cc\ucee4\ub97c \ub04a\uc744 \ub54c\ub9cc \uc4f0\uc138\uc694.',
-   '\uc815\uc0c1 \uc885\ub8cc\ub294 \ub300\uae30 \uc0c1\ud0dc\uc758 [\uc218\uc9d1 \ub05d\ub0b4\uae30] \uc785\ub2c8\ub2e4.','',
-   '\uadf8\ub798\ub3c4 \uac15\uc81c \uc885\ub8cc\ud560\uae4c\uc694?'];
+   '워커를 SIGKILL 로 즉시 죽입니다.','',
+   '• 녹화 중이던 에피소드와 아직 인코딩되지 않은 영상이 사라집니다.',
+   '• 메타가 마무리되지 않아 데이터셋이 안 열릴 수 있습니다 — Datasets 탭의 복구로 살릴 수 있습니다.',
+   '• 팔 토크가 켜진 채 남습니다 — Control 탭에서 토크 OFF 하거나 전원을 내리세요.','',
+   '응답 없는 워커를 끊을 때만 쓰세요.',
+   '정상 종료는 대기 상태의 [수집 끝내기] 입니다.','',
+   '그래도 강제 종료할까요?'];
   if(!confirm(L.join('\\n')))return;
   const d = await (await fetch('/api/kill/'+JID+'?force=1',{method:'POST'})).json();
-  if(!d.ok) alert('\uc885\ub8cc \uc2e4\ud328 \u2014 \uc774\ubbf8 \uc8fd\uc5c8\uac70\ub098 pid \ub97c \ubabb \ucc3e\uc558\uc2b5\ub2c8\ub2e4');
+  if(!d.ok) alert('종료 실패 — 이미 죽었거나 pid 를 못 찾았습니다');
   setTimeout(()=>location.reload(),1500);
 }
 function buildCams(names){

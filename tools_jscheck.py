@@ -6,6 +6,7 @@ Python 문자열 안에 JS 가 들어 있어 따옴표·역슬래시 escape 가 
 
     python tools_jscheck.py            # node 를 PATH 에서 찾음
     NODE=/opt/node22/bin/node python tools_jscheck.py
+    python tools_jscheck.py --en       # 영어 화면(사전 치환 후)
 """
 import os
 import re
@@ -41,6 +42,10 @@ def main():
         print("  (포트 미설정 → 더미 포트 주입, 전체 페이지 렌더)")
 
     client = TestClient(armlab.app)
+    en = "--en" in sys.argv          # 영어 화면(사전 치환 후)도 문법이 깨지지 않는지
+    if en:
+        client.cookies.set(armlab.LANG_COOKIE, "en")
+        print("  (영어 모드 — armlab_i18n_en.json 치환 후 검사)")
     bad = 0
     seen = {}
     with tempfile.TemporaryDirectory() as tmp:
@@ -68,6 +73,8 @@ def main():
         ro_run = "<script>" + armlab.ARM3D_JS + armlab.ROLLOUT_RUN_JS + "</script>"
         for name in ("COLLECT_RUN_HTML", "REVIEW_HTML", "WIZARD_HTML", "ROLLOUT_RUN"):
             blk = ro_run if name == "ROLLOUT_RUN" else getattr(armlab, name, "")
+            if en:
+                blk = armlab.to_en(blk)
             for i, js in enumerate(re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", blk, re.S)):
                 js = js.strip()
                 if not js:
